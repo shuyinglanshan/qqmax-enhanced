@@ -2097,7 +2097,7 @@ public final class QqKernel {
         return 0L;
     }
 
-    private static long longOf(java.lang.Object obj) {
+    public static long longOf(java.lang.Object obj) {
         if (obj instanceof java.lang.Number) {
             return ((java.lang.Number) obj).longValue();
         }
@@ -4356,60 +4356,54 @@ public final class QqKernel {
     }
 
     /** 临时会话专属菜单 */
+    /**
+     * 临时会话长按菜单：与宿主会话卡片菜单保持一致（不自建）。
+     * 直接复用 ChatCardInjector.showNativeMailMenu 的宿主 SelectDialogFragment 路径，
+     * 菜单项（删除/置顶/免打扰/清空消息）全部是宿主原生长按菜单项，
+     * 点击行为由 ensureNativeMenuHooks 注册的宿主逻辑处理。
+     */
     public static void showTempChatMenu(final android.content.Context context, final java.lang.String peerUid) {
         if (context == null || peerUid == null || peerUid.isEmpty()) {
             return;
         }
-        final android.content.Context ctx = context;
-        final java.lang.String uid = strictKey(peerUid);
-        Runnable show = new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    boolean top = isTempChatTop(uid);
-                    boolean dnd = isTempChatDnd(uid);
-                    java.lang.String name = "";
-                    java.lang.Object[] entry = sTempChatKnown.get(uid);
-                    if (entry != null) {
-                        name = strOf(entry[1]);
-                    }
-                    java.lang.String title = name.isEmpty() ? uid : name;
-                    final java.lang.String[] items = new java.lang.String[]{
-                            (top ? "取消置顶" : "置顶该会话"),
-                            (dnd ? "取消免打扰" : "免打扰"),
-                            "删除该临时会话"
-                    };
-                    new android.app.AlertDialog.Builder(ctx)
-                            .setTitle(title)
-                            .setItems(items, new android.content.DialogInterface.OnClickListener() {
-                                @Override
-                                public void onClick(android.content.DialogInterface d, int which) {
-                                    try {
-                                        if (which == 0) {
-                                            setTempChatTop(uid, !isTempChatTop(uid));
-                                        } else if (which == 1) {
-                                            setTempChatDnd(uid, !isTempChatDnd(uid));
-                                        } else if (which == 2) {
-                                            forgetTempChat(uid);
-                                            refreshTempChatList();
-                                        }
-                                    } catch (java.lang.Throwable th) {
-                                        com.tencent.qqlitepro.util.Log.w("临时会话: 菜单操作失败 " + chain(th));
-                                    }
-                                }
-                            })
-                            .setNegativeButton("取消", (android.content.DialogInterface.OnClickListener) null)
-                            .show();
-                } catch (java.lang.Throwable th) {
-                    com.tencent.qqlitepro.util.Log.w("临时会话: 弹出菜单失败 " + chain(th));
-                }
-            }
-        };
-        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-            show.run();
-        } else {
-            new android.os.Handler(android.os.Looper.getMainLooper()).post(show);
+        try {
+            // 先登记"本次要操作的会话"，供菜单 hook 内的删除逻辑定位目标
+            sMenuTargetUid = normPeerUid(peerUid);
+            com.tencent.qqlitepro.hook.ChatCardInjector.showNativeMailMenu(context);
+        } catch (java.lang.Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("临时会话: 弹出宿主菜单失败 " + chain(th));
         }
+    }
+
+    /** 当前长按菜单对应的目标会话（宿主菜单 hook 回调时读取） */
+    private static volatile java.lang.String sMenuTargetUid;
+
+    /** 供宿主菜单 hook（删除/置顶/免打扰）取目标 peerUid */
+    public static java.lang.String menuTargetUid() {
+        return sMenuTargetUid;
+    }
+
+    /** 当前长按菜单目标的展示名 */
+    private static volatile java.lang.String sMenuTargetName;
+
+    public static void setMenuTargetName(java.lang.String n) {
+        sMenuTargetName = n;
+    }
+
+    public static java.lang.String menuTargetName() {
+        return sMenuTargetName;
+    }
+
+    /** 群聊消息统计入口：登记目标 uin/名称后打开（由群聊菜单调用） */
+    public static void noteMenuTarget(long uin, java.lang.String name) {
+        sMenuTargetUinLong = uin;
+        sMenuTargetName = name;
+    }
+
+    private static volatile long sMenuTargetUinLong;
+
+    public static long menuTargetUinLong() {
+        return sMenuTargetUinLong;
     }
 
     private static int installTempChatRenderFixHook() {
@@ -5655,38 +5649,632 @@ public final class QqKernel {
      * 宿主没有对外暴露的 Intent，这里尝试走它的数据源/跳转入口；
      * 全部失败时静默（不崩溃），由调用方决定是否提示。
      */
-    public static boolean openTempChatSession(android.content.Context context, java.lang.String peerUid) {
-        if (context == null || peerUid == null || peerUid.isEmpty()) {
+    /** 从当前 resumed Activity（反射 ActivityThread）取 */
+    private static android.app.Activity findCurrentActivity() {
+        try {
+            Object act = null;
+            Class<?> atCls = Class.forName("android.app.ActivityThread");
+            Object at = atCls.getMethod("currentActivityThread").invoke(null);
+            try {
+                act = atCls.getMethod("currentApplication").invoke(null);
+            } catch (Throwable ignored) {}
+            if (act instanceof android.app.Activity) {
+                return (android.app.Activity) act;
+            }
+            // currentApplication 是 Application，不是 Activity；遍历其 fragments 由调用方处理
+            // 通过.ActivityThread 的 mActivities 拿 resumed activity
+            try {
+                java.lang.reflect.Field f = atCls.getDeclaredField("mActivities");
+                f.setAccessible(true);
+                Object arr = f.get(at);
+                if (arr instanceof android.util.ArrayMap) {
+                    for (Object v : ((android.util.ArrayMap) arr).values()) {
+                        try {
+                            Object r = de.robv.android.xposed.XposedHelpers.getObjectField(v, "activity");
+                            if (r instanceof android.app.Activity) {
+                                android.app.Activity a = (android.app.Activity) r;
+                                if (!a.isFinishing() && a.hasWindowFocus()) {
+                                    return a;
+                                }
+                                if (act == null) act = a;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            } catch (Throwable ignored) {}
+            return act instanceof android.app.Activity ? (android.app.Activity) act : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 递归取 FragmentManager 里第一个 Fragment（含子 FragmentManager） */
+    private static Object firstFragmentIn(Object fm, int depth) {
+        if (fm == null || depth > 4) {
+            return null;
+        }
+        try {
+            Object list = de.robv.android.xposed.XposedHelpers.callMethod(fm, "getFragments", new Object[0]);
+            if (list instanceof java.util.List) {
+                for (Object f : (java.util.List) list) {
+                    if (f != null) {
+                        // 优先返回自身
+                        return f;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** 通用：按 uin 打开聊天（chatType 1=好友 2=群），走宿主 AIO 路由 */
+    public static boolean openChatByUin(android.content.Context context, long uin, java.lang.String nick, int chatType) {
+        if (context == null || uin <= 0) {
             return false;
         }
         try {
             android.content.Context app = context.getApplicationContext() != null
                     ? context.getApplicationContext() : context;
-            // 常见宿主入口：通过 packageManager 取启动 Intent 不可行，改为尝试数据源提供的打开方法
-            java.lang.Object ds = sTempChatDatasource;
-            if (ds != null) {
-                for (java.lang.reflect.Method m : ds.getClass().getDeclaredMethods()) {
-                    java.lang.String n = m.getName();
-                    if ((n.equals("open") || n.equals("a") || n.equals("c"))
-                            && m.getParameterTypes().length >= 1
-                            && m.getParameterTypes()[0] == java.lang.String.class) {
-                        try {
+            java.lang.Class<?> apiCls = cls("com.tencent.qqnt.aio.adapter.api.IAIOStarterApi");
+            if (apiCls != null) {
+                java.lang.Object api = invokeQRouteApi(apiCls);
+                if (api != null) {
+                    for (java.lang.reflect.Method m : api.getClass().getMethods()) {
+                        if (!"navigateToAIOActivity".equals(m.getName())) continue;
+                        Class<?>[] ps = m.getParameterTypes();
+                        if (ps.length == 7 && ps[0] == android.content.Context.class
+                                && ps[1] == Integer.TYPE && ps[2] == java.lang.String.class
+                                && ps[3] == java.lang.String.class && ps[4] == Integer.TYPE
+                                && ps[5] == Long.TYPE && ps[6] == android.os.Bundle.class) {
                             m.setAccessible(true);
-                            m.invoke(ds, peerUid);
-                            com.tencent.qqlitepro.util.Log.i("临时会话: 已通过数据源打开 " + peerUid);
+                            m.invoke(api, app, Integer.valueOf(chatType),
+                                    String.valueOf(uin),
+                                    nick == null || nick.isEmpty() ? String.valueOf(uin) : nick,
+                                    Integer.valueOf(0), Long.valueOf(uin), null);
                             return true;
-                        } catch (java.lang.Throwable ignored) {
                         }
                     }
                 }
             }
+            // 兜底：直接实现类
+            java.lang.Class<?> implCls = cls("com.tencent.qqnt.aio.adapter.api.impl.AIOStarterApiNtImpl");
+            if (implCls != null) {
+                java.lang.reflect.Constructor<?> c = implCls.getDeclaredConstructor();
+                c.setAccessible(true);
+                java.lang.Object impl = c.newInstance();
+                for (java.lang.reflect.Method m : implCls.getMethods()) {
+                    if ("navigateToAIOActivity".equals(m.getName()) && m.getParameterTypes().length == 7) {
+                        m.setAccessible(true);
+                        m.invoke(impl, app, Integer.valueOf(chatType),
+                                String.valueOf(uin),
+                                nick == null || nick.isEmpty() ? String.valueOf(uin) : nick,
+                                Integer.valueOf(0), Long.valueOf(uin), null);
+                        return true;
+                    }
+                }
+            }
+        } catch (java.lang.Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("打开聊天失败 " + chain(th));
+        }
+        return false;
+    }
+
+    /**
+     * 打开临时会话的聊天界面（宿主原生 AIO）。
+     *
+     * 逆向自宿主 com.tencent.qqnt.aio.adapter.api.impl.AIOStarterApiNtImpl：
+     *   navigateToAIOActivity(context, chatType, uid, nick, routeFlags, uin, bundle)
+     *   内部 -> ActivityURIRequest(context, "/base/main/aio") + QRoute
+     * 参数：chatType 1=好友(临时会话属此类) 2=群；uid 用 peerUid；uin 用 peerUin。
+     * 优先用 QRoute 反射调用宿主实现，失败再退化到显式构造的 Uri 路由。
+     */
+    /**
+     * 打开临时会话聊天界面。
+     *
+     * 逆向自宿主（QQ Max M2.5）WatchRecentItemBuilder$listener$1.b()：
+     *   Bundle bundle = WatchPicElementExtKt.c0(peerUid, chatType, nick, 0, uin, 8);
+     *   NavController nav = NavHostFragment.findNavController(builder 的 d 字段 WatchFragment);
+     *   nav.f(2114519145, bundle, null)   [builder.d 即 WatchFragment]
+     * 这是宿主会话卡片点击进聊天的真实路径（手表版 ViewPager 页面导航），
+     * 而非 QRoute AIO 路由（手表版走的是 NavHostFragment）。
+     */
+    public static boolean openTempChatSession(android.content.Context context, java.lang.String peerUid) {
+        if (context == null || peerUid == null || peerUid.isEmpty()) {
+            return false;
+        }
+        try {
+            java.lang.Object[] entry = tempChatKnownEntry(peerUid);
+            long uin = entry != null ? longOf(entry[0]) : 0L;
+            java.lang.String nick = entry != null ? strOf(entry[1]) : "";
+            if (nick != null) {
+                nick = nick.replace("（临时会话）", "").replace("(临时会话)", "").trim();
+            }
+            if (nick == null || nick.isEmpty()) {
+                nick = peerUid;
+            }
+            // 1) 构造与宿主一致的参数 Bundle
+            android.os.Bundle bundle = new android.os.Bundle();
+            bundle.putString("key_bundle_peer_id", peerUid);
+            bundle.putInt("key_bundle_chat_type", 1);
+            bundle.putString("key_bundle_chat_nick", nick);
+            if (uin > 0) {
+                bundle.putString("key_bundle_chat_uin", String.valueOf(uin));
+            }
+            // 2) 找一个 NavHost 内的 Fragment（宿主主界面 MainActivity 的 fragment 树）。
+            //    主列表 builder 是 WatchChatListBuilder（无 d 字段），所以从 Activity 的
+            //    FragmentManager 遍历取第一个 Fragment，findNavController 会向上找宿主 NavHost。
+            android.app.Activity act = findCurrentActivity();
+            Object watchFragment = null;
+            if (act != null) {
+                try {
+                    android.view.View decor = act.getWindow().getDecorView();
+                    // 直接从 Activity 取 FragmentManager 遍历
+                    Object fm = null;
+                    try {
+                        fm = de.robv.android.xposed.XposedHelpers.callMethod(act,
+                                "getSupportFragmentManager", new Object[0]);
+                    } catch (Throwable ignored) {}
+                    if (fm == null) {
+                        // androidx activity: getSupportFragmentManager 是 FragmentActivity 方法
+                        try {
+                            fm = de.robv.android.xposed.XposedHelpers.callMethod(act,
+                                    "getFragmentManager", new Object[0]);
+                        } catch (Throwable ignored) {}
+                    }
+                    if (fm != null) {
+                        watchFragment = firstFragmentIn(fm, 0);
+                    }
+                } catch (Throwable th) {
+                    com.tencent.qqlitepro.util.Log.w("临时会话: 遍历 Fragment 失败 " + chain(th));
+                }
+            }
+            if (watchFragment == null) {
+                com.tencent.qqlitepro.util.Log.w("临时会话: 未找到可用 Fragment（NavHost 未就绪）");
+                return false;
+            }
+            // NavHostFragment.findNavController(fragment) — 静态方法名在 release 里可能是 S
+            Object navController = null;
+            try {
+                navController = de.robv.android.xposed.XposedHelpers.callStaticMethod(
+                        cls("androidx.navigation.fragment.NavHostFragment"),
+                        "findNavController",
+                        watchFragment);
+            } catch (Throwable t1) {
+                // 混淆名兜底：遍历 NavHostFragment 静态方法（返回 NavController 且参数是 Fragment）
+                try {
+                    Class<?> navHostCls = cls("androidx.navigation.fragment.NavHostFragment");
+                    for (java.lang.reflect.Method m : navHostCls.getDeclaredMethods()) {
+                        if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+                        Class<?>[] ps = m.getParameterTypes();
+                        if (ps.length == 1 && ps[0].getName().endsWith("Fragment")
+                                && m.getReturnType().getName().equals("androidx.navigation.NavController")) {
+                            m.setAccessible(true);
+                            navController = m.invoke(null, watchFragment);
+                            break;
+                        }
+                    }
+                } catch (Throwable t2) {
+                    com.tencent.qqlitepro.util.Log.w("临时会话: findNavController 失败 " + chain(t2));
+                }
+            }
+            if (navController == null) {
+                return false;
+            }
+            // 3) nav.f(2114519145, bundle, null) — 混淆名 f，遍历找单参 int 的 NavController 方法
+            boolean navigated = false;
+            for (java.lang.reflect.Method m : navController.getClass().getDeclaredMethods()) {
+                if (!java.lang.reflect.Modifier.isPublic(m.getModifiers())) continue;
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length == 3 && ps[0] == Integer.TYPE
+                        && ps[1] == android.os.Bundle.class
+                        && (ps[2] == null || ps[2].getName().endsWith("NavOptions"))) {
+                    m.setAccessible(true);
+                    m.invoke(navController, Integer.valueOf(2114519145), bundle, null);
+                    navigated = true;
+                    break;
+                }
+            }
+            if (!navigated) {
+                // 再试公开方法（含继承）
+                for (java.lang.reflect.Method m : navController.getClass().getMethods()) {
+                    Class<?>[] ps = m.getParameterTypes();
+                    if (ps.length == 3 && ps[0] == Integer.TYPE
+                            && ps[1] == android.os.Bundle.class
+                            && ps[2] != null && ps[2].getName().endsWith("NavOptions")) {
+                        m.setAccessible(true);
+                        m.invoke(navController, Integer.valueOf(2114519145), bundle, null);
+                        navigated = true;
+                        break;
+                    }
+                }
+            }
+            if (navigated) {
+                com.tencent.qqlitepro.util.Log.i("临时会话: NavController 导航成功 uid=" + peerUid);
+                return true;
+            }
+            com.tencent.qqlitepro.util.Log.w("临时会话: NavController 导航方法未找到");
+            return false;
         } catch (java.lang.Throwable th) {
             com.tencent.qqlitepro.util.Log.w("临时会话: 打开会话失败 " + chain(th));
         }
         return false;
     }
 
+    /** 通过 QRoute 取得 API 实现（反射封装） */
+    private static java.lang.Object invokeQRouteApi(java.lang.Class<?> apiCls) {
+        try {
+            java.lang.Class<?> qroute = cls("com.tencent.mobileqq.qroute.QRoute");
+            if (qroute == null) {
+                return null;
+            }
+            java.lang.reflect.Method m = qroute.getMethod("api", java.lang.Class.class);
+            m.setAccessible(true);
+            return m.invoke(null, apiCls);
+        } catch (java.lang.Throwable ignored) {
+        }
+        return null;
+    }
+
     /** 临时会话总数（供汇总卡片展示） */
+    /* ==================== 在线状态点赞（逆向自宿主 IKernelOnlineStatusService） ==================== */
+    private static volatile Object sSessionRef;
+
+    /** 点赞类型：对应宿主 OnlineStatusConstant */
+    public static final int LIKE_TYPE_ZAN = 1;      // 赞
+    public static final int LIKE_TYPE_XIN = 2;      // 心
+    public static final int LIKE_TYPE_GOUTOU = 3;   // 狗头
+    public static final int LIKE_TYPE_JINGLI = 4;   // 惊了
+    public static final int LIKE_TYPE_BAOBAO = 5;   // 宝宝
+    public static final int LIKE_TYPE_UNKNOWN = 0;
+
+    /**
+     * 取内核在线状态服务（IKernelOnlineStatusService）。
+     * 逆向链路：IQQNTWrapperSession.getOnlineStatusService()
+     */
+    private static Object onlineStatusService() throws Throwable {
+        try {
+            java.lang.reflect.Method mSession = Class.forName("com.tencent.qqnt.kernel.nativeinterface.IQQNTWrapperSession")
+                    .getMethod("getOnlineStatusService");
+            // session 实例：与 getMsgService 同源，从已缓存的 kernel session 取
+            Object session = kernelSessionInstance();
+            if (session == null) {
+                return null;
+            }
+            return mSession.invoke(session);
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("在线状态: 获取 service 失败 " + chain(t));
+            return null;
+        }
+    }
+
+    /** 取内核 session 实例（与 getMsgService / recallMsg 一致的获取方式） */
+    private static Object kernelSessionInstance() {
+        try {
+            java.lang.reflect.Method m = QqKernel.class.getDeclaredMethod("invokeKernelSession");
+            m.setAccessible(true);
+            return m.invoke(null);
+        } catch (Throwable t) {
+            try {
+                // 兜底：反射找任何返回 session 的静态入口
+                Class<?> sesCls = cls("com.tencent.qqnt.kernel.nativeinterface.IQQNTWrapperSession");
+                if (sesCls != null) {
+                    for (java.lang.reflect.Method m2 : sesCls.getDeclaredMethods()) {
+                        if (java.lang.reflect.Modifier.isStatic(m2.getModifiers())
+                                && m2.getParameterTypes().length == 0
+                                && m2.getReturnType() == sesCls) {
+                            m2.setAccessible(true);
+                            return m2.invoke(null);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            return null;
+        }
+    }
+
+    /** 内核 session 获取的公共入口（若模块已有同名方法则直接复用其返回值） */
+    private static Object invokeKernelSession() {
+        try {
+            // 已有代码里 recallMsg 使用的方式是拿 sCl 后调用宿主 QRoute；
+            // 这里退回用 getMsgService 所在类里保存的 session（如有）
+            java.lang.reflect.Field f = QqKernel.class.getDeclaredField("sSessionRef");
+            f.setAccessible(true);
+            Object v = f.get(null);
+            if (v != null) {
+                return v;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            // 宿主全局 Kernel：IQQNTWrapperSession 的 CppProxy 由内核持有，
+            // 通过 BaseService 的静态字段是最常见入口
+            Class<?> base = cls("com.tencent.qqnt.kernel.api.impl.BaseService");
+            if (base != null) {
+                for (java.lang.reflect.Field f : base.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())
+                            && f.getType().getName().endsWith("IQQNTWrapperSession")) {
+                        f.setAccessible(true);
+                        Object v = f.get(null);
+                        if (v != null) {
+                            try {
+                                java.lang.reflect.Field sf = QqKernel.class.getDeclaredField("sSessionRef");
+                                sf.setAccessible(true);
+                                sf.set(null, v);
+                            } catch (Throwable ignored) {
+                            }
+                            return v;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * 给好友点在线状态赞。
+     * 逆向自：IKernelOnlineStatusService.setLikeStatus(OSLikeStatusReq, IOSLikeStatusCallback)
+     *   OSLikeStatusReq{businessType:int, uin:long, likeItems:ArrayList<OSLikeItem{likeType:int, extInfo}>, isCancel:long}
+     */
+    public static String sendOnlineStatusLike(long targetUin, int likeType, int count) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            Object svc = onlineStatusService();
+            if (svc == null) {
+                return "内核在线状态服务不可用（宿主未就绪）";
+            }
+            Class<?> reqCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.OSLikeStatusReq");
+            Class<?> itemCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.OSLikeItem");
+            Class<?> cbCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.IOSLikeStatusCallback");
+
+            java.lang.reflect.Constructor<?> reqCtor = reqCls.getConstructor(Integer.TYPE, Long.TYPE, java.util.ArrayList.class, Long.TYPE);
+            Object req = reqCtor.newInstance(Integer.valueOf(0), Long.valueOf(targetUin),
+                    new java.util.ArrayList(), Long.valueOf(0L));
+
+            java.util.ArrayList items = new java.util.ArrayList();
+            for (int i = 0; i < Math.max(1, Math.min(count, 20)); i++) {
+                items.add(itemCls.getConstructor(Integer.TYPE,
+                        Class.forName("com.tencent.qqnt.kernel.nativeinterface.OSLikeExtInfo"))
+                        .newInstance(Integer.valueOf(likeType), null));
+            }
+            reqCls.getField("likeItems").set(req, items);
+
+            final int[] code = {-999};
+            final String[] err = {""};
+            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            Object cb = java.lang.reflect.Proxy.newProxyInstance(cbCls.getClassLoader(),
+                    new Class<?>[]{cbCls},
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
+                            if ("onResult".equals(m.getName()) && args != null && args.length >= 2) {
+                                code[0] = args[0] instanceof Integer ? (Integer) args[0] : -1;
+                                err[0] = args[1] == null ? "" : String.valueOf(args[1]);
+                                latch.countDown();
+                            }
+                            return null;
+                        }
+                    });
+
+            java.lang.reflect.Method setLike = findMethod(svc.getClass(), "setLikeStatus", reqCls, cbCls);
+            if (setLike == null) {
+                setLike = findMethod(svc.getClass(), "setLikeStatus", reqCls, cbCls);
+            }
+            if (setLike == null) {
+                return "内核未提供 setLikeStatus";
+            }
+            setLike.setAccessible(true);
+            setLike.invoke(svc, req, cb);
+            if (!latch.await(15000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                return "点赞回调超时";
+            }
+            if (code[0] == 0) {
+                return null;   // 成功
+            }
+            return "点赞失败 code=" + code[0] + (err[0].isEmpty() ? "" : " " + err[0]);
+        } catch (Throwable t) {
+            return "点赞异常 " + chain(t);
+        }
+    }
+
+    /** 查某好友的点赞列表（供界面展示） */
+    public static java.util.ArrayList<?> getOnlineStatusLikeList(long targetUin) {
+        try {
+            Object svc = onlineStatusService();
+            if (svc == null) {
+                return null;
+            }
+            Class<?> reqCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.OSGetLikeListReq");
+            Class<?> cbCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.IOSGetLikeListCallback");
+            Object req = reqCls.newInstance();
+            try {
+                reqCls.getField("uin").set(req, Long.valueOf(targetUin));
+            } catch (Throwable ignored) {
+            }
+            final java.util.ArrayList[] out = new java.util.ArrayList[1];
+            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            Object cb = java.lang.reflect.Proxy.newProxyInstance(cbCls.getClassLoader(),
+                    new Class<?>[]{cbCls},
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
+                            if ("onResult".equals(m.getName())) {
+                                for (Object a : (args == null ? new Object[0] : args)) {
+                                    if (a instanceof java.util.ArrayList) {
+                                        out[0] = (java.util.ArrayList) a;
+                                    }
+                                }
+                                latch.countDown();
+                            }
+                            return null;
+                        }
+                    });
+            java.lang.reflect.Method get = findMethod(svc.getClass(), "getLikeList", reqCls, cbCls);
+            if (get == null) {
+                return null;
+            }
+            get.setAccessible(true);
+            get.invoke(svc, req, cb);
+            latch.await(15000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return out[0];
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("在线状态: 点赞列表获取失败 " + chain(t));
+            return null;
+        }
+    }
+
+    /* ==================== 群聊消息统计（近 N 天消息总数 + 发言排行榜） ==================== */
+
+    /**
+     * 统计结果：total=消息总数, rank=发言排行 {发言人名, 条数}（已按条数降序）
+     */
+    public static final class GroupMsgStats {
+        public long total;
+        public final java.util.ArrayList<java.lang.String[]> rank = new java.util.ArrayList<>();
+        public int days;
+        public java.lang.String error;
+    }
+
+    /**
+     * 从宿主内核拉取群消息并按发言人聚合。
+     * 调用链（逆向）：IQQNTWrapperSession.getMsgService() -> IKernelMsgService.getMsgs(Contact, long startMsgId, int count, boolean, IKernelGetMsgsCallback)
+     */
+    public static GroupMsgStats groupMsgStats(long groupUin, int days) {
+        GroupMsgStats st = new GroupMsgStats();
+        st.days = days;
+        try {
+            Object svc = kernelMsgService();
+            if (svc == null) {
+                st.error = "内核消息服务不可用";
+                return st;
+            }
+            Class<?> contactCls = cls("com.tencent.qqnt.kernel.nativeinterface.Contact");
+            Object contact = contactCls.newInstance();
+            de.robv.android.xposed.XposedHelpers.setIntField(contact, "chatType", 2);
+            de.robv.android.xposed.XposedHelpers.setLongField(contact, "peerUin", groupUin);
+            de.robv.android.xposed.XposedHelpers.setLongField(contact, "peerId", groupUin);
+
+            Class<?> cbCls = cls("com.tencent.qqnt.kernel.nativeinterface.IKernelGetMsgsCallback");
+            final Object[] msgsBox = new Object[1];
+            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            Object cb = java.lang.reflect.Proxy.newProxyInstance(cbCls.getClassLoader(),
+                    new Class<?>[]{cbCls},
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
+                            if ("onResult".equals(m.getName()) && args != null && args.length >= 3) {
+                                msgsBox[0] = args[2];
+                                latch.countDown();
+                            }
+                            return null;
+                        }
+                    });
+
+            java.lang.reflect.Method getMsgs = null;
+            for (java.lang.reflect.Method m : svc.getClass().getMethods()) {
+                if (!"getMsgs".equals(m.getName())) continue;
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length >= 3 && ps[0] == contactCls) { getMsgs = m; break; }
+            }
+            if (getMsgs == null) {
+                st.error = "内核未提供 getMsgs";
+                return st;
+            }
+            getMsgs.setAccessible(true);
+            // 参数：contact, startMsgId=0(最新), count, 是否向前, callback —— 按类型填充
+            Class<?>[] ps = getMsgs.getParameterTypes();
+            Object[] argv = new Object[ps.length];
+            boolean cbSet = false;
+            for (int i = 0; i < ps.length; ++i) {
+                if (ps[i] == contactCls) argv[i] = contact;
+                else if (ps[i] == Long.TYPE) argv[i] = Long.valueOf(0L);
+                else if (ps[i] == Integer.TYPE) argv[i] = Integer.valueOf(1500);
+                else if (ps[i] == Boolean.TYPE) argv[i] = Boolean.FALSE;
+                else if (cbCls.isAssignableFrom(ps[i])) { argv[i] = cb; cbSet = true; }
+                else argv[i] = null;
+            }
+            if (!cbSet) {
+                st.error = "getMsgs 回调参数未匹配";
+                return st;
+            }
+            getMsgs.invoke(svc, argv);
+            if (!latch.await(20000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                st.error = "拉取消息超时";
+                return st;
+            }
+            Object result = msgsBox[0];
+            java.util.List list = null;
+            if (result instanceof java.util.ArrayList) {
+                list = (java.util.ArrayList) result;
+            } else if (result != null) {
+                // 可能是包一层的结果对象，找 ArrayList 字段
+                for (java.lang.reflect.Field f : result.getClass().getDeclaredFields()) {
+                    if (f.getType() == java.util.ArrayList.class) {
+                        f.setAccessible(true);
+                        Object v = f.get(result);
+                        if (v instanceof java.util.ArrayList) { list = (java.util.ArrayList) v; break; }
+                    }
+                }
+            }
+            if (list == null || list.isEmpty()) {
+                st.error = "未取到消息";
+                return st;
+            }
+
+            long cutoff = System.currentTimeMillis() - days * 86400000L;
+            java.util.HashMap<String, Integer> bySender = new java.util.HashMap<>();
+            java.util.HashMap<String, String> nameBySender = new java.util.HashMap<>();
+            for (Object msg : list) {
+                try {
+                    long msgTime = 0;
+                    try { msgTime = de.robv.android.xposed.XposedHelpers.getLongField(msg, "msgTime"); } catch (Throwable ignored) {}
+                    if (msgTime <= 0) {
+                        try { msgTime = de.robv.android.xposed.XposedHelpers.getLongField(msg, "time"); } catch (Throwable ignored) {}
+                    }
+                    // msgTime 是秒
+                    if (msgTime > 0 && msgTime < cutoff / 1000L) continue;
+                    String senderKey = null;
+                    try { senderKey = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "senderUid"); } catch (Throwable ignored) {}
+                    if (senderKey == null || senderKey.isEmpty()) {
+                        try { senderKey = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "senderUin")); } catch (Throwable ignored) {}
+                    }
+                    if (senderKey == null || senderKey.isEmpty()) continue;
+                    Integer c = bySender.get(senderKey);
+                    bySender.put(senderKey, Integer.valueOf(c == null ? 1 : c + 1));
+                    if (!nameBySender.containsKey(senderKey)) {
+                        String nm = null;
+                        try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendMemberName"); } catch (Throwable ignored) {}
+                        if (nm == null || nm.isEmpty()) {
+                            try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendNickName"); } catch (Throwable ignored) {}
+                        }
+                        nameBySender.put(senderKey, nm == null || nm.isEmpty() ? senderKey : nm);
+                    }
+                    st.total++;
+                } catch (Throwable ignored) {
+                }
+            }
+            // 排行排序
+            java.util.ArrayList<java.util.Map.Entry<String, Integer>> sorted =
+                    new java.util.ArrayList<java.util.Map.Entry<String, Integer>>(bySender.entrySet());
+            java.util.Collections.sort(sorted, new java.util.Comparator<java.util.Map.Entry<String, Integer>>() {
+                @Override
+                public int compare(java.util.Map.Entry<String, Integer> a, java.util.Map.Entry<String, Integer> b) {
+                    return Integer.compare(b.getValue().intValue(), a.getValue().intValue());
+                }
+            });
+            for (java.util.Map.Entry<String, Integer> e : sorted) {
+                String k = (String) e.getKey();
+                st.rank.add(new java.lang.String[]{nameBySender.get(k), String.valueOf(e.getValue())});
+            }
+            return st;
+        } catch (Throwable t) {
+            st.error = "统计异常 " + chain(t);
+            return st;
+        }
+    }
+
     public static int tempChatCount() {
         return sTempChatKnown.size();
     }
@@ -5882,7 +6470,7 @@ public final class QqKernel {
         return intOf(objArr[4]);
     }
 
-    private static java.lang.String previewOf(java.lang.Object[] objArr) {
+    public static java.lang.String previewOf(java.lang.Object[] objArr) {
         return (objArr == null || objArr.length <= 5) ? "" : strOf(objArr[5]);
     }
 
