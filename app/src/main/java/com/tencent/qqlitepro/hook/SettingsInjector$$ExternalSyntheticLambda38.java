@@ -1,0 +1,22 @@
+package com.tencent.qqlitepro.hook;
+
+/* JADX INFO: compiled from: D8$$SyntheticClass */
+/* JADX INFO: loaded from: classes.dex */
+public final /* synthetic */ class SettingsInjector$$ExternalSyntheticLambda38 implements java.lang.Runnable {
+    public final /* synthetic */ android.content.Context f$0;
+    public final /* synthetic */ android.widget.LinearLayout f$1;
+    public final /* synthetic */ android.widget.LinearLayout f$2;
+    public final /* synthetic */ android.view.ViewGroup f$3;
+
+    public /* synthetic */ SettingsInjector$$ExternalSyntheticLambda38(android.content.Context context, android.widget.LinearLayout linearLayout, android.widget.LinearLayout linearLayout2, android.view.ViewGroup viewGroup) {
+        this.f$0 = context;
+        this.f$1 = linearLayout;
+        this.f$2 = linearLayout2;
+        this.f$3 = viewGroup;
+    }
+
+    @Override // java.lang.Runnable
+    public final void run() {
+        com.tencent.qqlitepro.hook.SettingsInjector.lambda$addAutoTaskRuleRow$38(this.f$0, this.f$1, this.f$2, this.f$3);
+    }
+}
