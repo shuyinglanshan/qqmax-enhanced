@@ -175,10 +175,59 @@ public final class UiPatcher {
         }
     }
 
+    /** 主列表 Fragment（ChatListFragment）实例 —— 用于临时会话导航 */
+    private static volatile Object sChatListFragment;
+    private static volatile java.lang.ClassLoader sHostCl;
+
+    public static Object chatListFragment() {
+        return sChatListFragment;
+    }
+
+    public static java.lang.ClassLoader hostClassLoader() {
+        return sHostCl;
+    }
+
     public static void patch(java.lang.ClassLoader classLoader) {
         startStyleReconcile();
         installLanzouLinkHook(classLoader);
         installGroupStatEntryHook(classLoader);
+        installChatListFragmentHook(classLoader);
+    }
+
+    /**
+     * 记录宿主主列表 Fragment（ChatListFragment）实例。
+     * 逆向：ChatListFragment.onCreate 会把自身写入 WatchRecentItemBuilder.d，
+     * 但实测该静态字段可能未就绪；直接 hook onCreate 抓实例最可靠。
+     */
+    private static void installChatListFragmentHook(java.lang.ClassLoader classLoader) {
+        try {
+            sHostCl = classLoader;
+            java.lang.Class<?> fragCls = java.lang.Class.forName(
+                    "com.tencent.qqnt.watch.chat.ui.ChatListFragment", false, classLoader);
+            java.lang.reflect.Method onCreate = null;
+            for (java.lang.reflect.Method m : fragCls.getDeclaredMethods()) {
+                if (m.getName().equals("onCreate") && m.getParameterTypes().length == 1
+                        && m.getParameterTypes()[0] == android.os.Bundle.class) {
+                    onCreate = m;
+                    break;
+                }
+            }
+            if (onCreate == null) {
+                com.tencent.qqlitepro.util.Log.w("ChatListFragment.onCreate 未找到");
+                return;
+            }
+            onCreate.setAccessible(true);
+            de.robv.android.xposed.XposedBridge.hookMethod(onCreate, new de.robv.android.xposed.XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    sChatListFragment = param.thisObject;
+                    com.tencent.qqlitepro.util.Log.i("ChatListFragment 实例已记录（导航可用）");
+                }
+            });
+            com.tencent.qqlitepro.util.Log.i("已安装 ChatListFragment 实例捕获 hook");
+        } catch (java.lang.Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("安装 ChatListFragment hook 失败: " + th);
+        }
     }
 
     /**
