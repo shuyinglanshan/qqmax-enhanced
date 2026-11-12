@@ -178,6 +178,180 @@ public final class UiPatcher {
     public static void patch(java.lang.ClassLoader classLoader) {
         startStyleReconcile();
         installLanzouLinkHook(classLoader);
+        installGroupStatEntryHook(classLoader);
+    }
+
+    /**
+     * 聊天界面左滑（SettingFrame）注入"消息数据"入口。
+     * 逆向自宿主模组 ChatSearchKt.addChatSearchEntry：
+     *   SettingFrame.i(ScrollView) -> childAt(0) 是竖向 LinearLayout 条目容器，
+     *   用 setting_item layout inflate 条目（icon+desc），addView 后 CardMarginUnify.cardMargin。
+     * 我们 hook SettingFrame.onViewCreated_0_1 的 after（那里宿主模组也注入自己的 entry），
+     * 再从 fragment arguments 读 key_bundle_peer_id / key_bundle_chat_nick 定位当前群。
+     */
+    private static void installGroupStatEntryHook(java.lang.ClassLoader classLoader) {
+        try {
+            java.lang.Class<?> frameCls = java.lang.Class.forName(
+                    "com.tencent.watch.aio_impl.ui.frames.SettingFrame", false, classLoader);
+            java.lang.reflect.Method target = null;
+            for (java.lang.reflect.Method m : frameCls.getDeclaredMethods()) {
+                if (m.getName().equals("onViewCreated_0_1")) {
+                    target = m;
+                    break;
+                }
+            }
+            if (target == null) {
+                // 某些版本可能叫 onViewCreated_0
+                for (java.lang.reflect.Method m : frameCls.getDeclaredMethods()) {
+                    if (java.lang.reflect.Modifier.isPrivate(m.getModifiers())
+                            && m.getName().startsWith("onViewCreated")
+                            && m.getParameterTypes().length == 2) {
+                        target = m;
+                        break;
+                    }
+                }
+            }
+            if (target == null) {
+                com.tencent.qqlitepro.util.Log.w("SettingFrame 注入点未找到");
+                return;
+            }
+            target.setAccessible(true);
+            de.robv.android.xposed.XposedBridge.hookMethod(target, new de.robv.android.xposed.XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Object fragment = param.thisObject;
+                        // 只在群聊（chatType=2）时注入
+                        Object args = null;
+                        try {
+                            args = de.robv.android.xposed.XposedHelpers.callMethod(fragment, "requireArguments", new Object[0]);
+                        } catch (Throwable ignored) {}
+                        if (args == null) {
+                            try {
+                                args = de.robv.android.xposed.XposedHelpers.getObjectField(fragment, "mArguments");
+                            } catch (Throwable ignored) {}
+                        }
+                        if (args == null) {
+                            return;
+                        }
+                        int chatType = (args instanceof android.os.Bundle)
+                                ? ((android.os.Bundle) args).getInt("key_bundle_chat_type", 0) : 0;
+                        if (chatType != 2) {
+                            return;
+                        }
+                        long peerId = 0L;
+                        try {
+                            String pid = (args instanceof android.os.Bundle)
+                                    ? ((android.os.Bundle) args).getString("key_bundle_peer_id") : null;
+                            peerId = pid == null ? 0L : Long.parseLong(pid.trim());
+                        } catch (Throwable ignored) {}
+                        String nick = "";
+                        try {
+                            nick = (args instanceof android.os.Bundle)
+                                    ? ((android.os.Bundle) args).getString("key_bundle_chat_nick") : null;
+                        } catch (Throwable ignored) {}
+                        if (peerId <= 0) {
+                            return;
+                        }
+                        final long fUin = peerId;
+                        final String fNick = nick == null || nick.isEmpty() ? String.valueOf(peerId) : nick;
+                        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+                        h.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    addGroupStatEntry(fragment, fUin, fNick);
+                                } catch (Throwable th) {
+                                    com.tencent.qqlitepro.util.Log.w("注入消息数据入口失败: " + th);
+                                }
+                            }
+                        }, 260L);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            com.tencent.qqlitepro.util.Log.i("已安装聊天左滑面板消息数据注入 hook");
+        } catch (java.lang.Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("安装左滑面板 hook 失败: " + th);
+        }
+    }
+
+    /** 仿 ChatSearchKt.addChatSearchEntry 注入一个"消息数据"条目 */
+    private static void addGroupStatEntry(Object fragment, long groupUin, String groupName) {
+        try {
+            android.widget.ScrollView scroll = (android.widget.ScrollView) de.robv.android.xposed.XposedHelpers.getObjectField(fragment, "i");
+            if (scroll == null || scroll.getChildCount() == 0) {
+                return;
+            }
+            android.view.View child0 = scroll.getChildAt(0);
+            if (!(child0 instanceof android.widget.LinearLayout)) {
+                return;
+            }
+            android.widget.LinearLayout container = (android.widget.LinearLayout) child0;
+            android.content.Context ctx = null;
+            try {
+                ctx = (android.content.Context) de.robv.android.xposed.XposedHelpers.callMethod(fragment, "requireContext", new Object[0]);
+            } catch (Throwable ignored) {}
+            if (ctx == null) {
+                ctx = container.getContext();
+            }
+            android.content.res.Resources res = ctx.getResources();
+            String pkg = ctx.getPackageName();
+            int idDesc = res.getIdentifier("desc", "id", pkg);
+            int layoutSettingItem = res.getIdentifier("setting_item", "layout", pkg);
+            if (idDesc == 0 || layoutSettingItem == 0) {
+                com.tencent.qqlitepro.util.Log.w("setting_item/desc 资源未找到");
+                return;
+            }
+            // 查重：已有"消息数据"就不再注入
+            for (int i = 0; i < container.getChildCount(); ++i) {
+                android.view.View row = container.getChildAt(i);
+                android.widget.TextView desc = (android.widget.TextView) row.findViewById(idDesc);
+                if (desc != null && "消息数据".equals(String.valueOf(desc.getText()))) {
+                    return;
+                }
+            }
+            android.view.View entry = android.view.LayoutInflater.from(ctx).inflate(layoutSettingItem, container, false);
+            try {
+                android.widget.ImageView icon = (android.widget.ImageView) entry.findViewById(
+                        res.getIdentifier("icon", "id", pkg));
+                if (icon != null) {
+                    // 用宿主搜索图标样式（无合适资源则保持默认）
+                }
+            } catch (Throwable ignored) {}
+            android.widget.TextView desc = (android.widget.TextView) entry.findViewById(idDesc);
+            if (desc != null) {
+                desc.setText("消息数据");
+            }
+            final long fUin = groupUin;
+            final String fName = groupName;
+            entry.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try {
+                        com.tencent.qqlitepro.hook.SettingsInjector.openGroupMsgStats(v.getContext(), fUin, fName);
+                    } catch (Throwable th) {
+                        com.tencent.qqlitepro.util.Log.w("打开消息数据失败: " + th);
+                    }
+                }
+            });
+            container.addView(entry, Math.min(4, container.getChildCount()));
+            try {
+                java.lang.Class<?> cardCls = java.lang.Class.forName(
+                        "momoi.mod.qqpro.hook.view.CardMarginUnifyKt", false, ctx.getClassLoader());
+                for (java.lang.reflect.Method m : cardCls.getDeclaredMethods()) {
+                    if (m.getName().equals("cardMargin") && m.getParameterTypes().length == 1) {
+                        m.setAccessible(true);
+                        m.invoke(null, entry);
+                        break;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            com.tencent.qqlitepro.util.Log.i("消息数据入口已注入: group=" + groupUin);
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("addGroupStatEntry 异常: " + th);
+        }
     }
 
     /*
