@@ -1,0 +1,107 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.tencent.qqlitepro'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.tencent.qqlitepro"
+        minSdk 21
+        targetSdk 30
+        versionCode 8
+        versionName "1.2.1"
+    }
+
+    /*
+     * 签名配置：与原 APK 保持一致
+     *  - 证书主体 CN=AntiRecall, O=AntiRecall, L=CN, C=CN
+     *  - 序列号 6C38EBA91AF1EB7D
+     *  - 签名方案 v1(JAR) + v2(APK Signature Scheme v2)
+     * 说明：原包私钥不可得，无法生成字节级相同的证书指纹；
+     *      这里按原证书的主体/序列号重建密钥，保证"同一发布者"语义与 v1+v2 方案一致。
+     */
+    signingConfigs {
+        release {
+            storeFile file(System.getenv('QQMAX_KEYSTORE') ?: '../../keys/qqmax.jks')
+            storePassword System.getenv('QQMAX_STOREPASS') ?: 'qqmax123'
+            keyAlias System.getenv('QQMAX_ALIAS') ?: 'qqmax'
+            keyPassword System.getenv('QQMAX_KEYPASS') ?: 'qqmax123'
+            enableV1Signing true
+            enableV2Signing true
+            enableV3Signing false
+            enableV4Signing false
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+            shrinkResources false
+            // 模块以 Xposed 方式加载：不做混淆、删除资源或改写入口，避免破坏 hook 逻辑
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        // 原包由 AGP 8.2 + Java 11 编译（DEX 中含 $$Nest$ 桥接方法），这里对齐源码级别
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    // 保持与原始 APK 一致：assets/xposed_init 会被打包
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java']
+            res.srcDirs = ['src/main/res']
+            assets.srcDirs = ['src/main/assets']
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    packagingOptions {
+        resources {
+            // 原 APK 内含 JavaMail / Rhino 的 META-INF 资源，需完整保留
+            // 但 android-mail 与 android-activation 各带一份同名 NOTICE.md，属于打包冲突而非运行时资源
+            excludes += [
+                    'META-INF/NOTICE.md',
+                    'META-INF/NOTICE.txt',
+                    'META-INF/LICENSE.md',
+                    'META-INF/LICENSE.txt',
+                    'META-INF/LICENSE',
+                    'META-INF/*.kotlin_module'
+            ]
+            pickFirsts += ['META-INF/javamail.charset.map']
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
+    // 不生成 BuildConfig 以外的额外产物
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+dependencies {
+    // Xposed API（compileOnly：运行时由 Xposed/LSPosed 框架提供）
+    compileOnly 'de.robv.android.xposed:api:82'
+
+    // 与原 APK 内嵌版本精确一致：Gson 2.9.0（188/188 类匹配）
+    implementation 'com.google.code.gson:gson:2.9.0'
+
+    // Rhino 1.7.15（JS 插件引擎，330/330 类匹配）
+    implementation 'org.mozilla:rhino:1.7.15'
+
+    // JavaMail 1.6.7 Android 版（344/344 类匹配）
+    implementation 'com.sun.mail:android-mail:1.6.7'
+    implementation 'com.sun.mail:android-activation:1.6.7'
+}
