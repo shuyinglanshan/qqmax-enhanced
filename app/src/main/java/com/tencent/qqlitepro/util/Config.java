@@ -29,6 +29,8 @@ public final class Config {
     private static final java.lang.String KEY_CATGIRL_ENABLED = "catgirl_enabled";
     private static final java.lang.String KEY_CATGIRL_SUFFIX = "catgirl_suffix";
     private static final java.lang.String KEY_DOWNLOAD_DIR = "download_dir";
+    private static final java.lang.String KEY_IMAGE_SAVE_DIR = "image_save_dir";
+    private static final java.lang.String KEY_VIDEO_SAVE_DIR = "video_save_dir";
     private static final java.lang.String KEY_ENABLED = "enabled";
     private static final java.lang.String KEY_FORCE_NOTICE_READ = "force_notice_read";
     private static final java.lang.String KEY_KEYWORD_REPLY_CONTENT = "keyword_reply_content";
@@ -98,6 +100,8 @@ public final class Config {
     private static volatile boolean sCatgirlEnabled = false;
     private static volatile java.lang.String sCatgirlSuffix = "";
     private static volatile java.lang.String sDownloadDir = "";
+    private static volatile java.lang.String sImageSaveDir = "";
+    private static volatile java.lang.String sVideoSaveDir = "";
     private static volatile boolean sEnabled = true;
     private static volatile java.lang.String sForceNoticeRead = "";
     private static volatile java.lang.String sKeywordReplyContent = "";
@@ -311,6 +315,108 @@ public final class Config {
         sDownloadDir = str == null ? "" : str.trim();
         sDownloadDir = sDownloadDir.endsWith("/") ? sDownloadDir.substring(0, sDownloadDir.length() - 1) : sDownloadDir;
         markDirtyAndPersist(context);
+    }
+
+    /**
+     * 图片保存路径：空 = 跟随 downloadDir。
+     * SD 卡 tree URI（content://）自动转文件路径；不可写时回退应用目录。
+     */
+    public static synchronized java.lang.String imageSaveDir(android.content.Context context) {
+        if (!fastHit()) {
+            reload(context);
+        }
+        return resolveMediaDir(context, sImageSaveDir, "images");
+    }
+
+    /** 用户原始设置的图片路径（未设置返回 ""，不展开默认目录）——宿主 hook 用 */
+    public static synchronized java.lang.String imageSaveDirRaw(android.content.Context context) {
+        if (!fastHit()) {
+            reload(context);
+        }
+        return sImageSaveDir;
+    }
+
+    /** 用户原始设置的视频路径（未设置返回 ""） */
+    public static synchronized java.lang.String videoSaveDirRaw(android.content.Context context) {
+        if (!fastHit()) {
+            reload(context);
+        }
+        return sVideoSaveDir;
+    }
+
+    public static synchronized void setImageSaveDir(android.content.Context context, java.lang.String str) {
+        sImageSaveDir = str == null ? "" : str.trim();
+        sImageSaveDir = sImageSaveDir.endsWith("/") ? sImageSaveDir.substring(0, sImageSaveDir.length() - 1) : sImageSaveDir;
+        markDirtyAndPersist(context);
+    }
+
+    /** 视频保存路径：空 = 跟随 downloadDir */
+    public static synchronized java.lang.String videoSaveDir(android.content.Context context) {
+        if (!fastHit()) {
+            reload(context);
+        }
+        return resolveMediaDir(context, sVideoSaveDir, "videos");
+    }
+
+    public static synchronized void setVideoSaveDir(android.content.Context context, java.lang.String str) {
+        sVideoSaveDir = str == null ? "" : str.trim();
+        sVideoSaveDir = sVideoSaveDir.endsWith("/") ? sVideoSaveDir.substring(0, sVideoSaveDir.length() - 1) : sVideoSaveDir;
+        markDirtyAndPersist(context);
+    }
+
+    /** 媒体目录解析：tree URI 转路径 + 可写性校验 + 回退 */
+    private static java.lang.String resolveMediaDir(android.content.Context context, java.lang.String custom, java.lang.String fallbackName) {
+        if (custom == null || custom.trim().isEmpty()) {
+            java.io.File f0 = new java.io.File(downloadDir(context), fallbackName);
+            try {
+                if (!f0.exists()) f0.mkdirs();
+            } catch (Throwable ignored) {}
+            return f0.getAbsolutePath();
+        }
+        String p = custom.trim();
+        /* content:// tree URI -> 真实路径（primary storage 常见映射） */
+        if (p.startsWith("content://")) {
+            String mapped = mapTreeUriToPath(p);
+            if (mapped != null) {
+                p = mapped;
+            } else {
+                java.io.File f1 = new java.io.File(downloadDir(context), fallbackName);
+                try { if (!f1.exists()) f1.mkdirs(); } catch (Throwable ignored) {}
+                return f1.getAbsolutePath();
+            }
+        }
+        java.io.File f = new java.io.File(p);
+        if (com.tencent.qqlitepro.util.Storage.ensureWritable(f)) {
+            return f.getAbsolutePath();
+        }
+        java.io.File fb = new java.io.File(downloadDir(context), fallbackName);
+        try { if (!fb.exists()) fb.mkdirs(); } catch (Throwable ignored) {}
+        return fb.getAbsolutePath();
+    }
+
+    /** content://tree/primary:xxx -> /storage/emulated/0/xxx（仅常见映射） */
+    public static java.lang.String mapTreeUriToPathPublic(java.lang.String uri) {
+        return mapTreeUriToPath(uri);
+    }
+
+    private static java.lang.String mapTreeUriToPath(java.lang.String uri) {
+        try {
+            if (uri.contains("primary%3A")) {
+                String sub = uri.substring(uri.indexOf("primary%3A") + "primary%3A".length());
+                sub = java.net.URLDecoder.decode(sub, "UTF-8");
+                if (sub.endsWith(":")) sub = sub.substring(0, sub.length() - 1);
+                if (sub.isEmpty()) return "/storage/emulated/0";
+                return "/storage/emulated/0/" + sub;
+            }
+            if (uri.contains("primary:")) {
+                String sub = uri.substring(uri.indexOf("primary:") + "primary:".length());
+                sub = java.net.URLDecoder.decode(sub, "UTF-8");
+                if (sub.endsWith(":")) sub = sub.substring(0, sub.length() - 1);
+                if (sub.isEmpty()) return "/storage/emulated/0";
+                return "/storage/emulated/0/" + sub;
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     public static boolean qqDynamicEnabled(android.content.Context context) {
@@ -973,6 +1079,42 @@ public final class Config {
         return sMailLastUid;
     }
 
+    /** 最新邮件的发件人（缓存字段 from/sender） */
+    public static java.lang.String mailLatestFrom(android.content.Context context) {
+        return mailLatestField(context, new String[]{"from", "sender", "fromName"});
+    }
+
+    /** 最新邮件的主题 */
+    public static java.lang.String mailLatestSubject(android.content.Context context) {
+        return mailLatestField(context, new String[]{"subject", "title"});
+    }
+
+    private static java.lang.String mailLatestField(android.content.Context context, String[] keys) {
+        if (!fastHit()) {
+            reload(context);
+        }
+        try {
+            String cache = sMailInboxCache;
+            if (cache == null || cache.isEmpty()) {
+                return "";
+            }
+            com.google.gson.JsonArray arr = (com.google.gson.JsonArray) GSON.fromJson(cache, com.google.gson.JsonArray.class);
+            if (arr == null || arr.size() <= 0 || !arr.get(0).isJsonObject()) {
+                return "";
+            }
+            com.google.gson.JsonObject o = arr.get(0).getAsJsonObject();
+            for (String k : keys) {
+                if (o.has(k) && o.get(k).isJsonPrimitive()) {
+                    String v = o.get(k).getAsString();
+                    if (v != null && !v.trim().isEmpty()) {
+                        return v.trim();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return "";
+    }
+
     public static java.lang.String mailLatestSummary(android.content.Context context) {
         com.google.gson.JsonArray jsonArray;
         if (!fastHit()) {
@@ -1066,11 +1208,9 @@ public final class Config {
     }
 
     /** 临时会话功能是否启用（默认开） */
+    /** 临时会话功能：始终开启（不再有开关） */
     public static boolean tempChatEnabled(android.content.Context context) {
-        if (!fastHit()) {
-            reload(context);
-        }
-        return sTempChatEnabled;
+        return true;
     }
 
     public static void setTempChatEnabled(android.content.Context context, boolean z) {
@@ -1367,6 +1507,8 @@ public final class Config {
         jsonObject.addProperty(KEY_SEND_MODE, java.lang.Integer.valueOf(sSendMode));
         jsonObject.addProperty(KEY_SHARD_ENABLED, java.lang.Boolean.valueOf(sShardEnabled));
         jsonObject.addProperty(KEY_DOWNLOAD_DIR, sDownloadDir);
+        jsonObject.addProperty(KEY_IMAGE_SAVE_DIR, sImageSaveDir);
+        jsonObject.addProperty(KEY_VIDEO_SAVE_DIR, sVideoSaveDir);
         jsonObject.addProperty(KEY_PLUGINS_ENABLED, sPluginsEnabled);
         jsonObject.addProperty(KEY_QQ_DYNAMIC_ENABLED, java.lang.Boolean.valueOf(sQqDynamicEnabled));
         jsonObject.addProperty(KEY_QQ_DYNAMIC_INTERVAL, java.lang.Integer.valueOf(sQqDynamicInterval));
@@ -1449,6 +1591,10 @@ public final class Config {
         sShardEnabled = getBool(jsonObject, KEY_SHARD_ENABLED, false);
         java.lang.String str = getStr(jsonObject, KEY_DOWNLOAD_DIR, "");
         sDownloadDir = str == null ? "" : str.trim();
+        java.lang.String strImg = getStr(jsonObject, KEY_IMAGE_SAVE_DIR, "");
+        sImageSaveDir = strImg == null ? "" : strImg.trim();
+        java.lang.String strVid = getStr(jsonObject, KEY_VIDEO_SAVE_DIR, "");
+        sVideoSaveDir = strVid == null ? "" : strVid.trim();
         sPluginsEnabled = getStr(jsonObject, KEY_PLUGINS_ENABLED, "");
         sQqDynamicEnabled = getBool(jsonObject, KEY_QQ_DYNAMIC_ENABLED, false);
         sQqDynamicInterval = getInt(jsonObject, KEY_QQ_DYNAMIC_INTERVAL, 30);
