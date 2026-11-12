@@ -1274,10 +1274,15 @@ public final class QqKernel {
         }
     }
 
-    /** peerUid 转 QQ 号（供点赞等多处调用；非 u_ 开头原样返回） */
+    /** peerUid 转 QQ 号（供点赞等多处调用；非 u_ 开头原样返回）。
+     * 兜底链：IContactRuntimeService.map -> 临时会话登记表 -> 联系人内核缓存 */
     public static long uidToUinPublic(java.lang.String uid) {
         if (uid == null || uid.isEmpty()) {
             return 0L;
+        }
+        /* 兼容 "u_xxx|昵称" 之类混合 key */
+        if (uid.contains("|")) {
+            uid = uid.substring(0, uid.indexOf('|')).trim();
         }
         if (!uid.startsWith("u_")) {
             try {
@@ -1287,10 +1292,43 @@ public final class QqKernel {
             } catch (Throwable ignored) {}
             return 0L;
         }
+        // 1) 宿主 IContactRuntimeService 映射
         try {
             String v = uidToUin(uid);
             if (v != null && v.matches("\\d+")) {
                 return Long.parseLong(v);
+            }
+        } catch (Throwable ignored) {}
+        // 2) 临时会话登记表（点开过的临时会话都有 uin）
+        try {
+            Object[] v = tempChatKnownEntry(uid);
+            if (v != null) {
+                long u = longOf(v[0]);
+                if (u > 0) {
+                    return u;
+                }
+            }
+        } catch (Throwable ignored) {}
+        // 3) 联系人内核缓存：IContactRuntimeService 之外再看 helper 类的字段
+        try {
+            Object svc = qrouteApi("com.tencent.qqnt.watch.contact.api.IContactRuntimeService");
+            if (svc != null) {
+                /* 遍历其全部 Map 字段找 key 命中 */
+                for (java.lang.reflect.Field f : svc.getClass().getDeclaredFields()) {
+                    try {
+                        f.setAccessible(true);
+                        Object m = f.get(svc);
+                        if (m instanceof java.util.Map) {
+                            Object val = ((java.util.Map) m).get(uid);
+                            if (val != null) {
+                                String sv = String.valueOf(val);
+                                if (sv.matches("\\d{5,12}")) {
+                                    return Long.parseLong(sv);
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
             }
         } catch (Throwable ignored) {}
         return 0L;
@@ -4400,6 +4438,26 @@ public final class QqKernel {
     /** 当前长按菜单对应的目标会话（宿主菜单 hook 回调时读取） */
     private static volatile java.lang.String sMenuTargetUid;
 
+    /** 菜单打开时登记目标（供所有菜单 hook 取） */
+    public static void registerMenuTarget(java.lang.String uid, java.lang.String nick, int chatType, long uin) {
+        sMenuTargetUid = normPeerUid(uid);
+        setMenuTargetName(nick);
+        sMenuTargetUinLong = uin;
+        sMenuTargetChatType = chatType;
+    }
+
+    private static volatile int sMenuTargetChatType;
+    public static int menuTargetChatType() {
+        return sMenuTargetChatType;
+    }
+
+    /** 菜单关闭时清空登记目标（防止下一个菜单沿用旧 uid） */
+    public static void clearMenuTarget() {
+        sMenuTargetUid = null;
+        sMenuTargetName = null;
+        sMenuTargetUinLong = 0L;
+    }
+
     /** 供宿主菜单 hook（删除/置顶/免打扰）取目标 peerUid */
     public static java.lang.String menuTargetUid() {
         return sMenuTargetUid;
@@ -4819,11 +4877,10 @@ public final class QqKernel {
         rememberTempChatTemplate(arrayList);
         int iPatchTempChatEntriesInPlace = patchTempChatEntriesInPlace(arrayList);
         /*
-         * 架构调整：临时会话不再"分散插入"到会话列表，改为聚合成一张卡片
-         * （与 QQ 邮箱卡片一致：列表只出现一张，点进去看全部临时会话）。
-         * 这里保留登记/样式处理，但关闭列表注入。
+         * 临时会话直接作为普通会话条目插入主会话列表（按最后消息时间排序），
+         * 与宿主真实会话一致（昵称/头像/未读/时间/预览 + 原生长按菜单）。
          */
-        int iEnsureTempChatsFromKnown = 0;
+        int iEnsureTempChatsFromKnown = ensureTempChatsFromKnown(arrayList, list, null);
         if (iPatchTempChatEntriesInPlace == 0 && iEnsureTempChatsFromKnown == 0) {
             return;
         }
@@ -5028,7 +5085,7 @@ public final class QqKernel {
             if (uin != 0 && usedContactIds.contains(java.lang.Long.valueOf(uin))) {
                 continue;
             }
-            java.lang.Object info = buildTempChatInfo(template, uid, uin, 0,
+            java.lang.Object info = buildTempChatInfo(template, uid, uin, 1,
                     value != null ? strOf(value[1]) : "",
                     value != null ? longOf(value[2]) : 0L);
             if (info == null) {
@@ -5990,6 +6047,16 @@ public final class QqKernel {
         }
     }
 
+    /** 反射安全设 int（字段不存在时静默跳过） */
+    public static void safeSetIntField(Object obj, String name, int v) {
+        try { de.robv.android.xposed.XposedHelpers.setIntField(obj, name, v); } catch (Throwable ignored) {}
+    }
+
+    /** 反射安全设 long */
+    public static void safeSetLongField(Object obj, String name, long v) {
+        try { de.robv.android.xposed.XposedHelpers.setLongField(obj, name, v); } catch (Throwable ignored) {}
+    }
+
     /** 通过 QRoute 取得 API 实现（反射封装） */
     private static java.lang.Object invokeQRouteApi(java.lang.Class<?> apiCls) {
         try {
@@ -6006,201 +6073,10 @@ public final class QqKernel {
     }
 
     /** 临时会话总数（供汇总卡片展示） */
-    /* ==================== 在线状态点赞（逆向自宿主 IKernelOnlineStatusService） ==================== */
-    private static volatile Object sSessionRef;
-
-    /** 点赞类型：对应宿主 OnlineStatusConstant */
-    public static final int LIKE_TYPE_ZAN = 1;      // 赞
-    public static final int LIKE_TYPE_XIN = 2;      // 心
-    public static final int LIKE_TYPE_GOUTOU = 3;   // 狗头
-    public static final int LIKE_TYPE_JINGLI = 4;   // 惊了
-    public static final int LIKE_TYPE_BAOBAO = 5;   // 宝宝
-    public static final int LIKE_TYPE_UNKNOWN = 0;
-
     /**
-     * 取内核在线状态服务（IKernelOnlineStatusService）。
-     * 与 kernelMsgService 同源：KernelServiceUtil.c() 返回 IQQNTWrapperSession，
-     * 再 getOnlineStatusService()。
-     */
-    private static Object onlineStatusService() throws Throwable {
-        try {
-            Object session = kernelSessionInstance();
-            if (session == null) {
-                com.tencent.qqlitepro.util.Log.w("在线状态: 内核 session 未就绪（KernelServiceUtil.c 为空）");
-                return null;
-            }
-            java.lang.reflect.Method m = session.getClass().getMethod("getOnlineStatusService");
-            m.setAccessible(true);
-            Object svc = m.invoke(session);
-            if (svc == null) {
-                com.tencent.qqlitepro.util.Log.w("在线状态: getOnlineStatusService 返回空");
-            }
-            return svc;
-        } catch (Throwable t) {
-            com.tencent.qqlitepro.util.Log.w("在线状态: 获取 service 失败 " + chain(t));
-            return null;
-        }
-    }
-
-    /**
-     * 内核 session：KernelServiceUtil.c()（模块 sendMsg/recallMsg 同款路径）。
-     * 若 c() 没找到则遍历该类静态无参方法兜底。
-     */
-    private static Object kernelSessionInstance() {
-        try {
-            java.lang.reflect.Method m = findMethod(cls("com.tencent.qqnt.msg.KernelServiceUtil"), "c", new java.lang.Class[0]);
-            if (m != null) {
-                Object v = m.invoke(null, new Object[0]);
-                if (v != null) {
-                    return v;
-                }
-            }
-            // 兜底：遍历 KernelServiceUtil 全部静态无参方法
-            Class<?> utilCls = cls("com.tencent.qqnt.msg.KernelServiceUtil");
-            if (utilCls != null) {
-                for (java.lang.reflect.Method m2 : utilCls.getDeclaredMethods()) {
-                    if (!java.lang.reflect.Modifier.isStatic(m2.getModifiers())) continue;
-                    if (m2.getParameterTypes().length != 0) continue;
-                    try {
-                        m2.setAccessible(true);
-                        Object v2 = m2.invoke(null, new Object[0]);
-                        if (v2 != null && v2.getClass().getName().contains("WrapperSession")) {
-                            return v2;
-                        }
-                    } catch (Throwable ignored) {}
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    /**
-     * 给好友点在线状态赞。
-     * 逆向自：IKernelOnlineStatusService.setLikeStatus(OSLikeStatusReq, IOSLikeStatusCallback)
-     *   OSLikeStatusReq{businessType:int, uin:long, likeItems:ArrayList<OSLikeItem{likeType:int, extInfo}>, isCancel:long}
-     */
-    public static String sendOnlineStatusLike(long targetUin, int likeType, int count) {
-        StringBuilder sb = new StringBuilder();
-        try {
-            Object svc = onlineStatusService();
-            if (svc == null) {
-                return "内核在线状态服务不可用（宿主未就绪）";
-            }
-            Class<?> reqCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.OSLikeStatusReq");
-            Class<?> itemCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.OSLikeItem");
-            Class<?> cbCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.IOSLikeStatusCallback");
-
-            java.lang.reflect.Constructor<?> reqCtor = reqCls.getConstructor(Integer.TYPE, Long.TYPE, java.util.ArrayList.class, Long.TYPE);
-            Object req = reqCtor.newInstance(Integer.valueOf(0), Long.valueOf(targetUin),
-                    new java.util.ArrayList(), Long.valueOf(0L));
-
-            java.util.ArrayList items = new java.util.ArrayList();
-            for (int i = 0; i < Math.max(1, Math.min(count, 20)); i++) {
-                items.add(itemCls.getConstructor(Integer.TYPE,
-                        Class.forName("com.tencent.qqnt.kernel.nativeinterface.OSLikeExtInfo"))
-                        .newInstance(Integer.valueOf(likeType), null));
-            }
-            reqCls.getField("likeItems").set(req, items);
-
-            final int[] code = {-999};
-            final String[] err = {""};
-            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-            Object cb = java.lang.reflect.Proxy.newProxyInstance(cbCls.getClassLoader(),
-                    new Class<?>[]{cbCls},
-                    new java.lang.reflect.InvocationHandler() {
-                        @Override
-                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
-                            if ("onResult".equals(m.getName()) && args != null && args.length >= 2) {
-                                code[0] = args[0] instanceof Integer ? (Integer) args[0] : -1;
-                                err[0] = args[1] == null ? "" : String.valueOf(args[1]);
-                                latch.countDown();
-                            }
-                            return null;
-                        }
-                    });
-
-            java.lang.reflect.Method setLike = findMethod(svc.getClass(), "setLikeStatus", reqCls, cbCls);
-            if (setLike == null) {
-                setLike = findMethod(svc.getClass(), "setLikeStatus", reqCls, cbCls);
-            }
-            if (setLike == null) {
-                return "内核未提供 setLikeStatus";
-            }
-            setLike.setAccessible(true);
-            setLike.invoke(svc, req, cb);
-            if (!latch.await(15000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                return "点赞回调超时";
-            }
-            if (code[0] == 0) {
-                return null;   // 成功
-            }
-            return "点赞失败 code=" + code[0] + (err[0].isEmpty() ? "" : " " + err[0]);
-        } catch (Throwable t) {
-            return "点赞异常 " + chain(t);
-        }
-    }
-
-    /** 查某好友的点赞列表（供界面展示） */
-    public static java.util.ArrayList<?> getOnlineStatusLikeList(long targetUin) {
-        try {
-            Object svc = onlineStatusService();
-            if (svc == null) {
-                return null;
-            }
-            Class<?> reqCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.OSGetLikeListReq");
-            Class<?> cbCls = Class.forName("com.tencent.qqnt.kernel.nativeinterface.IOSGetLikeListCallback");
-            Object req = reqCls.newInstance();
-            try {
-                reqCls.getField("uin").set(req, Long.valueOf(targetUin));
-            } catch (Throwable ignored) {
-            }
-            final java.util.ArrayList[] out = new java.util.ArrayList[1];
-            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
-            Object cb = java.lang.reflect.Proxy.newProxyInstance(cbCls.getClassLoader(),
-                    new Class<?>[]{cbCls},
-                    new java.lang.reflect.InvocationHandler() {
-                        @Override
-                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
-                            if ("onResult".equals(m.getName())) {
-                                for (Object a : (args == null ? new Object[0] : args)) {
-                                    if (a instanceof java.util.ArrayList) {
-                                        out[0] = (java.util.ArrayList) a;
-                                    }
-                                }
-                                latch.countDown();
-                            }
-                            return null;
-                        }
-                    });
-            java.lang.reflect.Method get = findMethod(svc.getClass(), "getLikeList", reqCls, cbCls);
-            if (get == null) {
-                return null;
-            }
-            get.setAccessible(true);
-            get.invoke(svc, req, cb);
-            latch.await(15000, java.util.concurrent.TimeUnit.MILLISECONDS);
-            return out[0];
-        } catch (Throwable t) {
-            com.tencent.qqlitepro.util.Log.w("在线状态: 点赞列表获取失败 " + chain(t));
-            return null;
-        }
-    }
-
-    /* ==================== 群聊消息统计（近 N 天消息总数 + 发言排行榜） ==================== */
-
-    /**
-     * 统计结果：total=消息总数, rank=发言排行 {发言人名, 条数}（已按条数降序）
-     */
-    public static final class GroupMsgStats {
-        public long total;
-        public final java.util.ArrayList<java.lang.String[]> rank = new java.util.ArrayList<>();
-        public int days;
-        public java.lang.String error;
-    }
-
-    /**
-     * 从宿主内核拉取群消息并按发言人聚合。
-     * 调用链（逆向）：IQQNTWrapperSession.getMsgService() -> IKernelMsgService.getMsgs(Contact, long startMsgId, int count, boolean, IKernelGetMsgsCallback)
+     * 群消息统计（近 N 天）：内核 getMsgs 拉取后按发送者聚合。
+     * 逆向链路：KernelServiceUtil.c() = IMsgService，
+     * getMsgs(Contact, startMsgId=0, count, order=true, IKernelGetMsgsCallback)
      */
     public static GroupMsgStats groupMsgStats(long groupUin, int days) {
         GroupMsgStats st = new GroupMsgStats();
@@ -6213,9 +6089,12 @@ public final class QqKernel {
             }
             Class<?> contactCls = cls("com.tencent.qqnt.kernel.nativeinterface.Contact");
             Object contact = contactCls.newInstance();
-            de.robv.android.xposed.XposedHelpers.setIntField(contact, "chatType", 2);
-            de.robv.android.xposed.XposedHelpers.setLongField(contact, "peerUin", groupUin);
-            de.robv.android.xposed.XposedHelpers.setLongField(contact, "peerId", groupUin);
+            safeSetIntField(contact, "chatType", 2);
+            safeSetLongField(contact, "peerUin", groupUin);
+            safeSetLongField(contact, "peerId", groupUin);
+            try {
+                de.robv.android.xposed.XposedHelpers.setObjectField(contact, "peerUid", String.valueOf(groupUin));
+            } catch (Throwable ignored) {}
 
             Class<?> cbCls = cls("com.tencent.qqnt.kernel.nativeinterface.IKernelGetMsgsCallback");
             final Object[] msgsBox = new Object[1];
@@ -6234,89 +6113,95 @@ public final class QqKernel {
                     });
 
             java.lang.reflect.Method getMsgs = null;
-            for (java.lang.reflect.Method m : svc.getClass().getMethods()) {
-                if (!"getMsgs".equals(m.getName())) continue;
+            for (java.lang.reflect.Method m : svc.getClass().getDeclaredMethods()) {
+                if (!m.getName().equals("getMsgs")) continue;
                 Class<?>[] ps = m.getParameterTypes();
-                if (ps.length >= 3 && ps[0] == contactCls) { getMsgs = m; break; }
+                if (ps.length >= 4 && ps[0] == contactCls && ps[1] == Long.TYPE && ps[2] == Integer.TYPE) {
+                    getMsgs = m;
+                    break;
+                }
             }
             if (getMsgs == null) {
-                st.error = "内核未提供 getMsgs";
+                st.error = "IKernelMsgService.getMsgs 未找到";
                 return st;
             }
             getMsgs.setAccessible(true);
-            // 参数：contact, startMsgId=0(最新), count, 是否向前, callback —— 按类型填充
-            Class<?>[] ps = getMsgs.getParameterTypes();
-            Object[] argv = new Object[ps.length];
-            boolean cbSet = false;
-            for (int i = 0; i < ps.length; ++i) {
-                if (ps[i] == contactCls) argv[i] = contact;
-                else if (ps[i] == Long.TYPE) argv[i] = Long.valueOf(0L);
-                else if (ps[i] == Integer.TYPE) argv[i] = Integer.valueOf(1500);
-                else if (ps[i] == Boolean.TYPE) argv[i] = Boolean.FALSE;
-                else if (cbCls.isAssignableFrom(ps[i])) { argv[i] = cb; cbSet = true; }
-                else argv[i] = null;
+            Object[] invokeArgs = new Object[getMsgs.getParameterTypes().length];
+            invokeArgs[0] = contact;
+            invokeArgs[1] = Long.valueOf(0L);
+            invokeArgs[2] = Integer.valueOf(1500);
+            for (int i = 3; i < invokeArgs.length; i++) {
+                Class<?> pt = getMsgs.getParameterTypes()[i];
+                if (pt == Boolean.TYPE) invokeArgs[i] = Boolean.TRUE;
+                else if (pt == Integer.TYPE) invokeArgs[i] = Integer.valueOf(0);
+                else if (pt == Long.TYPE) invokeArgs[i] = Long.valueOf(0L);
+                else if (pt == cbCls) invokeArgs[i] = cb;
+                else if (pt == java.util.List.class || pt == java.util.ArrayList.class) invokeArgs[i] = new java.util.ArrayList();
+                else invokeArgs[i] = null;
             }
-            if (!cbSet) {
-                st.error = "getMsgs 回调参数未匹配";
-                return st;
-            }
-            getMsgs.invoke(svc, argv);
-            if (!latch.await(20000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            getMsgs.invoke(svc, invokeArgs);
+            if (!latch.await(15000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
                 st.error = "拉取消息超时";
                 return st;
             }
             Object result = msgsBox[0];
-            java.util.List list = null;
-            if (result instanceof java.util.ArrayList) {
-                list = (java.util.ArrayList) result;
+            java.util.List<?> list = null;
+            if (result instanceof java.util.List) {
+                list = (java.util.List<?>) result;
             } else if (result != null) {
-                // 可能是包一层的结果对象，找 ArrayList 字段
-                for (java.lang.reflect.Field f : result.getClass().getDeclaredFields()) {
-                    if (f.getType() == java.util.ArrayList.class) {
-                        f.setAccessible(true);
-                        Object v = f.get(result);
-                        if (v instanceof java.util.ArrayList) { list = (java.util.ArrayList) v; break; }
-                    }
-                }
+                try {
+                    Object arr = de.robv.android.xposed.XposedHelpers.callMethod(result, "getMsgList", new Object[0]);
+                    if (arr instanceof java.util.List) list = (java.util.List<?>) arr;
+                } catch (Throwable ignored) {}
             }
-            if (list == null || list.isEmpty()) {
-                st.error = "未取到消息";
+            if (list == null) {
+                st.error = "消息列表为空";
                 return st;
             }
 
             long cutoff = System.currentTimeMillis() - days * 86400000L;
-            java.util.HashMap<String, Integer> bySender = new java.util.HashMap<>();
-            java.util.HashMap<String, String> nameBySender = new java.util.HashMap<>();
+            java.util.HashMap<String, Integer> bySender = new java.util.HashMap<String, Integer>();
+            java.util.HashMap<String, String> nameBySender = new java.util.HashMap<String, String>();
+            java.util.HashSet<String> seenMsgIds = new java.util.HashSet<String>();
             for (Object msg : list) {
                 try {
+                    String msgKey = null;
+                    try { msgKey = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "msgId")); } catch (Throwable ignored) {}
+                    if (msgKey == null || "0".equals(msgKey)) {
+                        try { msgKey = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "msgSeq")); } catch (Throwable ignored) {}
+                    }
+                    if (msgKey != null && !"0".equals(msgKey) && !seenMsgIds.add(msgKey)) {
+                        continue;
+                    }
                     long msgTime = 0;
                     try { msgTime = de.robv.android.xposed.XposedHelpers.getLongField(msg, "msgTime"); } catch (Throwable ignored) {}
                     if (msgTime <= 0) {
                         try { msgTime = de.robv.android.xposed.XposedHelpers.getLongField(msg, "time"); } catch (Throwable ignored) {}
                     }
-                    // msgTime 是秒
-                    if (msgTime > 0 && msgTime < cutoff / 1000L) continue;
+                    if (msgTime <= 0) continue;
+                    if (msgTime * 1000L < cutoff) continue;
+                    if (msgTime * 1000L > System.currentTimeMillis() + 86400000L) continue;
                     String senderKey = null;
+                    String nm = null;
                     try { senderKey = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "senderUid"); } catch (Throwable ignored) {}
+                    try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendMemberName"); } catch (Throwable ignored) {}
+                    if (nm == null || nm.isEmpty()) {
+                        try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendNickName"); } catch (Throwable ignored) {}
+                    }
                     if (senderKey == null || senderKey.isEmpty()) {
                         try { senderKey = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "senderUin")); } catch (Throwable ignored) {}
                     }
-                    if (senderKey == null || senderKey.isEmpty()) continue;
+                    if (senderKey == null || senderKey.isEmpty() || "0".equals(senderKey)) continue;
                     Integer c = bySender.get(senderKey);
-                    bySender.put(senderKey, Integer.valueOf(c == null ? 1 : c + 1));
+                    bySender.put(senderKey, Integer.valueOf(c == null ? 1 : c.intValue() + 1));
                     if (!nameBySender.containsKey(senderKey)) {
-                        String nm = null;
-                        try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendMemberName"); } catch (Throwable ignored) {}
-                        if (nm == null || nm.isEmpty()) {
-                            try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendNickName"); } catch (Throwable ignored) {}
-                        }
                         nameBySender.put(senderKey, nm == null || nm.isEmpty() ? senderKey : nm);
                     }
                     st.total++;
                 } catch (Throwable ignored) {
                 }
             }
-            // 排行排序
+            /* 排行 Top15 */
             java.util.ArrayList<java.util.Map.Entry<String, Integer>> sorted =
                     new java.util.ArrayList<java.util.Map.Entry<String, Integer>>(bySender.entrySet());
             java.util.Collections.sort(sorted, new java.util.Comparator<java.util.Map.Entry<String, Integer>>() {
@@ -6325,15 +6210,171 @@ public final class QqKernel {
                     return Integer.compare(b.getValue().intValue(), a.getValue().intValue());
                 }
             });
-            for (java.util.Map.Entry<String, Integer> e : sorted) {
+            int limit = Math.min(15, sorted.size());
+            for (int i = 0; i < limit; i++) {
+                java.util.Map.Entry<String, Integer> e = sorted.get(i);
                 String k = (String) e.getKey();
-                st.rank.add(new java.lang.String[]{nameBySender.get(k), String.valueOf(e.getValue())});
+                st.rank.add(new String[]{nameBySender.get(k), String.valueOf(e.getValue()), k});
             }
             return st;
         } catch (Throwable t) {
             st.error = "统计异常 " + chain(t);
             return st;
         }
+    }
+
+    /* ==================== 个性签名（逆向：IKernelProfileService.setLongNick） ==================== */
+
+    /** 设置个性签名。成功返回 null，失败返回错误信息。 */
+    public static String setLongNick(String text) {
+        try {
+            Object svc = profileService();
+            if (svc == null) {
+                return "内核 ProfileService 不可用";
+            }
+            Class<?> cbCls = cls("com.tencent.qqnt.kernel.nativeinterface.IOperateCallback");
+            final int[] code = {-999};
+            final String[] err = {""};
+            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            Object cb = java.lang.reflect.Proxy.newProxyInstance(cbCls.getClassLoader(),
+                    new Class<?>[]{cbCls},
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
+                            if ("onResult".equals(m.getName()) && args != null && args.length >= 2) {
+                                code[0] = args[0] instanceof Integer ? (Integer) args[0] : -1;
+                                err[0] = args[1] == null ? "" : String.valueOf(args[1]);
+                                latch.countDown();
+                            }
+                            return null;
+                        }
+                    });
+            java.lang.reflect.Method set = null;
+            for (java.lang.reflect.Method m : svc.getClass().getDeclaredMethods()) {
+                if (m.getName().equals("setLongNick") && m.getParameterTypes().length == 2
+                        && m.getParameterTypes()[0] == String.class) {
+                    set = m;
+                    break;
+                }
+            }
+            if (set == null) {
+                return "setLongNick 未找到";
+            }
+            set.setAccessible(true);
+            set.invoke(svc, text, cb);
+            if (!latch.await(15000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                return "保存超时";
+            }
+            if (code[0] == 0) {
+                return null;
+            }
+            return "code=" + code[0] + (err[0].isEmpty() ? "" : " " + err[0]);
+        } catch (Throwable t) {
+            return "异常 " + chain(t);
+        }
+    }
+
+    /** 读当前签名（ProfileService 拉自己的资料，尽力而为） */
+    public static String currentLongNick() {
+        try {
+            Object svc = profileService();
+            if (svc == null) {
+                return "";
+            }
+            /* 遍历无参或自参方法找 getSelfProfile 系列调用（尽力读取 longNick）。 */
+            for (java.lang.reflect.Method m : svc.getClass().getDeclaredMethods()) {
+                String n = m.getName();
+                if (!n.startsWith("getSelfProfile")) continue;
+                try {
+                    m.setAccessible(true);
+                    Class<?>[] ps = m.getParameterTypes();
+                    Object[] argv = new Object[ps.length];
+                    boolean ok = true;
+                    for (int i = 0; i < ps.length; i++) {
+                        Class<?> pt = ps[i];
+                        if (pt == String.class) argv[i] = selfUid();
+                        else if (pt == Long.TYPE) argv[i] = Long.valueOf(selfUin());
+                        else if (pt.isInterface() || !pt.isPrimitive()) argv[i] = null;
+                        else if (pt == Integer.TYPE) argv[i] = Integer.valueOf(0);
+                        else if (pt == Boolean.TYPE) argv[i] = Boolean.FALSE;
+                        else { ok = false; break; }
+                    }
+                    if (!ok) continue;
+                    Object r = m.invoke(svc, argv);
+                    if (r != null) {
+                        try {
+                            Object v = de.robv.android.xposed.XposedHelpers.getObjectField(r, "longNick");
+                            if (v instanceof String) {
+                                return (String) v;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+        return "";
+    }
+
+    /** 内核 session：KernelServiceUtil.g()（f().getWrapperSession()） */
+    private static Object kernelSessionInstance() {
+        try {
+            java.lang.reflect.Method g = findMethod(cls("com.tencent.qqnt.msg.KernelServiceUtil"), "g", new java.lang.Class[0]);
+            if (g != null) {
+                Object v = g.invoke(null, new Object[0]);
+                if (v != null) {
+                    return v;
+                }
+            }
+            Class<?> utilCls = cls("com.tencent.qqnt.msg.KernelServiceUtil");
+            if (utilCls != null) {
+                for (java.lang.reflect.Method m2 : utilCls.getDeclaredMethods()) {
+                    if (!java.lang.reflect.Modifier.isStatic(m2.getModifiers())) continue;
+                    if (m2.getParameterTypes().length != 0) continue;
+                    if (!m2.getReturnType().getName().endsWith("IQQNTWrapperSession")) continue;
+                    m2.setAccessible(true);
+                    Object v2 = m2.invoke(null, new Object[0]);
+                    if (v2 != null) {
+                        return v2;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /**
+     * IKernelProfileService：走 session.getProfileService()。
+     * 逆向确认：IQQNTWrapperSession.getProfileService() -> IKernelProfileService
+     * （含 setLongNick）；而 KernelServiceUtil.d() 返回的是宿主包装层 IProfileService，无 setLongNick。
+     */
+    private static Object profileService() {
+        try {
+            Object session = kernelSessionInstance();
+            if (session != null) {
+                java.lang.reflect.Method m = session.getClass().getMethod("getProfileService");
+                m.setAccessible(true);
+                Object v = m.invoke(session);
+                if (v != null) {
+                    return v;
+                }
+            }
+        } catch (Throwable ignored) {}
+        /* 兜底：KernelServiceUtil.d()（包装层，可能无 setLongNick） */
+        try {
+            java.lang.reflect.Method d = findMethod(cls("com.tencent.qqnt.msg.KernelServiceUtil"), "d", new java.lang.Class[0]);
+            if (d != null) {
+                return d.invoke(null, new Object[0]);
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** 群消息统计结果 */
+    public static class GroupMsgStats {
+        public int days;
+        public long total;
+        public java.util.ArrayList<String[]> rank = new java.util.ArrayList<String[]>();
+        public String error;
     }
 
     public static int tempChatCount() {
