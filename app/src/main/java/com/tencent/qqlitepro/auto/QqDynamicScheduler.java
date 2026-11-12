@@ -183,8 +183,8 @@ public final class QqDynamicScheduler {
             return "内核尚未就绪（hook 未注册）";
         }
         int iPrepareFeeds = prepareFeeds();
-        java.util.Set<java.lang.String> whitelist = com.tencent.qqlitepro.http.QqDynamic.parseWhitelist(com.tencent.qqlitepro.util.Config.qqDynamicWhitelist(context));
-        boolean z5 = !whitelist.isEmpty();
+        java.util.Set<java.lang.String> blacklist = com.tencent.qqlitepro.http.QqDynamic.parseBlacklist(com.tencent.qqlitepro.util.Config.qqDynamicBlacklist(context));
+        boolean z5 = !blacklist.isEmpty(); /* 黑名单非空时启用过滤 */
         long jSelfUin = selfUin();
         long j2 = todayStartMillis();
         java.util.List<com.tencent.qqlitepro.auto.QqDynamicScheduler.FeedRecord> listSnapshot = snapshot();
@@ -206,25 +206,25 @@ public final class QqDynamicScheduler {
                 z4 = z5;
                 i = i2;
                 try {
-                    if (!whitelist.contains(java.lang.String.valueOf(feedRecord.owner))) {
+                    if (blacklist.contains(java.lang.String.valueOf(feedRecord.owner))) {
                     }
-                    set = whitelist;
+                    set = blacklist;
                     j = jSelfUin;
                     z5 = z4;
                     i2 = i;
                 } catch (java.lang.Throwable th2) {
                     java.lang.Throwable thRethrow = th2;
-                    set = whitelist;
+                    set = blacklist;
                     j = jSelfUin;
                     int i9 = i8;
                     i2 = i;
                     com.tencent.qqlitepro.util.Log.w("QQ动态: 处理动态异常 " + thRethrow);
                     i8 = i9;
                     z5 = z4;
-                    whitelist = set;
+                    blacklist = set;
                     jSelfUin = j;
                 }
-                whitelist = set;
+                blacklist = set;
                 jSelfUin = j;
             } else {
                 z4 = z5;
@@ -236,12 +236,12 @@ public final class QqDynamicScheduler {
                         boolean z6 = z && iQqDynamicLikeCount > 0 && i4 + i6 >= iQqDynamicLikeCount;
                         boolean z7 = z2 && iQqDynamicCommentCount > 0 && i3 >= iQqDynamicCommentCount;
                         if (z6 && z7) {
-                            set = whitelist;
+                            set = blacklist;
                             j = jSelfUin;
                         } else {
                             try {
                                 if (z3) {
-                                    set = whitelist;
+                                    set = blacklist;
                                     try {
                                         java.util.Set<java.lang.String> set2 = sHandled;
                                         synchronized (set2) {
@@ -262,10 +262,10 @@ public final class QqDynamicScheduler {
                                         com.tencent.qqlitepro.util.Log.w("QQ动态: 处理动态异常 " + thRethrow2);
                                         i8 = i10;
                                     }
-                                    whitelist = set;
+                                    blacklist = set;
                                     jSelfUin = j;
                                 } else {
-                                    set = whitelist;
+                                    set = blacklist;
                                     j = jSelfUin;
                                 }
                                 if (feedRecord.nick != null) {
@@ -328,25 +328,25 @@ public final class QqDynamicScheduler {
                                 i8 = i13;
                             }
                             z5 = z4;
-                            whitelist = set;
+                            blacklist = set;
                             jSelfUin = j;
                         }
                     } else {
-                        set = whitelist;
+                        set = blacklist;
                         j = jSelfUin;
                     }
                 } catch (java.lang.Throwable th7) {
                     java.lang.Throwable thRethrow5 = th7;
-                    set = whitelist;
+                    set = blacklist;
                     j = jSelfUin;
                 }
             } else {
-                set = whitelist;
+                set = blacklist;
                 j = jSelfUin;
             }
             z5 = z4;
             i2 = i;
-            whitelist = set;
+            blacklist = set;
             jSelfUin = j;
         }
         boolean z8 = z5;
@@ -413,8 +413,8 @@ public final class QqDynamicScheduler {
             return "内核尚未就绪（hook 未注册）";
         }
         int iPrepareFeeds = prepareFeeds();
-        java.util.Set<java.lang.String> whitelist = com.tencent.qqlitepro.http.QqDynamic.parseWhitelist(com.tencent.qqlitepro.util.Config.qqDynamicWhitelist(context));
-        boolean z4 = !whitelist.isEmpty();
+        java.util.Set<java.lang.String> blacklist = com.tencent.qqlitepro.http.QqDynamic.parseBlacklist(com.tencent.qqlitepro.util.Config.qqDynamicBlacklist(context));
+        boolean z4 = !blacklist.isEmpty(); /* 黑名单非空时启用过滤 */
         long jSelfUin = selfUin();
         int iQqDynamicLikeCount = com.tencent.qqlitepro.util.Config.qqDynamicLikeCount(context);
         int iQqDynamicCommentCount = com.tencent.qqlitepro.util.Config.qqDynamicCommentCount(context);
@@ -442,20 +442,20 @@ public final class QqDynamicScheduler {
                 z3 = z4;
                 i2 = i3;
                 try {
-                    if (!whitelist.contains(java.lang.String.valueOf(next.owner))) {
+                    if (blacklist.contains(java.lang.String.valueOf(next.owner))) {
                     }
                     i4 = i;
                     z4 = z3;
                     i3 = i2;
                 } catch (java.lang.Throwable th2) {
                     java.lang.Throwable thRethrow6 = th2;
-                    set = whitelist;
+                    set = blacklist;
                     j = jSelfUin;
                     i3 = i2;
                     com.tencent.qqlitepro.util.Log.w("QQ动态: 处理动态异常 " + thRethrow6);
                     i4 = i;
                     z4 = z3;
-                    whitelist = set;
+                    blacklist = set;
                     jSelfUin = j;
                 }
             } else {
@@ -466,7 +466,7 @@ public final class QqDynamicScheduler {
                 boolean z5 = z && iQqDynamicLikeCount > 0 && i5 + i7 >= iQqDynamicLikeCount;
                 boolean z6 = z2 && iQqDynamicCommentCount > 0 && i9 >= iQqDynamicCommentCount;
                 if (!z5 || !z6) {
-                    set = whitelist;
+                    set = blacklist;
                     try {
                         if (next.nick == null || next.nick.isEmpty()) {
                             j = jSelfUin;
@@ -486,7 +486,7 @@ public final class QqDynamicScheduler {
                                 com.tencent.qqlitepro.util.Log.w("QQ动态: 处理动态异常 " + thRethrow7);
                                 i4 = i;
                                 z4 = z3;
-                                whitelist = set;
+                                blacklist = set;
                                 jSelfUin = j;
                             }
                         }
@@ -541,11 +541,11 @@ public final class QqDynamicScheduler {
                         com.tencent.qqlitepro.util.Log.w("QQ动态: 处理动态异常 " + thRethrow9);
                         i4 = i;
                         z4 = z3;
-                        whitelist = set;
+                        blacklist = set;
                         jSelfUin = j;
                     }
                     z4 = z3;
-                    whitelist = set;
+                    blacklist = set;
                     jSelfUin = j;
                 }
             }
