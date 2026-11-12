@@ -6,11 +6,16 @@ public final class AvatarHook {
 
     /** 图片保存目录：优先原路径，不可写则退到应用可写目录 */
     private static java.io.File saveDir(android.content.Context context) {
-        java.io.File legacy = new java.io.File(SAVE_DIR);
-        if (com.tencent.qqlitepro.util.Storage.ensureWritable(legacy)) {
-            return legacy;
+        /* 用户设置的图片保存路径（独立于文件/视频路径） */
+        try {
+            return new java.io.File(com.tencent.qqlitepro.util.Config.imageSaveDir(context));
+        } catch (Throwable t) {
+            java.io.File legacy = new java.io.File(SAVE_DIR);
+            if (com.tencent.qqlitepro.util.Storage.ensureWritable(legacy)) {
+                return legacy;
+            }
+            return com.tencent.qqlitepro.util.Storage.dir(context, "pictures");
         }
-        return com.tencent.qqlitepro.util.Storage.dir(context, "pictures");
     }
     private static final android.os.Handler H = new android.os.Handler(android.os.Looper.getMainLooper());
     private static final java.util.Set<java.lang.Object> sQzoneMediaAdapters = java.util.Collections.synchronizedSet(new java.util.HashSet());
@@ -132,8 +137,8 @@ public final class AvatarHook {
 
         protected void afterHookedMethod(de.robv.android.xposed.XC_MethodHook.MethodHookParam methodHookParam) throws java.lang.Throwable {
             java.lang.Object obj;
-            java.lang.String str;
-            java.lang.String str2;
+            java.lang.String str = null;
+            java.lang.String str2 = null;
             try {
                 if (com.tencent.qqlitepro.hook.AvatarHook.sQzoneMediaAdapters.contains(methodHookParam.thisObject) || (obj = methodHookParam.args[0]) == null) {
                     return;
@@ -145,33 +150,76 @@ public final class AvatarHook {
                     java.lang.String str3 = null;
                     java.lang.Object obj2 = (list == null || iIntValue < 0 || iIntValue >= list.size()) ? null : list.get(iIntValue);
                     if (obj2 != null) {
-                        try {
-                            str = (java.lang.String) de.robv.android.xposed.XposedHelpers.callMethod(obj2, "getImageUrl", new java.lang.Object[0]);
-                        } catch (java.lang.Throwable unused) {
-                            str = null;
+                        /* 多方法回退取 URL：动态图片对象的取值方法名可能随版本变化 */
+                        str = tryCallString(obj2, "getImageUrl");
+                        if (str == null || str.isEmpty()) {
+                            str = tryCallString(obj2, "getFullUrl");
                         }
-                        try {
-                            str3 = (java.lang.String) de.robv.android.xposed.XposedHelpers.callMethod(obj2, "getImageLocalPath", new java.lang.Object[0]);
-                        } catch (java.lang.Throwable unused2) {
+                        if (str == null || str.isEmpty()) {
+                            str = tryCallString(obj2, "getUrl");
                         }
-                        if (str == null) {
-                            try {
-                                java.lang.String str4 = str3;
-                                str3 = (java.lang.String) de.robv.android.xposed.XposedHelpers.callMethod(obj2, "getFullUrl", new java.lang.Object[0]);
-                                str2 = str4;
-                            } catch (java.lang.Throwable unused3) {
-                                str2 = str3;
-                                str3 = str;
-                            }
-                        } else {
-                            str2 = str3;
-                            str3 = str;
+                        if (str == null || str.isEmpty()) {
+                            str = tryCallString(obj2, "getPicUrl");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryCallString(obj2, "getOriginUrl");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryCallString(obj2, "getRawUrl");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryReadStringField(obj2, "url");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryReadStringField(obj2, "imageUrl");
+                        }
+                        /* QZone PicElement 常见字段（动态图片） */
+                        if (str == null || str.isEmpty()) {
+                            str = tryReadStringField(obj2, "url");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryReadStringField(obj2, "pictureUrl");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryReadStringField(obj2, "boycacheUrl");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryReadStringField(obj2, "llocUrl");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryCallString(obj2, "getPictureUrl");
+                        }
+                        if (str == null || str.isEmpty()) {
+                            str = tryCallString(obj2, "getLlocUrl");
+                        }
+                        /* QZone 本地路径兜底 */
+                        if (str3 == null || str3.isEmpty()) {
+                            str3 = tryReadStringField(obj2, "llocPath");
+                        }
+                        if (str3 == null || str3.isEmpty()) {
+                            str3 = tryCallString(obj2, "getLocalPath");
+                        }
+                        /* 本地路径：有本地文件就优先（免下载） */
+                        str3 = tryCallString(obj2, "getImageLocalPath");
+                        if (str3 == null || str3.isEmpty()) {
+                            str3 = tryReadStringField(obj2, "localPath");
+                        }
+                        /* 视频条目：MediaItem.videoUrl（imageUrl 为空时用它） */
+                        String videoUrl = tryCallString(obj2, "getVideoUrl");
+                        if ((str == null || str.isEmpty()) && videoUrl != null && !videoUrl.isEmpty()) {
+                            str = videoUrl;
+                        }
+                        str2 = str3;
+                        /* URL 为空时用本地路径兜底（保存已有文件） */
+                        if ((str == null || str.isEmpty()) && str2 != null && !str2.isEmpty()) {
+                            str = str2;
                         }
                     } else {
                         str2 = null;
                     }
                     android.widget.ImageView imageView = (android.widget.ImageView) objCallMethod;
-                    imageView.setOnLongClickListener(new com.tencent.qqlitepro.hook.AvatarHook$2$$ExternalSyntheticLambda0(imageView, iIntValue, str2, str3));
+                    /* showSaveDialog(ctx, local, url)——此前传反导致"无可用图片" */
+                    imageView.setOnLongClickListener(new com.tencent.qqlitepro.hook.AvatarHook$2$$ExternalSyntheticLambda0(imageView, iIntValue, str2, str));
                 }
             } catch (java.lang.Throwable th) {
                 com.tencent.qqlitepro.util.Log.w("MediaPager onBind hook 内部: " + th);
@@ -187,6 +235,24 @@ public final class AvatarHook {
     }
 
     /* JADX INFO: Access modifiers changed from: private */
+    private static String tryCallString(Object obj, String method) {
+        try {
+            Object v = de.robv.android.xposed.XposedHelpers.callMethod(obj, method, new Object[0]);
+            return v instanceof String ? (String) v : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String tryReadStringField(Object obj, String field) {
+        try {
+            Object v = de.robv.android.xposed.XposedHelpers.getObjectField(obj, field);
+            return v instanceof String ? (String) v : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     public static void showSaveDialog(android.content.Context context, java.lang.String str, java.lang.String str2) {
         if (context == null) {
             return;
@@ -254,16 +320,51 @@ public final class AvatarHook {
         }
     }
 
-    private static void downloadAndSave(android.content.Context context, java.lang.String str) {
+    private static void downloadAndSave(final android.content.Context context, final java.lang.String str) {
+        /* URL 校验：空/非法直接提示，不再抛出 message=null */
+        if (str == null || str.trim().isEmpty() || !(str.startsWith("http://") || str.startsWith("https://"))) {
+            android.widget.Toast.makeText(context,
+                    "下载失败：图片地址无效" + (str == null ? "（null）" : "（" + str.trim() + "）"), 0).show();
+            com.tencent.qqlitepro.util.Log.w("downloadAndSave: 非法 URL=" + str);
+            return;
+        }
+        /* 网络请求必须离开主线程（否则 NetworkOnMainThreadException） */
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                doDownloadAndSave(context, str);
+            }
+        }, "qqmax-dl").start();
+    }
+
+    private static void doDownloadAndSave(android.content.Context context, java.lang.String str) {
         try {
-            // 路径修复：/sdcard/Pictures 在 Android 10+ 不可写，改用可写目录
-            java.io.File file = saveDir(context);
-            java.io.File file2 = new java.io.File(file, "Image_" + java.lang.System.currentTimeMillis() + ".jpg");
+            /* 视频链接 -> 视频保存路径；图片链接 -> 图片保存路径 */
+            boolean isVideo = str.toLowerCase().matches(".*\\.(mp4|mov|avi|mkv|webm|3gp)(\\?.*)?")
+                    || str.contains("video");
+            java.io.File file;
+            if (isVideo) {
+                file = new java.io.File(com.tencent.qqlitepro.util.Config.videoSaveDir(context));
+            } else {
+                file = saveDir(context);
+            }
+            try {
+                if (!file.exists()) file.mkdirs();
+            } catch (Throwable ignored) {}
+            String ext = isVideo ? ".mp4" : ".jpg";
+            java.io.File file2 = new java.io.File(file, "Media_" + java.lang.System.currentTimeMillis() + ext);
             java.net.HttpURLConnection httpURLConnection = (java.net.HttpURLConnection) new java.net.URL(str).openConnection();
             httpURLConnection.setConnectTimeout(8000);
             httpURLConnection.setReadTimeout(15000);
             httpURLConnection.setInstanceFollowRedirects(true);
-            httpURLConnection.connect();
+            /* 很多图床对无 UA 的请求拒绝（返回 403/空 body） */
+            httpURLConnection.setRequestProperty("User-Agent", "Mozilla/5.0 (Android)");
+            int code = httpURLConnection.getResponseCode();
+            if (code < 200 || code >= 300) {
+                android.widget.Toast.makeText(context, "下载失败：服务器返回 " + code, 0).show();
+                httpURLConnection.disconnect();
+                return;
+            }
             java.io.InputStream inputStream = httpURLConnection.getInputStream();
             java.io.FileOutputStream fileOutputStream = new java.io.FileOutputStream(file2);
             byte[] bArr = new byte[8192];
@@ -275,6 +376,11 @@ public final class AvatarHook {
                     inputStream.close();
                     fileOutputStream.close();
                     httpURLConnection.disconnect();
+                    if (file2.length() <= 0) {
+                        file2.delete();
+                        android.widget.Toast.makeText(context, "下载失败：返回内容为空", 0).show();
+                        return;
+                    }
                     com.tencent.qqlitepro.util.Log.i("图片已下载保存: " + file2.getAbsolutePath());
                     android.widget.Toast.makeText(context, "已保存到 " + file2.getAbsolutePath(), 1).show();
                     return;
@@ -282,7 +388,11 @@ public final class AvatarHook {
             }
         } catch (java.lang.Throwable th) {
             com.tencent.qqlitepro.util.Log.w("downloadAndSave 失败: " + th);
-            android.widget.Toast.makeText(context, "下载失败: " + th.getMessage(), 0).show();
+            String msg = th.getMessage();
+            if (msg == null || msg.trim().isEmpty()) {
+                msg = th.getClass().getSimpleName();
+            }
+            android.widget.Toast.makeText(context, "下载失败: " + msg, 0).show();
         }
     }
 }
