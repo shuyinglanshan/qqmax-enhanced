@@ -276,152 +276,138 @@ public final class UiPatcher {
     }
 
     /**
-     * 签名编辑弹窗 —— 复刻宿主"修改昵称"界面样式：
-     * 深色圆角卡 + 居中标题 + [😊 输入] 行 + 蓝色"确定" + 深色"取消"。
+     * 用宿主"修改昵称"同款文本输入界面改个性签名（不再自建卡片）。
      */
     private static void showSignatureEditor(android.content.Context context) {
+        try {
+            android.app.Activity activity = null;
+            android.content.Context c = context;
+            while (c instanceof android.content.ContextWrapper) {
+                if (c instanceof android.app.Activity) {
+                    activity = (android.app.Activity) c;
+                    break;
+                }
+                c = ((android.content.ContextWrapper) c).getBaseContext();
+            }
+            if (activity == null) {
+                android.widget.Toast.makeText(context, "需在宿主界面内使用", android.widget.Toast.LENGTH_SHORT).show();
+                return;
+            }
+            Object frag = topAndroidXFragment(activity);
+            if (frag == null) {
+                android.widget.Toast.makeText(context, "未找到宿主界面，请稍后重试", android.widget.Toast.LENGTH_SHORT).show();
+                return;
+            }
+            final android.content.Context fCtx = context;
+            boolean ok = com.tencent.qqlitepro.http.QqKernel.showHostTextInput(
+                    activity, frag, "修改个性签名", "pg_watch_modifies_longnick",
+                    new java.util.function.BiConsumer<Boolean, String>() {
+                        @Override
+                        public void accept(final Boolean isSuccess, final String text) {
+                            if (isSuccess == null || !isSuccess.booleanValue()) {
+                                return;
+                            }
+                            new Thread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    final String err = com.tencent.qqlitepro.http.QqKernel.setLongNickViaHostWrapper(text);
+                                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            if (err == null) {
+                                                android.widget.Toast.makeText(fCtx, "签名已更新",
+                                                        android.widget.Toast.LENGTH_SHORT).show();
+                                            } else {
+                                                android.widget.Toast.makeText(fCtx, "保存失败：" + err,
+                                                        android.widget.Toast.LENGTH_SHORT).show();
+                                            }
+                                        }
+                                    });
+                                }
+                            }, "sig-save").start();
+                        }
+                    });
+            if (!ok) {
+                com.tencent.qqlitepro.util.Log.w("打开宿主文本输入失败，回退到内置编辑框");
+                showFallbackSignatureEditor(context);
+            }
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("签名编辑异常: " + th);
+        }
+    }
+
+    /** 取栈顶 androidx Fragment */
+    private static Object topAndroidXFragment(android.app.Activity activity) {
+        try {
+            Class<?> supCls = Class.forName("androidx.fragment.app.FragmentActivity");
+            if (!supCls.isInstance(activity)) {
+                return null;
+            }
+            Object fm = supCls.getMethod("getSupportFragmentManager").invoke(activity);
+            java.util.List<?> frags = (java.util.List<?>) fm.getClass().getMethod("getFragments").invoke(fm);
+            if (frags == null || frags.isEmpty()) {
+                return null;
+            }
+            for (int i = frags.size() - 1; i >= 0; i--) {
+                Object f = frags.get(i);
+                if (f != null) {
+                    return f;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** 兜底：宿主界面打不开时的简易输入框 */
+    private static void showFallbackSignatureEditor(android.content.Context context) {
         try {
             float d = context.getResources().getDisplayMetrics().density;
             android.widget.LinearLayout root = new android.widget.LinearLayout(context);
             root.setOrientation(1);
-            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
-            bg.setColor(-14605507);
-            bg.setCornerRadius((int) (d * 18));
-            root.setBackground(bg);
-            int pad = (int) (d * 18);
+            int pad = (int) (d * 16);
             root.setPadding(pad, pad, pad, pad);
-
             android.widget.TextView title = new android.widget.TextView(context);
             title.setText("修改个性签名");
-            title.setTextSize(15.5f);
+            title.setTextSize(15.0f);
             title.setTextColor(-1);
-            title.setGravity(17);
-            root.addView(title, new android.widget.LinearLayout.LayoutParams(-1, -2));
-
-            /* [😊 输入行] */
-            android.widget.LinearLayout inputRow = new android.widget.LinearLayout(context);
-            inputRow.setOrientation(0);
-            inputRow.setGravity(16);
-            android.widget.LinearLayout.LayoutParams inLp = new android.widget.LinearLayout.LayoutParams(-1, -2);
-            inLp.topMargin = (int) (d * 16);
-            root.addView(inputRow, inLp);
-
-            android.widget.TextView icon = new android.widget.TextView(context);
-            icon.setText("\uD83D\uDE0A");
-            icon.setTextSize(16.0f);
-            inputRow.addView(icon);
-
-            android.widget.EditText et = new android.widget.EditText(context);
+            root.addView(title);
+            final android.widget.EditText et = new android.widget.EditText(context);
             et.setHint("请输入个性签名");
             et.setTextColor(-1);
-            et.setHintTextColor(-8355712);
             et.setTextSize(14.0f);
-            et.setSingleLine(true);
-            et.setBackground(null);
-            android.widget.LinearLayout.LayoutParams etLp = new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f);
-            etLp.leftMargin = (int) (d * 8);
-            inputRow.addView(et, etLp);
-
-            /* 读当前签名 */
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    final String cur = com.tencent.qqlitepro.http.QqKernel.currentLongNick();
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                        @Override
-                        public void run() {
-                            try {
-                                if (cur != null && !cur.isEmpty()) {
-                                    et.setText(cur);
-                                    et.setSelection(cur.length());
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                    });
-                }
-            }, "sig-read").start();
-
-            final android.widget.EditText fEt = et;
-            /* 确定（蓝色圆角） */
-            android.widget.TextView ok = new android.widget.TextView(context);
+            android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(-1, -2);
+            lp.topMargin = pad;
+            root.addView(et, lp);
+            android.widget.Button ok = new android.widget.Button(context);
             ok.setText("确定");
-            ok.setTextSize(15.0f);
-            ok.setTextColor(-1);
-            ok.setGravity(17);
-            android.graphics.drawable.GradientDrawable okBg = new android.graphics.drawable.GradientDrawable();
-            okBg.setColor(-13878718);
-            okBg.setCornerRadius((int) (d * 22));
-            ok.setBackground(okBg);
-            ok.setClickable(true);
-            android.widget.LinearLayout.LayoutParams okLp = new android.widget.LinearLayout.LayoutParams(-1, (int) (d * 44));
-            okLp.topMargin = (int) (d * 18);
-            root.addView(ok, okLp);
-
-            /* 取消（深色圆角） */
-            android.widget.TextView cancel = new android.widget.TextView(context);
-            cancel.setText("取消");
-            cancel.setTextSize(15.0f);
-            cancel.setTextColor(-1);
-            cancel.setGravity(17);
-            android.graphics.drawable.GradientDrawable cancelBg = new android.graphics.drawable.GradientDrawable();
-            cancelBg.setColor(-14671840);
-            cancelBg.setCornerRadius((int) (d * 22));
-            cancel.setBackground(cancelBg);
-            cancel.setClickable(true);
-            android.widget.LinearLayout.LayoutParams cancelLp = new android.widget.LinearLayout.LayoutParams(-1, (int) (d * 44));
-            cancelLp.topMargin = (int) (d * 10);
-            root.addView(cancel, cancelLp);
-
+            root.addView(ok);
             android.app.Dialog dialog = new android.app.Dialog(context);
-            dialog.requestWindowFeature(1);
-            android.widget.FrameLayout wrap = new android.widget.FrameLayout(context);
-            int wp = (int) (d * 18);
-            wrap.setPadding(wp, (int) (d * 40), wp, (int) (d * 40));
-            wrap.addView(root, new android.widget.FrameLayout.LayoutParams(-1, -2));
-            dialog.setContentView(wrap);
-            if (dialog.getWindow() != null) {
-                android.view.WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
-                attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
-                attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
-                dialog.getWindow().setAttributes(attrs);
-                dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
-            }
+            dialog.setContentView(root);
             final android.app.Dialog fDialog = dialog;
             ok.setOnClickListener(new android.view.View.OnClickListener() {
                 @Override
                 public void onClick(android.view.View v) {
-                    final String text = fEt.getText().toString().trim();
+                    final String text = et.getText().toString().trim();
                     new Thread(new Runnable() {
                         @Override
                         public void run() {
-                            final String err = com.tencent.qqlitepro.http.QqKernel.setLongNick(text);
+                            final String err = com.tencent.qqlitepro.http.QqKernel.setLongNickViaHostWrapper(text);
                             new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
                                 @Override
                                 public void run() {
-                                    if (err == null) {
-                                        android.widget.Toast.makeText(v.getContext(), "签名已更新", android.widget.Toast.LENGTH_SHORT).show();
-                                        fDialog.dismiss();
-                                    } else {
-                                        android.widget.Toast.makeText(v.getContext(), "保存失败：" + err, android.widget.Toast.LENGTH_SHORT).show();
-                                    }
+                                    android.widget.Toast.makeText(v.getContext(),
+                                            err == null ? "签名已更新" : "保存失败：" + err,
+                                            android.widget.Toast.LENGTH_SHORT).show();
+                                    if (err == null) fDialog.dismiss();
                                 }
                             });
                         }
                     }, "sig-save").start();
                 }
             });
-            cancel.setOnClickListener(new android.view.View.OnClickListener() {
-                @Override
-                public void onClick(android.view.View v) {
-                    fDialog.dismiss();
-                }
-            });
             dialog.show();
-        } catch (Throwable th) {
-            com.tencent.qqlitepro.util.Log.w("签名编辑弹窗异常: " + th);
-        }
+        } catch (Throwable ignored) {}
     }
-
     /**
      * 宿主媒体保存路径 hook（逆向 momoi.mod.qqpro.hook.qzone.MediaSave）：
      *   toGallery(ctx, src, displayName, mime, isVideo, subDir)
