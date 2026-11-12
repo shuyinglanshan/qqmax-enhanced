@@ -949,7 +949,7 @@ public final class HttpApiServer {
                 } else if ("auto".equals(lowerCase)) {
                     com.tencent.qqlitepro.util.Config.setAutoReply(contextAppContext, com.tencent.qqlitepro.util.Config.autoReplyEnabled(contextAppContext), com.tencent.qqlitepro.util.Config.autoReplyContent(contextAppContext), asString2, com.tencent.qqlitepro.util.Config.autoReplyAt(contextAppContext));
                 } else if ("qzone".equals(lowerCase)) {
-                    com.tencent.qqlitepro.util.Config.setQqDynamicWhitelist(contextAppContext, asString2);
+                    com.tencent.qqlitepro.util.Config.setQqDynamicBlacklist(contextAppContext, asString2);
                 } else {
                     return envelope(400, "type 仅支持 keyword|auto|qzone", null);
                 }
