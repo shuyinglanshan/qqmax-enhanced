@@ -313,6 +313,19 @@ public final class Log {
     private static java.util.List<java.io.File> candidates() {
         java.lang.String packageName;
         java.util.ArrayList arrayList = new java.util.ArrayList();
+        /* 首选：/sdcard/QQMax增强/logs/qqmax_YYYYMMDD.log（便于用户直接取日志） */
+        try {
+            java.io.File ext = android.os.Environment.getExternalStorageDirectory();
+            if (ext != null) {
+                java.io.File dir = new java.io.File(ext, "QQMax增强/logs");
+                if (dir.exists() || dir.mkdirs()) {
+                    java.text.SimpleDateFormat dsf =
+                            new java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US);
+                    arrayList.add(new java.io.File(dir, "qqmax_" + dsf.format(new java.util.Date()) + ".log"));
+                }
+            }
+        } catch (java.lang.Throwable ignored) {
+        }
         android.content.Context contextAppContext = appContext();
         java.lang.String str = null;
         if (contextAppContext != null) {
