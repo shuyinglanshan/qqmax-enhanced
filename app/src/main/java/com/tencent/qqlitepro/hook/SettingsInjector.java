@@ -287,6 +287,8 @@ public final class SettingsInjector {
     private static volatile android.widget.TextView sZanLog;
     private static volatile android.widget.EditText sZanUin;
     private static volatile android.widget.EditText sZanCount;
+    /* 会话选择后换算出的目标 uin（支持多选） */
+    private static volatile java.util.LinkedHashSet<Long> sZanUins = new java.util.LinkedHashSet<>();
 
     private static void addZanBlock(android.content.Context context, android.view.ViewGroup viewGroup) {
         try {
@@ -381,12 +383,31 @@ public final class SettingsInjector {
                             public void run() {
                                 try {
                                     java.util.Set<java.lang.String> sel = sSelectedKeys;
-                                    if (sel == null || sel.isEmpty() || et == null) {
+                                    if (sel == null || sel.isEmpty()) {
                                         return;
                                     }
-                                    String first = sel.iterator().next();
-                                    et.setText(first);
-                                    toast(fCtxSel, "已选择 " + sel.size() + " 个，填入第一个 " + first);
+                                    int added = 0;
+                                    for (String key : sel) {
+                                        long uin = 0L;
+                                        if (key.matches("\\d{5,12}")) {
+                                            uin = Long.parseLong(key);
+                                        } else {
+                                            uin = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(key);
+                                        }
+                                        if (uin > 0) {
+                                            sZanUins.add(Long.valueOf(uin));
+                                            added++;
+                                        }
+                                    }
+                                    if (added > 0 && et != null) {
+                                        StringBuilder sb = new StringBuilder();
+                                        for (Long u : sZanUins) {
+                                            if (sb.length() > 0) sb.append(",");
+                                            sb.append(u.longValue());
+                                        }
+                                        et.setText(sb.toString());
+                                    }
+                                    toast(fCtxSel, "已选择 " + added + " 个好友，可直接发送点赞");
                                 } catch (Throwable th) {
                                     com.tencent.qqlitepro.util.Log.w("会话选择回填失败: " + th);
                                 }
@@ -407,9 +428,16 @@ public final class SettingsInjector {
                 @Override
                 public void run() {
                     try {
-                        final String uinStr = sZanUin != null ? sZanUin.getText().toString().trim() : "";
-                        if (uinStr.isEmpty() || !uinStr.matches("\\d{5,12}")) {
-                            toast(fCtx, "请输入有效的好友 QQ 号");
+                        /* 目标集合：手动输入 + 会话选择（支持多个好友） */
+                        java.util.LinkedHashSet<Long> targets = new java.util.LinkedHashSet<>(sZanUins);
+                        String uinStr = sZanUin != null ? sZanUin.getText().toString().trim() : "";
+                        for (String one : uinStr.split("[,,\\s]+")) {
+                            if (one.matches("\\d{5,12}")) {
+                                targets.add(Long.valueOf(Long.parseLong(one)));
+                            }
+                        }
+                        if (targets.isEmpty()) {
+                            toast(fCtx, "请输入 QQ 号或从会话选择好友");
                             return;
                         }
                         int cnt = 1;
@@ -418,23 +446,36 @@ public final class SettingsInjector {
                         } catch (Throwable ignored) {
                         }
                         final int fCnt = Math.max(1, Math.min(20, cnt));
-                        final long fUin = Long.parseLong(uinStr);
                         final int fType = types[chosen[0]];
-                        appendLog(sZanLog, "发送中：uin=" + fUin + " 次数=" + fCnt + " 类型=" + names[chosen[0]]);
+                        final java.util.ArrayList<Long> list = new java.util.ArrayList<>(targets);
+                        appendLog(sZanLog, "开始点赞：" + list.size() + " 人 次数=" + fCnt + " 类型=" + names[chosen[0]]);
                         new Thread(new Runnable() {
                             @Override
                             public void run() {
-                                final String err = com.tencent.qqlitepro.http.QqKernel
-                                        .sendOnlineStatusLike(fUin, fType, fCnt);
+                                int okCnt = 0;
+                                StringBuilder errs = new StringBuilder();
+                                for (Long u : list) {
+                                    String err = com.tencent.qqlitepro.http.QqKernel
+                                            .sendOnlineStatusLike(u.longValue(), fType, fCnt);
+                                    if (err == null) {
+                                        okCnt++;
+                                        showZanLog(sZanLog, u.longValue() + " 点赞成功 ✓");
+                                    } else {
+                                        errs.append(u.longValue()).append(":").append(err).append("; ");
+                                        showZanLog(sZanLog, u.longValue() + " 失败：" + err);
+                                    }
+                                }
+                                final int fOk = okCnt;
+                                final String fErrs = errs.toString();
                                 new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
                                     @Override
                                     public void run() {
-                                        if (err == null) {
-                                            appendLog(sZanLog, "点赞成功 ✓");
-                                            toast(fCtx, "已给 " + fUin + " 点赞");
+                                        if (fErrs.isEmpty()) {
+                                            appendLog(sZanLog, "全部完成：成功 " + fOk + "/" + list.size());
+                                            toast(fCtx, "已给 " + fOk + " 个好友点赞");
                                         } else {
-                                            appendLog(sZanLog, "失败：" + err);
-                                            toast(fCtx, "点赞失败：" + err);
+                                            appendLog(sZanLog, "完成：成功 " + fOk + "/" + list.size());
+                                            toast(fCtx, "成功 " + fOk + "/" + list.size() + "（详情见日志）");
                                         }
                                     }
                                 });
@@ -455,6 +496,16 @@ public final class SettingsInjector {
         } catch (Throwable th) {
             com.tencent.qqlitepro.util.Log.w("构建点赞区块失败: " + th);
         }
+    }
+
+    private static void showZanLog(final android.widget.TextView view, final String line) {
+        if (view == null) return;
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                appendLog(view, line);
+            }
+        });
     }
 
     private static void addGateStatusRow(final android.content.Context context, android.view.ViewGroup viewGroup) {
@@ -2392,6 +2443,8 @@ public final class SettingsInjector {
     private static void renderMenu(android.content.Context context, android.view.ViewGroup viewGroup) {
         viewGroup.removeAllViews();
         viewGroup.addView(section(context, "增强模块设置"));
+        /* 在线状态点赞卡片（移自基础设置，方便直达） */
+        addZanBlock(context, viewGroup);
         addDivider(viewGroup);
         viewGroup.addView(navRow(context, "基础设置", "防撤回 / 翻译接口 / 通用", 1));
         addDivider(viewGroup);
@@ -2760,8 +2813,6 @@ public final class SettingsInjector {
         viewGroup.addView(section(context, "防撤回"));
         viewGroup.addView(switchRow(context, "防撤回总开关", "关闭后不拦截消息撤回", com.tencent.qqlitepro.util.Config.enabled(context), new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda80(context)));
         addDivider(viewGroup);
-        viewGroup.addView(section(context, "在线状态点赞"));
-        addZanBlock(context, viewGroup);
         addDivider(viewGroup);
         viewGroup.addView(section(context, "防撤回模式"));
         int iMode = com.tencent.qqlitepro.util.Config.mode(context);
