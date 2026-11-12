@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Xposed 模块作用目标：QQ Lite -->
+    <queries>
+        <package android:name="org.lsposed.manager" />
+        <package android:name="org.meowcat.edxposed.manager" />
+        <package android:name="de.robv.android.xposed.installer" />
+        <package android:name="com.solohsu.android.edxp.manager" />
+        <package android:name="me.weishu.exp" />
+        <package android:name="io.va.exposed" />
+        <package android:name="com.tencent.qqlite" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="QQMax增强模块"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name="com.tencent.qqlitepro.MainActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name="com.tencent.qqlitepro.StatusProvider"
+            android:authorities="com.tencent.qqlitepro.status"
+            android:exported="true" />
+
+        <!-- Xposed 模块声明 -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="防撤回(红边角标/原文还原)、群公告全量显示、翻译接口替换、自定义后缀、定时消息、关键词回复与自动回复(支持AI)、AI总结、本地HTTP API、URL转语音、任意文件发送(伪图片/伪语音/分片)、下载管理、JS插件扩展、QQ动态定时点赞评论" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="53" />
+        <meta-data
+            android:name="xposedscope"
+            android:value="com.tencent.qqlite" />
+        <meta-data
+            android:name="xposedprocess"
+            android:value="com.tencent.qqlite" />
+    </application>
+</manifest>
