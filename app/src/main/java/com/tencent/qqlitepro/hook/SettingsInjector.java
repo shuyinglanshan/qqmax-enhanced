@@ -38,6 +38,7 @@ public final class SettingsInjector {
     private static final int PAGE_SUMMARY = 7;
     private static final int PAGE_VOICE = 8;
     private static final int REQ_DIR_PICK = 24345;
+    private static final int REQ_MEDIA_DIR_PICK = 24347;
     private static final int REQ_FILE_PICK = 24344;
     static final int REQ_MAIL_ATTACH = 24347;
     static final int REQ_MAIL_BG = 24349;
@@ -204,6 +205,10 @@ public final class SettingsInjector {
             final android.widget.TextView resultView = text(context, "点击下方按钮开始统计", HINT, 13.0f, 3);
             resultView.setLineSpacing(dp(context, 4.0f), 1.0f);
             root.addView(resultView, withTop(context, 10.0f));
+            /* 排行榜容器：每行 头像 + 昵称(QQ号) + 条数 */
+            final android.widget.LinearLayout rankBox = new android.widget.LinearLayout(context);
+            rankBox.setOrientation(1);
+            root.addView(rankBox, withTop(context, 6.0f));
 
             final android.content.Context fCtx = context;
             // 统计按钮
@@ -231,18 +236,19 @@ public final class SettingsInjector {
                                             return;
                                         }
                                         StringBuilder sb = new StringBuilder();
-                                        sb.append("近 ").append(st.days).append(" 天消息总数：").append(st.total).append("\n");
-                                        sb.append("发言排行：\n");
+                                        sb.append("近 ").append(st.days).append(" 天消息总数：").append(st.total);
+                                        resultView.setText(sb.toString());
+                                        /* 排行榜：头像 + 昵称(QQ号) + 条数 */
+                                        rankBox.removeAllViews();
                                         int limit = Math.min(15, st.rank.size());
                                         for (int i = 0; i < limit; i++) {
                                             String[] one = st.rank.get(i);
-                                            sb.append("  ").append(i + 1).append(". ").append(one[0])
-                                              .append("  ").append(one[1]).append(" 条\n");
+                                            rankBox.addView(renderRankRow(context, i + 1, one[0], one[1], one[2]),
+                                                    rootLp());
                                         }
                                         if (st.rank.isEmpty()) {
-                                            sb.append("  （无数据）");
+                                            rankBox.addView(text(context, "（无数据）", HINT, 12.5f, 3), rootLp());
                                         }
-                                        resultView.setText(sb.toString());
                                     }
                                 });
                             }
@@ -254,16 +260,30 @@ public final class SettingsInjector {
             });
             root.addView(statBtn, withTop(context, 12.0f));
 
-            // 截图按钮：进入聊天界面由用户操作后截图，这里给快捷入口
-            android.view.View shotBtn = saveButton(context, "打开聊天并截图", new Runnable() {
+            /* 生成结果截图：跳到该群聊天，走宿主原生"长按消息→多选→截图"链路
+             * （逆向：momoi.mod.qqpro.hook.screenshot.ChatScreenshot.capture 需在
+             *   聊天多选界面内调用，由宿主消息长按菜单"多选"进入）。 */
+            final android.content.Context fCtxShot = context;
+            final android.widget.LinearLayout fRankBox = rankBox;
+            final android.widget.TextView fResult = resultView;
+            android.view.View shotBtn = saveButton(context, "生成结果截图", new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        dialog.dismiss();
-                        // 进入聊天（宿主 AIO），用户在聊天内用宿主自带"截图"按钮完成截图与发送
-                        com.tencent.qqlitepro.http.QqKernel.openChatByUin(fCtx, groupUin, groupName, 2);
+                        /* 把统计结果区域画成 Bitmap，交给宿主原生截图预览（发送/保存/取消） */
+                        android.graphics.Bitmap bm = renderStatBitmap(fCtxShot, fResult, fRankBox);
+                        if (bm == null) {
+                            toast(fCtxShot, "暂无可截图内容");
+                            return;
+                        }
+                        if (openHostScreenshotPreview(fCtxShot, bm)) {
+                            try { dialog.dismiss(); } catch (Throwable ignored) {}
+                        } else {
+                            toast(fCtxShot, "宿主截图预览不可用，已保存到本地");
+                        }
                     } catch (Throwable th) {
-                        com.tencent.qqlitepro.util.Log.w("跳转聊天失败: " + th);
+                        com.tencent.qqlitepro.util.Log.w("生成结果截图失败: " + th);
+                        toast(fCtxShot, "生成截图失败：" + th.getMessage());
                     }
                 }
             });
@@ -271,230 +291,17 @@ public final class SettingsInjector {
 
             scroll.addView(root);
             dialog.setContentView(scroll);
+            /* 全屏显示（含状态栏区域） */
             if (dialog.getWindow() != null) {
                 android.view.WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
-                attrs.width = (int) (context.getResources().getDisplayMetrics().widthPixels * 0.94f);
-                attrs.height = (int) (context.getResources().getDisplayMetrics().heightPixels * 0.85f);
+                attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
                 dialog.getWindow().setAttributes(attrs);
+                dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(-15592942));
             }
             dialog.show();
         } catch (Throwable th) {
             com.tencent.qqlitepro.util.Log.w("打开消息数据失败: " + th);
-        }
-    }
-
-    /** 在线状态点赞（逆向自宿主 IKernelOnlineStatusService） */
-    private static volatile android.widget.TextView sZanLog;
-    private static volatile android.widget.EditText sZanUin;
-    private static volatile android.widget.EditText sZanCount;
-    /* 会话选择后换算出的目标 uin（支持多选） */
-    private static volatile java.util.LinkedHashSet<Long> sZanUins = new java.util.LinkedHashSet<>();
-
-    private static void addZanBlock(android.content.Context context, android.view.ViewGroup viewGroup) {
-        try {
-            android.widget.LinearLayout card = new android.widget.LinearLayout(context);
-            card.setOrientation(1);
-            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
-            bg.setColor(-14013129);
-            bg.setCornerRadius(dpLite(10.0f));
-            card.setBackground(bg);
-            int p = dp(context, 12);
-            card.setPadding(p, p, p, p);
-
-            card.addView(text(context, "给好友点在线状态赞（赞/心/狗头）", TITLE, 13.5f, 3), rootLp());
-
-            // 好友 QQ 号
-            android.widget.EditText etUin = new android.widget.EditText(context);
-            etUin.setHint("好友 QQ 号");
-            etUin.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
-            etUin.setTextSize(13.5f);
-            etUin.setTextColor(TITLE);
-            etUin.setHintTextColor(HINT);
-            etUin.setSingleLine(true);
-            android.widget.LinearLayout.LayoutParams lp1 = rootLp();
-            lp1.topMargin = dp(context, 8);
-            card.addView(etUin, lp1);
-            sZanUin = etUin;
-
-            // 次数
-            android.widget.EditText etCount = new android.widget.EditText(context);
-            etCount.setHint("点赞次数（1-20，默认 1）");
-            etCount.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
-            etCount.setTextSize(13.5f);
-            etCount.setTextColor(TITLE);
-            etCount.setHintTextColor(HINT);
-            etCount.setSingleLine(true);
-            android.widget.LinearLayout.LayoutParams lp2 = rootLp();
-            lp2.topMargin = dp(context, 6);
-            card.addView(etCount, lp2);
-            sZanCount = etCount;
-
-            // 类型选择
-            final String[] names = {"赞", "心", "狗头", "惊了", "宝宝"};
-            final int[] types = {
-                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_ZAN,
-                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_XIN,
-                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_GOUTOU,
-                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_JINGLI,
-                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_BAOBAO
-            };
-            final int[] chosen = {0};
-            android.widget.LinearLayout typeRow = new android.widget.LinearLayout(context);
-            typeRow.setOrientation(0);
-            for (int i = 0; i < names.length; i++) {
-                final int idx2 = i;
-                android.widget.TextView tv = text(context, names[i], i == 0 ? ACCENT : HINT, 13.0f, 17);
-                tv.setPadding(dp(context, 10), dp(context, 6), dp(context, 10), dp(context, 6));
-                tv.setClickable(true);
-                tv.setOnClickListener(new android.view.View.OnClickListener() {
-                    @Override
-                    public void onClick(android.view.View v) {
-                        chosen[0] = idx2;
-                        // 高亮选中的
-                        for (int j = 0; j < typeRow.getChildCount(); j++) {
-                            android.widget.TextView c = (android.widget.TextView) typeRow.getChildAt(j);
-                            c.setTextColor(j == idx2 ? ACCENT : HINT);
-                        }
-                    }
-                });
-                typeRow.addView(tv);
-            }
-            android.widget.LinearLayout.LayoutParams lp3 = rootLp();
-            lp3.topMargin = dp(context, 8);
-            card.addView(typeRow, lp3);
-
-            // 日志区
-            android.widget.TextView logView = text(context, "", HINT, 12.0f, 3);
-            logView.setLineSpacing(dp(context, 3), 1.0f);
-            android.widget.LinearLayout.LayoutParams lp4 = rootLp();
-            lp4.topMargin = dp(context, 8);
-            card.addView(logView, lp4);
-            sZanLog = logView;
-
-            /* 从会话选择框选好友：样式跟随基础设置内的"原生会话选择器"开关 */
-            final android.content.Context fCtxSel = context;
-            android.view.View pickBtn = saveButton(context, "从会话选择好友", new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        android.widget.EditText et = sZanUin;
-                        showSessionPicker(fCtxSel, true, null, new Runnable() {
-                            @Override
-                            public void run() {
-                                try {
-                                    java.util.Set<java.lang.String> sel = sSelectedKeys;
-                                    if (sel == null || sel.isEmpty()) {
-                                        return;
-                                    }
-                                    int added = 0;
-                                    for (String key : sel) {
-                                        long uin = 0L;
-                                        if (key.matches("\\d{5,12}")) {
-                                            uin = Long.parseLong(key);
-                                        } else {
-                                            uin = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(key);
-                                        }
-                                        if (uin > 0) {
-                                            sZanUins.add(Long.valueOf(uin));
-                                            added++;
-                                        }
-                                    }
-                                    if (added > 0 && et != null) {
-                                        StringBuilder sb = new StringBuilder();
-                                        for (Long u : sZanUins) {
-                                            if (sb.length() > 0) sb.append(",");
-                                            sb.append(u.longValue());
-                                        }
-                                        et.setText(sb.toString());
-                                    }
-                                    toast(fCtxSel, "已选择 " + added + " 个好友，可直接发送点赞");
-                                } catch (Throwable th) {
-                                    com.tencent.qqlitepro.util.Log.w("会话选择回填失败: " + th);
-                                }
-                            }
-                        });
-                    } catch (Throwable th) {
-                        com.tencent.qqlitepro.util.Log.w("打开会话选择器失败: " + th);
-                    }
-                }
-            });
-            android.widget.LinearLayout.LayoutParams pickLp = rootLp();
-            pickLp.topMargin = dp(context, 10);
-            card.addView(pickBtn, pickLp);
-
-            // 执行按钮
-            final android.content.Context fCtx = context;
-            android.view.View btn = saveButton(context, "发送点赞", new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        /* 目标集合：手动输入 + 会话选择（支持多个好友） */
-                        java.util.LinkedHashSet<Long> targets = new java.util.LinkedHashSet<>(sZanUins);
-                        String uinStr = sZanUin != null ? sZanUin.getText().toString().trim() : "";
-                        for (String one : uinStr.split("[,,\\s]+")) {
-                            if (one.matches("\\d{5,12}")) {
-                                targets.add(Long.valueOf(Long.parseLong(one)));
-                            }
-                        }
-                        if (targets.isEmpty()) {
-                            toast(fCtx, "请输入 QQ 号或从会话选择好友");
-                            return;
-                        }
-                        int cnt = 1;
-                        try {
-                            cnt = Integer.parseInt(sZanCount != null ? sZanCount.getText().toString().trim() : "1");
-                        } catch (Throwable ignored) {
-                        }
-                        final int fCnt = Math.max(1, Math.min(20, cnt));
-                        final int fType = types[chosen[0]];
-                        final java.util.ArrayList<Long> list = new java.util.ArrayList<>(targets);
-                        appendLog(sZanLog, "开始点赞：" + list.size() + " 人 次数=" + fCnt + " 类型=" + names[chosen[0]]);
-                        new Thread(new Runnable() {
-                            @Override
-                            public void run() {
-                                int okCnt = 0;
-                                StringBuilder errs = new StringBuilder();
-                                for (Long u : list) {
-                                    String err = com.tencent.qqlitepro.http.QqKernel
-                                            .sendOnlineStatusLike(u.longValue(), fType, fCnt);
-                                    if (err == null) {
-                                        okCnt++;
-                                        showZanLog(sZanLog, u.longValue() + " 点赞成功 ✓");
-                                    } else {
-                                        errs.append(u.longValue()).append(":").append(err).append("; ");
-                                        showZanLog(sZanLog, u.longValue() + " 失败：" + err);
-                                    }
-                                }
-                                final int fOk = okCnt;
-                                final String fErrs = errs.toString();
-                                new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        if (fErrs.isEmpty()) {
-                                            appendLog(sZanLog, "全部完成：成功 " + fOk + "/" + list.size());
-                                            toast(fCtx, "已给 " + fOk + " 个好友点赞");
-                                        } else {
-                                            appendLog(sZanLog, "完成：成功 " + fOk + "/" + list.size());
-                                            toast(fCtx, "成功 " + fOk + "/" + list.size() + "（详情见日志）");
-                                        }
-                                    }
-                                });
-                            }
-                        }, "qqmax-zan").start();
-                    } catch (Throwable th) {
-                        com.tencent.qqlitepro.util.Log.w("点赞界面异常: " + th);
-                    }
-                }
-            });
-            android.widget.LinearLayout.LayoutParams lp5 = rootLp();
-            lp5.topMargin = dp(context, 10);
-            card.addView(btn, lp5);
-
-            android.widget.LinearLayout.LayoutParams cardLp = rootLp();
-            cardLp.topMargin = dp(context, 8);
-            viewGroup.addView(card, cardLp);
-        } catch (Throwable th) {
-            com.tencent.qqlitepro.util.Log.w("构建点赞区块失败: " + th);
         }
     }
 
@@ -507,6 +314,227 @@ public final class SettingsInjector {
             }
         });
     }
+
+    /* ==================== QQ动态点赞用户昵称查看 ==================== */
+    private static volatile android.widget.TextView sDynZanLog;
+
+    /** 查看最近动态的点赞用户昵称（本人/他人通用，数据来自宿主 FeedManager） */
+    public static void openDynZanViewer(android.content.Context context) {
+        try {
+            android.app.Dialog dialog = new android.app.Dialog(context);
+            dialog.requestWindowFeature(1);
+            android.widget.ScrollView scroll = new android.widget.ScrollView(context);
+            android.widget.LinearLayout root = new android.widget.LinearLayout(context);
+            root.setOrientation(1);
+            root.setBackgroundColor(-15657960);
+            int pad = dp(context, 16.0f);
+            root.setPadding(pad, dp(context, 14.0f), pad, dp(context, 16.0f));
+
+            android.widget.LinearLayout header = new android.widget.LinearLayout(context);
+            header.setOrientation(0);
+            header.setGravity(16);
+            header.addView(text(context, "动态点赞用户", TITLE, 17.0f, 3),
+                    new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f));
+            android.widget.TextView close = text(context, "关闭", ACCENT, 13.0f, 17);
+            close.setPadding(dp(context, 10.0f), dp(context, 4.0f), 0, dp(context, 4.0f));
+            close.setClickable(true);
+            close.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try { dialog.dismiss(); } catch (Throwable ignored) {}
+                }
+            });
+            header.addView(close);
+            root.addView(header, rootLp());
+
+            final android.widget.TextView logView = text(context, "加载中…（需先打开过一次动态页让宿主缓存动态）", HINT, 13.0f, 3);
+            logView.setLineSpacing(dp(context, 4.0f), 1.0f);
+            sDynZanLog = logView;
+            root.addView(logView, withTop(context, 10.0f));
+            scroll.addView(root);
+            dialog.setContentView(scroll);
+            if (dialog.getWindow() != null) {
+                android.view.WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
+                attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                dialog.getWindow().setAttributes(attrs);
+                dialog.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(-15592942));
+            }
+            dialog.show();
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    final StringBuilder sb = new StringBuilder();
+                    try {
+                        java.util.List<com.tencent.qqlitepro.auto.QqDynamicScheduler.FeedRecord> list =
+                                com.tencent.qqlitepro.auto.QqDynamicScheduler.snapshot();
+                        if (list.isEmpty()) {
+                            sb.append("暂无动态缓存。请先打开 QQ 动态页，等宿主加载动态后重试。");
+                        } else {
+                            int shown = 0;
+                            for (com.tencent.qqlitepro.auto.QqDynamicScheduler.FeedRecord rec : list) {
+                                if (shown >= 20) { sb.append("\n（仅显示最近 20 条）"); break; }
+                                java.util.ArrayList<String> nicks =
+                                        com.tencent.qqlitepro.auto.QqDynamicScheduler.feedZanNicks(rec.feed);
+                                int total = com.tencent.qqlitepro.auto.QqDynamicScheduler.feedZanCount(rec.feed);
+                                if (total <= 0 && nicks.isEmpty()) continue;
+                                sb.append("【").append(rec.nick).append("】点赞 ").append(total).append(" 人\n");
+                                if (nicks.isEmpty()) {
+                                    sb.append("  （内核未返回点赞人昵称）\n\n");
+                                } else {
+                                    for (String n : nicks) {
+                                        sb.append("  · ").append(n).append("\n");
+                                    }
+                                    sb.append("\n");
+                                }
+                                shown++;
+                            }
+                            if (shown == 0) {
+                                sb.append("缓存动态均无点赞数据");
+                            }
+                        }
+                    } catch (Throwable th) {
+                        sb.append("加载失败：").append(th.getMessage());
+                    }
+                    final String txt = sb.toString();
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (sDynZanLog != null) sDynZanLog.setText(txt);
+                        }
+                    });
+                }
+            }, "dyn-zan-view").start();
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("打开动态点赞查看失败: " + th);
+        }
+    }
+
+    /** 把统计结果（标题+排行）渲染成一张 Bitmap */
+    private static android.graphics.Bitmap renderStatBitmap(android.content.Context context,
+                                                             android.widget.TextView result,
+                                                             android.view.ViewGroup rankBox) {
+        try {
+            float d = context.getResources().getDisplayMetrics().density;
+            int width = context.getResources().getDisplayMetrics().widthPixels;
+            android.widget.LinearLayout box = new android.widget.LinearLayout(context);
+            box.setOrientation(1);
+            box.setBackgroundColor(-15329264);
+            int pad = (int) (d * 14);
+            box.setPadding(pad, pad, pad, pad);
+            if (result != null) {
+                android.widget.TextView tv = new android.widget.TextView(context);
+                tv.setText(result.getText());
+                tv.setTextColor(-1);
+                tv.setTextSize(15.0f);
+                box.addView(tv);
+            }
+            if (rankBox != null) {
+                android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(-1, -2);
+                lp.topMargin = (int) (d * 8);
+                box.addView(rankBox, lp);
+            }
+            int wSpec = android.view.View.MeasureSpec.makeMeasureSpec(width, android.view.View.MeasureSpec.EXACTLY);
+            int hSpec = android.view.View.MeasureSpec.makeMeasureSpec(0, android.view.View.MeasureSpec.UNSPECIFIED);
+            box.measure(wSpec, hSpec);
+            int h = Math.max(box.getMeasuredHeight(), (int) (d * 200));
+            box.layout(0, 0, width, h);
+            android.graphics.Bitmap bm = android.graphics.Bitmap.createBitmap(width, h,
+                    android.graphics.Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas cv = new android.graphics.Canvas(bm);
+            box.draw(cv);
+            return bm;
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("renderStatBitmap 失败: " + th);
+            return null;
+        }
+    }
+
+    /**
+     * 调宿主原生截图预览界面（momoi.mod.qqpro.hook.screenshot.ScreenshotPreview），
+     * 之后"发送/保存/取消"全部交宿主处理。
+     */
+    private static boolean openHostScreenshotPreview(android.content.Context context, android.graphics.Bitmap bm) {
+        try {
+            ClassLoader cl = context.getClassLoader();
+            Class<?> cls = Class.forName("momoi.mod.qqpro.hook.screenshot.ScreenshotPreview", false, cl);
+            Object inst = cls.getField("INSTANCE").get(null);
+            for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length == 2 && ps[0] == android.content.Context.class && ps[1] == android.graphics.Bitmap.class) {
+                    m.setAccessible(true);
+                    m.invoke(inst, context, bm);
+                    com.tencent.qqlitepro.util.Log.i("已打开宿主截图预览 m=" + m.getName());
+                    return true;
+                }
+            }
+            com.tencent.qqlitepro.util.Log.w("ScreenshotPreview 未找到 (Context,Bitmap) 方法");
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("打开宿主截图预览失败: " + th);
+        }
+        return false;
+    }
+
+    /** 排行榜单行：头像(qlogo) + "i. 昵称(QQ号)" + "N 条" */
+    private static android.view.View renderRankRow(android.content.Context context, int idx,
+                                                   String nick, String count, String uin) {
+        android.widget.LinearLayout row = new android.widget.LinearLayout(context);
+        row.setOrientation(0);
+        row.setGravity(16);
+        int pad = dp(context, 6.0f);
+        row.setPadding(0, pad, 0, pad);
+
+        android.widget.ImageView avatar = new android.widget.ImageView(context);
+        android.widget.LinearLayout.LayoutParams avLp = new android.widget.LinearLayout.LayoutParams(
+                dp(context, 34.0f), dp(context, 34.0f));
+        avatar.setLayoutParams(avLp);
+        android.graphics.drawable.GradientDrawable avBg = new android.graphics.drawable.GradientDrawable();
+        avBg.setColor(-10785013);
+        avBg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        avatar.setBackground(avBg);
+        row.addView(avatar);
+
+        android.widget.LinearLayout mid = new android.widget.LinearLayout(context);
+        mid.setOrientation(1);
+        android.widget.LinearLayout.LayoutParams midLp = new android.widget.LinearLayout.LayoutParams(
+                0, -2, 1.0f);
+        midLp.leftMargin = dp(context, 10.0f);
+        mid.setLayoutParams(midLp);
+        mid.addView(text(context, idx + ". " + (nick == null || nick.isEmpty() ? "未知" : nick), TITLE, 13.5f, 3),
+                rootLp());
+        mid.addView(text(context, "QQ:" + (uin == null || uin.isEmpty() ? "?" : uin), HINT, 11.5f, 3),
+                rootLp());
+        row.addView(mid);
+
+        row.addView(text(context, (count == null ? "0" : count) + " 条", ACCENT, 12.5f, 17));
+        try {
+            final long u = Long.parseLong(uin);
+            final android.widget.ImageView fav = avatar;
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        java.net.URL url = new java.net.URL("https://q1.qlogo.cn/g?b=qq&nk=" + u + "&s=100");
+                        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                        conn.setConnectTimeout(8000);
+                        conn.setReadTimeout(8000);
+                        conn.setDoInput(true);
+                        android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeStream(conn.getInputStream());
+                        if (bm != null) {
+                            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try { fav.setImageBitmap(bm); } catch (Throwable ignored) {}
+                                }
+                            });
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }, "rank-av-" + u).start();
+        } catch (Throwable ignored) {}
+        return row;
+    }
+
 
     private static void addGateStatusRow(final android.content.Context context, android.view.ViewGroup viewGroup) {
         try {
@@ -2443,8 +2471,6 @@ public final class SettingsInjector {
     private static void renderMenu(android.content.Context context, android.view.ViewGroup viewGroup) {
         viewGroup.removeAllViews();
         viewGroup.addView(section(context, "增强模块设置"));
-        /* 在线状态点赞卡片（移自基础设置，方便直达） */
-        addZanBlock(context, viewGroup);
         addDivider(viewGroup);
         viewGroup.addView(navRow(context, "基础设置", "防撤回 / 翻译接口 / 通用", 1));
         addDivider(viewGroup);
@@ -2836,12 +2862,6 @@ public final class SettingsInjector {
                         com.tencent.qqlitepro.hook.SettingsInjector.ToggleHandler.KEY_GROUP_TOAST, context)));
         // 门禁状态 + 刷新按钮：加入群后无需重启，点一下即可检测并注入
         addGateStatusRow(context, viewGroup);
-        addDivider(viewGroup);
-        viewGroup.addView(section(context, "临时会话"));
-        viewGroup.addView(switchRow(context, "临时会话功能", "关闭后首页不再显示临时会话卡片",
-                com.tencent.qqlitepro.util.Config.tempChatEnabled(context),
-                new com.tencent.qqlitepro.hook.SettingsInjector.ToggleHandler(
-                        com.tencent.qqlitepro.hook.SettingsInjector.ToggleHandler.KEY_TEMP_CHAT, context)));
         addDivider(viewGroup);
         viewGroup.addView(section(context, "自定义后缀"));
         android.widget.CompoundButton[] compoundButtonArr = new android.widget.CompoundButton[1];
@@ -4979,6 +4999,10 @@ public final class SettingsInjector {
                             android.app.Activity activity = obj instanceof android.app.Activity ? (android.app.Activity) obj : null;
                             if (iIntValue2 == com.tencent.qqlitepro.hook.SettingsInjector.REQ_DIR_PICK) {
                                 com.tencent.qqlitepro.hook.SettingsInjector.handleDirPicked(activity, uriPickUriFromIntent);
+                                return;
+                            }
+                            if (iIntValue2 == com.tencent.qqlitepro.hook.SettingsInjector.REQ_MEDIA_DIR_PICK) {
+                                com.tencent.qqlitepro.hook.SettingsInjector.handleMediaDirPicked(activity, uriPickUriFromIntent, sPickKind);
                                 return;
                             }
                             if (iIntValue2 == com.tencent.qqlitepro.hook.SettingsInjector.REQ_PLUGIN_PICK) {
@@ -9705,56 +9729,191 @@ public final class SettingsInjector {
     }
 
     private static void buildDownloadManage(android.content.Context context, android.view.ViewGroup viewGroup) {
-        viewGroup.addView(backRow(context));
-        viewGroup.addView(section(context, "下载管理"));
         if (context instanceof android.app.Activity) {
             sFileHost = (android.app.Activity) context;
         }
-        android.widget.LinearLayout linearLayout = new android.widget.LinearLayout(context);
-        linearLayout.setOrientation(1);
-        android.graphics.drawable.GradientDrawable gradientDrawable = new android.graphics.drawable.GradientDrawable();
-        gradientDrawable.setShape(0);
-        gradientDrawable.setColor(SURFACE_CONTAINER);
-        gradientDrawable.setCornerRadius(dpLite(14.0f));
-        linearLayout.setBackground(gradientDrawable);
-        linearLayout.setPadding(dp(context, 12.0f), dp(context, 14.0f), dp(context, 12.0f), dp(context, 14.0f));
-        linearLayout.setLayoutParams(rootLp());
-        linearLayout.addView(text(context, "下载保存路径", TITLE, 14.0f, 8388611), rootLp());
-        android.widget.TextView textViewText = text(context, com.tencent.qqlitepro.util.Config.downloadDir(context), -6643546, 12.0f, 8388611);
-        textViewText.setPadding(0, dp(context, 4.0f), 0, dp(context, 6.0f));
-        textViewText.setSingleLine(false);
-        linearLayout.addView(textViewText, rootLp());
-        viewGroup.addView(linearLayout);
+        viewGroup.addView(section(context, "下载管理"));
+
+        /* 下载文件路径 */
+        android.widget.LinearLayout dlCard = new android.widget.LinearLayout(context);
+        dlCard.setOrientation(1);
+        android.graphics.drawable.GradientDrawable dlBg = new android.graphics.drawable.GradientDrawable();
+        dlBg.setColor(SURFACE_CONTAINER);
+        dlBg.setCornerRadius(dpLite(14.0f));
+        dlCard.setBackground(dlBg);
+        dlCard.setPadding(dp(context, 12.0f), dp(context, 14.0f), dp(context, 12.0f), dp(context, 14.0f));
+        dlCard.setLayoutParams(rootLp());
+        dlCard.addView(text(context, "文件保存路径", TITLE, 14.0f, 8388611), rootLp());
+        dlCard.addView(text(context, com.tencent.qqlitepro.util.Config.downloadDir(context), -6643546, 12.0f, 8388611), rootLp());
+        viewGroup.addView(dlCard);
         makeGroupGap(viewGroup);
-        viewGroup.addView(saveButton(context, "修改保存路径", new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda217()));
+        viewGroup.addView(saveButton(context, "修改文件保存路径", new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda217()));
         makeGroupGap(viewGroup);
-        android.widget.LinearLayout linearLayout2 = new android.widget.LinearLayout(context);
-        linearLayout2.setOrientation(1);
-        android.graphics.drawable.GradientDrawable gradientDrawable2 = new android.graphics.drawable.GradientDrawable();
-        gradientDrawable2.setShape(0);
-        gradientDrawable2.setColor(SURFACE_CONTAINER);
-        gradientDrawable2.setCornerRadius(dpLite(14.0f));
-        linearLayout2.setBackground(gradientDrawable2);
-        linearLayout2.setPadding(dp(context, 12.0f), dp(context, 14.0f), dp(context, 12.0f), dp(context, 14.0f));
-        linearLayout2.setLayoutParams(rootLp());
-        linearLayout2.addView(text(context, "已下载文件（长按可打开 / 删除）", TITLE, 14.0f, 8388611), rootLp());
-        java.io.File[] fileArrListDownloadFiles = listDownloadFiles(context);
-        int length = fileArrListDownloadFiles == null ? 0 : fileArrListDownloadFiles.length;
+
+        /* 图片保存路径 */
+        android.widget.LinearLayout imgCard = new android.widget.LinearLayout(context);
+        imgCard.setOrientation(1);
+        android.graphics.drawable.GradientDrawable imgBg = new android.graphics.drawable.GradientDrawable();
+        imgBg.setColor(SURFACE_CONTAINER);
+        imgBg.setCornerRadius(dpLite(14.0f));
+        imgCard.setBackground(imgBg);
+        imgCard.setPadding(dp(context, 12.0f), dp(context, 14.0f), dp(context, 12.0f), dp(context, 14.0f));
+        imgCard.setLayoutParams(rootLp());
+        imgCard.addView(text(context, "图片保存路径（独立）", TITLE, 14.0f, 8388611), rootLp());
+        imgCard.addView(text(context, com.tencent.qqlitepro.util.Config.imageSaveDir(context), -6643546, 12.0f, 8388611), rootLp());
+        viewGroup.addView(imgCard);
+        makeGroupGap(viewGroup);
+        viewGroup.addView(saveButton(context, "修改图片保存路径", new Runnable() {
+            @Override
+            public void run() {
+                pickMediaSaveDir(context, "image");
+            }
+        }));
+        makeGroupGap(viewGroup);
+
+        /* 视频保存路径 */
+        android.widget.LinearLayout vidCard = new android.widget.LinearLayout(context);
+        vidCard.setOrientation(1);
+        android.graphics.drawable.GradientDrawable vidBg = new android.graphics.drawable.GradientDrawable();
+        vidBg.setColor(SURFACE_CONTAINER);
+        vidBg.setCornerRadius(dpLite(14.0f));
+        vidCard.setBackground(vidBg);
+        vidCard.setPadding(dp(context, 12.0f), dp(context, 14.0f), dp(context, 12.0f), dp(context, 14.0f));
+        vidCard.setLayoutParams(rootLp());
+        vidCard.addView(text(context, "视频保存路径（独立）", TITLE, 14.0f, 8388611), rootLp());
+        vidCard.addView(text(context, com.tencent.qqlitepro.util.Config.videoSaveDir(context), -6643546, 12.0f, 8388611), rootLp());
+        viewGroup.addView(vidCard);
+        makeGroupGap(viewGroup);
+        viewGroup.addView(saveButton(context, "修改视频保存路径", new Runnable() {
+            @Override
+            public void run() {
+                pickMediaSaveDir(context, "video");
+            }
+        }));
+        makeGroupGap(viewGroup);
+
+        /* 合并列表：已下载文件 + 已保存媒体 */
+        android.widget.LinearLayout listCard = new android.widget.LinearLayout(context);
+        listCard.setOrientation(1);
+        android.graphics.drawable.GradientDrawable listBg = new android.graphics.drawable.GradientDrawable();
+        listBg.setColor(SURFACE_CONTAINER);
+        listBg.setCornerRadius(dpLite(14.0f));
+        listCard.setBackground(listBg);
+        listCard.setPadding(dp(context, 12.0f), dp(context, 14.0f), dp(context, 12.0f), dp(context, 14.0f));
+        listCard.setLayoutParams(rootLp());
+        listCard.addView(text(context, "已下载文件与已保存媒体（长按操作）", TITLE, 14.0f, 8388611), rootLp());
+
+        java.util.ArrayList<java.io.File> all = new java.util.ArrayList<java.io.File>();
+        java.util.HashSet<String> seen = new java.util.HashSet<String>();
+        java.io.File[] dl = listDownloadFiles(context);
+        if (dl != null) {
+            for (java.io.File f : dl) {
+                if (f != null && f.isFile() && seen.add(f.getAbsolutePath())) all.add(f);
+            }
+        }
+        java.io.File[] imgs = listDirFiles(com.tencent.qqlitepro.util.Config.imageSaveDir(context));
+        if (imgs != null) {
+            for (java.io.File f : imgs) {
+                if (f != null && f.isFile() && seen.add(f.getAbsolutePath())) all.add(f);
+            }
+        }
+        java.io.File[] vids = listDirFiles(com.tencent.qqlitepro.util.Config.videoSaveDir(context));
+        if (vids != null) {
+            for (java.io.File f : vids) {
+                if (f != null && f.isFile() && seen.add(f.getAbsolutePath())) all.add(f);
+            }
+        }
+        java.io.File[] merged = all.toArray(new java.io.File[0]);
+
         android.widget.ScrollView scrollView = new android.widget.ScrollView(context);
         scrollView.setFillViewport(false);
         scrollView.setVerticalScrollBarEnabled(true);
-        android.widget.LinearLayout.LayoutParams layoutParams = new android.widget.LinearLayout.LayoutParams(-1, -2);
-        layoutParams.topMargin = dp(context, 6.0f);
-        if (length > 0) {
-            layoutParams.height = java.lang.Math.max(dp(context, 96.0f), java.lang.Math.min(dp(context, 320.0f), (length * dp(context, 56.0f)) + dp(context, 12.0f)));
+        android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(-1, -2);
+        lp.topMargin = dp(context, 6.0f);
+        if (merged.length > 0) {
+            lp.height = java.lang.Math.max(dp(context, 96.0f), java.lang.Math.min(dp(context, 320.0f), (merged.length * dp(context, 56.0f)) + dp(context, 12.0f)));
         }
-        scrollView.setLayoutParams(layoutParams);
-        android.widget.LinearLayout linearLayout3 = new android.widget.LinearLayout(context);
-        linearLayout3.setOrientation(1);
-        scrollView.addView(linearLayout3);
-        linearLayout2.addView(scrollView);
-        viewGroup.addView(linearLayout2);
-        populateFileList(context, linearLayout3, fileArrListDownloadFiles);
+        scrollView.setLayoutParams(lp);
+        android.widget.LinearLayout listInner = new android.widget.LinearLayout(context);
+        listInner.setOrientation(1);
+        scrollView.addView(listInner);
+        listCard.addView(scrollView);
+        viewGroup.addView(listCard);
+        populateFileList(context, listInner, merged);
+    }
+
+    /** 列出目录下文件（不存在/为空返回 null） */
+    private static java.io.File[] listDirFiles(String dir) {
+        try {
+            java.io.File f = new java.io.File(dir);
+            if (!f.exists() || !f.isDirectory()) {
+                return null;
+            }
+            return f.listFiles();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 图片/视频保存路径选择：
+     * 先让用户选择"用哪个应用来处理"（系统 chooser，与下载路径选择一致的交互），
+     * 由所选应用返回目录（ACTION_OPEN_DOCUMENT_TREE）后转真实路径写入。
+     */
+    private static void pickMediaSaveDir(android.content.Context context, String kind) {
+        try {
+            if (!(context instanceof android.app.Activity)) {
+                toast(context, "需在设置界面内使用");
+                return;
+            }
+            android.app.Activity act = (android.app.Activity) context;
+            sPickKind = kind;
+            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT_TREE);
+            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            act.startActivityForResult(android.content.Intent.createChooser(intent,
+                    "选择处理的应用后选择" + ("image".equals(kind) ? "图片" : "视频") + "保存目录"), REQ_MEDIA_DIR_PICK);
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("打开目录选择器失败: " + th);
+            toast(context, "打开目录选择器失败：" + th.getMessage());
+        }
+    }
+
+    private static volatile String sPickKind = "image";
+
+    /** 目录选择结果：tree URI -> 真实路径 -> 按图片/视频分别写入 */
+    public static void handleMediaDirPicked(android.app.Activity activity, android.net.Uri uri, String kind) {
+        try {
+            if (uri == null) {
+                return;
+            }
+            /* 持久化授权，之后内核/媒体写入可直接读写 */
+            try {
+                activity.getContentResolver().takePersistableUriPermission(uri,
+                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                | android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            } catch (Throwable ignored) {
+            }
+            String path = com.tencent.qqlitepro.util.Config.mapTreeUriToPathPublic(uri.toString());
+            if (path == null) {
+                path = uri.toString();
+            }
+            if ("image".equals(kind)) {
+                com.tencent.qqlitepro.util.Config.setImageSaveDir(activity, path);
+            } else {
+                com.tencent.qqlitepro.util.Config.setVideoSaveDir(activity, path);
+            }
+            toast(activity, ("image".equals(kind) ? "图片" : "视频") + "保存路径已设为：\n" + path);
+            com.tencent.qqlitepro.util.Log.i("媒体保存路径已设置 kind=" + kind + " path=" + path);
+            try {
+                if (sPageGroup != null) {
+                    openPage(sPageGroup, 10);
+                }
+            } catch (Throwable ignored) {}
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("处理目录选择失败: " + th);
+        }
     }
 
     private static java.io.File[] listDownloadFiles(android.content.Context context) {
@@ -9810,11 +9969,98 @@ public final class SettingsInjector {
         return true;
     }
 
+    /** 自绘文件操作卡片（不用安卓原生 AlertDialog 样式） */
     private static void showDownloadFileMenu(android.content.Context context, java.io.File file) {
         try {
-            new android.app.AlertDialog.Builder(context).setTitle(file.getName()).setItems(new java.lang.String[]{"打开（选择应用）", "删除文件"}, new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda163(context, file)).setNegativeButton("取消", (android.content.DialogInterface.OnClickListener) null).show();
+            android.app.Dialog dialog = new android.app.Dialog(context);
+            dialog.requestWindowFeature(1);
+            android.widget.LinearLayout root = new android.widget.LinearLayout(context);
+            root.setOrientation(1);
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(-14605507);
+            bg.setCornerRadius(dpLite(16.0f));
+            root.setBackground(bg);
+            int pad = dp(context, 16.0f);
+            root.setPadding(pad, dp(context, 18.0f), pad, dp(context, 12.0f));
+
+            root.addView(text(context, file.getName(), TITLE, 15.5f, 3), rootLp());
+            root.addView(text(context, humanSize(file.length()) + "  ·  "
+                    + com.tencent.qqlitepro.http.FakeVoice.formatTime(file.lastModified())
+                    + "  ·  " + file.getParent(), HINT, 11.0f, 3), withTop(context, 4.0f));
+
+            final android.app.Dialog fDialog = dialog;
+            final android.content.Context fCtx = context;
+            final java.io.File fFile = file;
+            String[][] items = {
+                    {"打开（选择应用）", "open"},
+                    {"删除文件", "delete"},
+                    {"取消", "cancel"}
+            };
+            for (String[] it : items) {
+                android.widget.LinearLayout row = new android.widget.LinearLayout(context);
+                row.setOrientation(1);
+                row.setClickable(true);
+                android.graphics.drawable.GradientDrawable rowBg = new android.graphics.drawable.GradientDrawable();
+                rowBg.setColor(-15461382);
+                rowBg.setCornerRadius(dpLite(12.0f));
+                row.setBackground(rowBg);
+                int rp = dp(context, 10.0f);
+                row.setPadding(rp, dp(context, 12.0f), rp, dp(context, 12.0f));
+                row.addView(text(context, it[0], it[2].equals("cancel") ? HINT : TITLE, 14.5f, 3), rootLp());
+                row.setOnClickListener(new android.view.View.OnClickListener() {
+                    @Override
+                    public void onClick(android.view.View v) {
+                        try {
+                            dialog.dismiss();
+                        } catch (Throwable ignored) {}
+                        if ("open".equals(it[2])) {
+                            openDownloadFile(fCtx, fFile);
+                        } else if ("delete".equals(it[2])) {
+                            deleteDownloadFile(fCtx, fFile);
+                        }
+                    }
+                });
+                android.widget.LinearLayout.LayoutParams rowLp = rootLp();
+                rowLp.topMargin = dp(context, 8.0f);
+                root.addView(row, rowLp);
+            }
+
+            scrollHostDialog(dialog, root);
         } catch (java.lang.Throwable thRethrow14) {
             com.tencent.qqlitepro.util.Log.w("弹出文件操作菜单失败: " + thRethrow14);
+        }
+    }
+
+    /** 包一层透明 ScrollView 展示内容卡片（居中，宽度 92%） */
+    private static void scrollHostDialog(android.app.Dialog dialog, android.view.View content) {
+        try {
+            android.content.Context ctx = (android.content.Context) content.getTag();
+        } catch (Throwable ignored) {}
+        try {
+            android.content.Context c = null;
+            try {
+                c = ((android.view.View) content).getContext();
+            } catch (Throwable ignored) {}
+            android.widget.ScrollView sv = new android.widget.ScrollView(c);
+            android.widget.FrameLayout wrap = new android.widget.FrameLayout(c);
+            int pad = dp(c, 20.0f);
+            wrap.setPadding(pad, dp(c, 60.0f), pad, dp(c, 40.0f));
+            android.widget.FrameLayout.LayoutParams clp = new android.widget.FrameLayout.LayoutParams(
+                    -1, -2);
+            clp.setMargins(dp(c, 10.0f), 0, dp(c, 10.0f), 0);
+            wrap.addView(content, clp);
+            sv.addView(wrap);
+            dialog.setContentView(sv);
+            if (dialog.getWindow() != null) {
+                android.view.WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
+                attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                dialog.getWindow().setAttributes(attrs);
+                dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
+            }
+            dialog.show();
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("展示操作卡片失败: " + th);
         }
     }
 
