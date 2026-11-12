@@ -442,7 +442,7 @@ public final class QqDynamic {
         return str.length() > 300 ? str.substring(0, 300) : str;
     }
 
-    public static java.util.Set<java.lang.String> parseWhitelist(java.lang.String str) {
+    public static java.util.Set<java.lang.String> parseBlacklist(java.lang.String str) {
         java.util.HashSet hashSet = new java.util.HashSet();
         if (str == null) {
             return hashSet;
