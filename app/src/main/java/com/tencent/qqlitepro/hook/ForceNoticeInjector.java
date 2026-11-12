@@ -458,11 +458,57 @@ public class ForceNoticeInjector {
             window.setLayout(-1, -1);
         }
         android.widget.TextView[] textViewArr = new android.widget.TextView[2];
-        dialog.setContentView(build(activity, jsonObject, textViewArr));
+        android.view.View rootNotice = build(activity, jsonObject, textViewArr);
+        /*
+         * 右滑退出：倒计时未结束时不可滑出（有 0 进度提示），结束后从左往右滑即可关闭。
+         * 通过给根布局挂 OnTouchListener 实现，不影响内部按钮点击。
+         */
+        attachSwipeToDismiss(rootNotice, dialog);
+        dialog.setContentView(rootNotice);
         dialog.show();
         sDialog = dialog;
         startCountdown(textViewArr, new java.lang.Runnable[]{new com.tencent.qqlitepro.hook.ForceNoticeInjector$$ExternalSyntheticLambda15(strNoticeIdStr, dialog), new com.tencent.qqlitepro.hook.ForceNoticeInjector$$ExternalSyntheticLambda4(activity, strNoticeIdStr, dialog)}, 5);
     }
+
+    /** 倒计时结束后允许右滑关闭公告 */
+    private static void attachSwipeToDismiss(android.view.View root, final android.app.Dialog dialog) {
+        final float[] startX = new float[1];
+        final float[] startY = new float[1];
+        final boolean[] canDismiss = new boolean[1];
+        sSwipeDismissFlag = canDismiss;
+        root.setOnTouchListener(new android.view.View.OnTouchListener() {
+            @Override
+            public boolean onTouch(android.view.View v, android.view.MotionEvent event) {
+                switch (event.getActionMasked()) {
+                    case android.view.MotionEvent.ACTION_DOWN:
+                        startX[0] = event.getX();
+                        startY[0] = event.getY();
+                        canDismiss[0] = sCountdownDone;
+                        return false; // 不消费 down，让子控件继续响应
+                    case android.view.MotionEvent.ACTION_MOVE:
+                        if (!canDismiss[0]) {
+                            return false;
+                        }
+                        float dx = event.getX() - startX[0];
+                        float dy = Math.abs(event.getY() - startY[0]);
+                        if (dx > dp(v.getContext(), 80.0f) && dy < dp(v.getContext(), 60.0f)) {
+                            try {
+                                dialog.dismiss();
+                            } catch (Throwable ignored) {
+                            }
+                            return true;
+                        }
+                        return false;
+                    default:
+                        return false;
+                }
+            }
+        });
+    }
+
+    /* 倒计时结束标志（供右滑判断） */
+    private static volatile boolean sCountdownDone;
+    private static volatile boolean[] sSwipeDismissFlag;
 
     static /* synthetic */ void lambda$show$5(java.lang.String str, android.app.Dialog dialog) {
         sConfirmedShown.add(str);
@@ -539,6 +585,10 @@ public class ForceNoticeInjector {
             while (true) {
                 android.widget.TextView[] textViewArr = this.val$btns;
                 if (i >= textViewArr.length) {
+                    /* 倒计时结束：允许右滑退出 */
+                    if (com.tencent.qqlitepro.hook.ForceNoticeInjector.sSwipeDismissFlag != null) {
+                        com.tencent.qqlitepro.hook.ForceNoticeInjector.sSwipeDismissFlag[0] = true;
+                    }
                     return;
                 }
                 textViewArr[i].setText(this.val$bases[i]);
@@ -581,13 +631,37 @@ public class ForceNoticeInjector {
     }
 
     private static android.view.View build(android.content.Context context, com.google.gson.JsonObject jsonObject, android.widget.TextView[] textViewArr) {
+        /*
+         * 开屏公告自适应：
+         * 读取设备真实屏幕尺寸（含 contentRect 排除状态栏/导航栏），
+         * 按比例分配标题/正文/按钮区，保证任何分辨率下按钮都不被挤出屏幕。
+         */
+        android.graphics.Rect rect = new android.graphics.Rect();
+        if (context instanceof android.app.Activity) {
+            ((android.app.Activity) context).getWindow().getDecorView().getWindowVisibleDisplayFrame(rect);
+        } else {
+            android.util.DisplayMetrics dm = context.getResources().getDisplayMetrics();
+            rect.set(0, 0, dm.widthPixels, dm.heightPixels);
+        }
+        int screenW = rect.width() > 0 ? rect.width() : context.getResources().getDisplayMetrics().widthPixels;
+        int screenH = rect.height() > 0 ? rect.height() : context.getResources().getDisplayMetrics().heightPixels;
+        /* 边距随屏宽自适应：最小 12dp，最大 24dp（屏宽 3% 为基准） */
+        int padH = Math.max(dp(context, 12.0f), Math.min(dp(context, 24.0f), (int) (screenW * 0.03f)));
+        int padV = Math.max(dp(context, 10.0f), Math.min(dp(context, 20.0f), (int) (screenH * 0.02f)));
+        /* 正文高度占屏 55%（保证按钮区至少能放下两个按钮） */
+        int contentMinH = (int) (screenH * 0.55f);
+        /* 标题字号随屏宽自适应：小屏 17sp，大屏 22sp */
+        float titleSize = Math.max(17.0f, Math.min(22.0f, screenW / 22.0f));
+        /* 按钮高度固定 44dp 以上，保证可点 */
+        int btnMinH = Math.max(dp(context, 44.0f), (int) (screenH * 0.06f));
+
         android.widget.LinearLayout linearLayout = new android.widget.LinearLayout(context);
         linearLayout.setOrientation(1);
         linearLayout.setGravity(1);
-        linearLayout.setPadding(dp(context, 24.0f), dp(context, 24.0f), dp(context, 24.0f), dp(context, 24.0f));
+        linearLayout.setPadding(padH, padV, padH, padV);
         linearLayout.setBackgroundColor(-15592942);
         android.widget.FrameLayout frameLayout = new android.widget.FrameLayout(context);
-        android.widget.TextView textViewText = text(context, nonEmpty(prims(jsonObject, "title"), "（标题）"), -1, 20.0f, 1);
+        android.widget.TextView textViewText = text(context, nonEmpty(prims(jsonObject, "title"), "（标题）"), -1, titleSize, 1);
         textViewText.setGravity(17);
         frameLayout.addView(textViewText, new android.widget.FrameLayout.LayoutParams(-1, -2, 17));
         android.view.View viewNodeSwitcher = nodeSwitcher(context);
@@ -600,7 +674,9 @@ public class ForceNoticeInjector {
         linearLayout.addView(textViewText2, m(-1, -2, 0, 0, 0, dp(context, 16.0f)));
         android.widget.ScrollView scrollView = new android.widget.ScrollView(context);
         scrollView.setLayoutParams(new android.widget.LinearLayout.LayoutParams(-1, 0, 1.0f));
-        android.widget.TextView textViewText3 = text(context, nonEmpty(prims(jsonObject, "content"), "（无正文）"), -1512723, 15.0f, 0);
+        scrollView.setMinimumHeight(contentMinH);
+        float bodySize = Math.max(13.0f, Math.min(16.0f, screenW / 26.0f));
+        android.widget.TextView textViewText3 = text(context, nonEmpty(prims(jsonObject, "content"), "（无正文）"), -1512723, bodySize, 0);
         textViewText3.setLineSpacing(dp(context, 4.0f), 1.0f);
         textViewText3.setPadding(dp(context, 8.0f), dp(context, 16.0f), dp(context, 8.0f), dp(context, 16.0f));
         scrollView.addView(textViewText3, new android.widget.FrameLayout.LayoutParams(-1, -2));
@@ -608,13 +684,17 @@ public class ForceNoticeInjector {
         android.widget.LinearLayout linearLayout2 = new android.widget.LinearLayout(context);
         linearLayout2.setOrientation(0);
         linearLayout2.setGravity(17);
-        android.widget.LinearLayout.LayoutParams layoutParams2 = new android.widget.LinearLayout.LayoutParams(-1, -2);
-        layoutParams2.topMargin = dp(context, 20.0f);
+        android.widget.LinearLayout.LayoutParams layoutParams2 = new android.widget.LinearLayout.LayoutParams(-1, btnMinH);
+        layoutParams2.topMargin = dp(context, 12.0f);
         linearLayout.addView(linearLayout2, layoutParams2);
         android.widget.TextView textViewButton = button(context, "确认");
         android.widget.TextView textViewButton2 = button(context, "不再提醒");
-        linearLayout2.addView(textViewButton, m(0, -2, 0, 0, dp(context, 6.0f), 0, 1.0f));
-        linearLayout2.addView(textViewButton2, m(0, -2, dp(context, 6.0f), 0, 0, 0, 1.0f));
+        textViewButton.setMinHeight(btnMinH - dp(context, 8.0f));
+        textViewButton2.setMinHeight(btnMinH - dp(context, 8.0f));
+        textViewButton.setGravity(17);
+        textViewButton2.setGravity(17);
+        linearLayout2.addView(textViewButton, m(0, -1, 0, 0, dp(context, 6.0f), 0, 1.0f));
+        linearLayout2.addView(textViewButton2, m(0, -1, dp(context, 6.0f), 0, 0, 0, 1.0f));
         textViewArr[0] = textViewButton;
         textViewArr[1] = textViewButton2;
         return linearLayout;
