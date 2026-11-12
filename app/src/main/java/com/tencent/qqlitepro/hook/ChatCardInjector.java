@@ -160,7 +160,8 @@ public class ChatCardInjector {
     }
 
     public static int tempChatCardSlot(Object obj) {
-        return 1;
+        /* 汇总卡已停用：临时会话改为直接插入主会话列表 */
+        return -1;
     }
 
     private static boolean tempChatFeatureOn() {
@@ -651,7 +652,11 @@ public class ChatCardInjector {
                             for (int i = 0; i < chatItems.size() && i < fItems.size(); ++i) {
                                 final String uid = (String) ((Object[]) fItems.get(i))[0];
                                 View card = ChatCardInjector.buildHostChatRowAt(fCtx, (ViewGroup) fList, chatItems.get(i), i);
-                                if (card != null) {
+                                if (card == null) {
+                                    /* 单卡失败补 fallback，保证每 uid 恰好一张卡（防粘连/缺卡） */
+                                    fList.addView(ChatCardInjector.fallbackRow(fCtx, fDialog, (Object[]) fItems.get(i)),
+                                            new LinearLayout.LayoutParams(-1, -2));
+                                } else {
                                     builtCount[0] = builtCount[0] + 1;
                                     fList.addView(card, new LinearLayout.LayoutParams(-1, -2));
                                     card.setOnClickListener(new View.OnClickListener() {
@@ -671,9 +676,6 @@ public class ChatCardInjector {
                                             return true;
                                         }
                                     });
-                                } else {
-                                    fList.addView(ChatCardInjector.fallbackRow(fCtx, fDialog, (Object[]) fItems.get(i)),
-                                            new LinearLayout.LayoutParams(-1, -2));
                                 }
                             }
                             Log.i("全屏临时会话页: 共 " + fItems.size() + " 条，宿主卡片 " + builtCount[0] + " 条");
@@ -746,6 +748,14 @@ public class ChatCardInjector {
                 return;
             }
             Class<?> bcls = binding.getClass();
+            /* binding 构造参数顺序（逆向 WatchRecentItemBuilder.a）：
+             *   (root, 2114519368头像, 2114519698标题, 2114521588时间, 2114521611摘要, 2114521638置顶, 2114521741未读)
+             * 对应字段 a..g：a=root, b=头像, c=标题(SingleLineTextView),
+             * d=时间, e=摘要(SingleLineTextView), f=置顶Icon, g=未读QUIBadge。
+             * 宿主 e(item) 里 r4.b.c.setText(item.h.a=标题) 也证明 c 是标题。 */
+            /* 视觉顺序（真机确认）：e(SingleLineTextView) 在上=标题位，c(SingleLineTextView) 在下=摘要位。
+             * 宿主 e() 把 SummaryInfo 填 e？不——宿主 e() 填的是 c。真机显示预览在上昵称在下，
+             * 因此这里按视觉修正：e ← 昵称（标题位），c ← 消息预览（摘要位）。 */
             try {
                 Object tv = bcls.getField("e").get(binding);
                 XposedHelpers.callMethod(tv, "setText", new Object[]{nick});
@@ -774,13 +784,13 @@ public class ChatCardInjector {
             } catch (Throwable th3) {
                 Log.w("直填未读失败: " + th3);
             }
-            /* 置顶箭头图标：置顶由模块的独立排序体现（置顶的排最前），
-             * 不显示宿主的置顶图标（避免与模板拷贝来的 topFlag 残留混淆）。
-             * binding 的 f 字段是 ImageView（top 标识）。 */
+            /* 置顶箭头标识：按该会话自己的置顶标志独立显示/隐藏 */
             try {
                 Object topIcon = bcls.getField("f").get(binding);
                 if (topIcon instanceof android.view.View) {
-                    ((android.view.View) topIcon).setVisibility(android.view.View.GONE);
+                    boolean top = com.tencent.qqlitepro.http.QqKernel.isTempChatTop(peerUid);
+                    ((android.view.View) topIcon).setVisibility(top
+                            ? android.view.View.VISIBLE : android.view.View.GONE);
                 }
             } catch (Throwable ignored) {}
 
@@ -794,22 +804,9 @@ public class ChatCardInjector {
                 }
             } catch (Throwable ignored) {}
 
-            /* 卡片分隔（与宿主首页卡片一致）：调宿主模组的
-             * CardMarginUnifyKt.cardMargin(itemView)——左右 4dp、上下 2dp。 */
-            try {
-                ClassLoader clM = sAppCtx != null ? sAppCtx.getClassLoader() : null;
-                if (clM != null) {
-                    Class<?> cardCls = Class.forName(
-                            "momoi.mod.qqpro.hook.style.CardMarginUnifyKt", false, clM);
-                    for (java.lang.reflect.Method m : cardCls.getDeclaredMethods()) {
-                        if (m.getName().equals("cardMargin") && m.getParameterTypes().length == 1) {
-                            m.setAccessible(true);
-                            m.invoke(null, (android.view.View) XposedHelpers.getObjectField(holder, "itemView"));
-                            break;
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {}
+            /* 卡片分隔：外层包装 LinearLayout 已有 4/2dp margin（buildHostChatRowAt 添加处），
+             * 不再对宿主 itemView 调 cardMargin——它自带 RecyclerView MarginParams，
+             * 重复设置会导致独立容器里 measure 异常（首卡内容溢出）。 */
 
             /* 头像：qlogo URL 按 uin 拉取 Bitmap 写入 WatchAvatarView。
              * （AvatarFacade 链会在 dex 类解析时抛 NoClassDefFoundError：SingleLineTextView，
@@ -888,9 +885,68 @@ public class ChatCardInjector {
             } catch (Throwable th) {
                 Log.w("构建宿主卡片: onBindViewHolder 失败 " + th);
             }
-            fillWatchBinding(adapter, holder, chatItem, peerUidOf(chatItem));
+            /* 置顶标识：写 item.k 后调宿主 builder.o(item, holder)（宿主原生显隐逻辑） */
             try {
-                clearChildClickListeners(itemView, 0);
+                String uidT = peerUidOf(chatItem);
+                boolean top = com.tencent.qqlitepro.http.QqKernel.isTempChatTop(uidT);
+                XposedHelpers.setBooleanField(chatItem, "k", top);
+                Object builderT = watchRecentItemBuilder();
+                if (builderT != null) {
+                    for (java.lang.reflect.Method m : builderT.getClass().getDeclaredMethods()) {
+                        if (m.getName().equals("o") && m.getParameterTypes().length == 2
+                                && m.getParameterTypes()[0].isInstance(chatItem)
+                                && m.getParameterTypes()[1].isInstance(holder)) {
+                            m.setAccessible(true);
+                            m.invoke(builderT, chatItem, holder);
+                            break;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            /* 点击/长按：调宿主 holder.e(item)——宿主为每张卡挂独立的
+             * 点击(进聊天)/长按(原生菜单, items 带 item 对象, 天然逐卡独立) */
+            try {
+                for (java.lang.reflect.Method m : holder.getClass().getDeclaredMethods()) {
+                    if (m.getName().equals("e") && m.getParameterTypes().length == 1
+                            && m.getParameterTypes()[0].isInstance(chatItem)) {
+                        m.setAccessible(true);
+                        m.invoke(holder, chatItem);
+                        break;
+                    }
+                }
+            } catch (Throwable thE) {
+                Log.w("构建宿主卡片: holder.e 失败 " + thE);
+            }
+            /* 直填数据放最后：holder.e 会用 item.h.a 重写昵称（带后缀），
+             * 我们在它之后剥后缀/填摘要/时间/未读/头像，保证最终显示正确 */
+            final Object fAdapter2 = adapter;
+            final Object fHolder2 = holder;
+            final Object fItem2 = chatItem;
+            final String fUid2 = peerUidOf(chatItem);
+            /* 直填延后一拍：确保覆盖宿主 onBindViewHolder 的异步渲染结果 */
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        fillWatchBinding(fAdapter2, fHolder2, fItem2, fUid2);
+                    } catch (Throwable ignored) {}
+                }
+            });
+            /* 独立容器（LinearLayout）里的 RecyclerView.LayoutParams 会让
+             * measure 走 RecyclerView 的子 View 语义，导致 ConstraintLayout
+             * 高度塌陷/内容溢出。用通用 MarginLayoutParams（保留原 margin）修复。 */
+            try {
+                android.view.ViewGroup.LayoutParams lp0 = itemView.getLayoutParams();
+                android.view.ViewGroup.MarginLayoutParams nlp;
+                if (lp0 instanceof android.view.ViewGroup.MarginLayoutParams) {
+                    nlp = (android.view.ViewGroup.MarginLayoutParams) lp0;
+                } else {
+                    nlp = new android.widget.LinearLayout.LayoutParams(-1, -2);
+                }
+                nlp.width = -1;
+                nlp.height = -2;
+                itemView.setLayoutParams(nlp);
             } catch (Throwable ignored) {
             }
             return itemView;
@@ -989,14 +1045,15 @@ public class ChatCardInjector {
                 XposedHelpers.callMethod(adapter, "submitList", new Object[]{chatItems, null});
             } catch (Throwable ignored) {}
         }
-        for (int wait = 0; wait < 60; ++wait) {
+        /* diff 提交等待：高频短轮询（10ms×最多 100 次=1s），尽快进入逐卡渲染 */
+        for (int wait = 0; wait < 100; ++wait) {
             try {
                 Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
                 if (cur instanceof List && ((List)cur).size() == chatItems.size()) {
                     break;
                 }
             } catch (Throwable ignored) {}
-            try { Thread.sleep(25L); } catch (InterruptedException ie) { break; }
+            try { Thread.sleep(10L); } catch (InterruptedException ie) { break; }
         }
         return chatItems;
     }
@@ -1258,25 +1315,32 @@ public class ChatCardInjector {
             if (name == null || name.trim().isEmpty()) {
                 name = QqKernel.strOf(QqKernel.fieldValue(info, "peerUid"));
             }
+            /*
+             * 逆向宿主渲染语义（WatchRecentItemBuilder）：
+             *   e(item): binding.c(标题)  = item.h.a  -> SummaryInfo.a 应装【昵称】
+             *   s(item): binding.e(摘要)  = item.f.a  -> TitleInfo.a   应装【消息预览】
+             *   r(item): binding.d(时间)  = item.g    -> item.g 直接是时间串
+             * 这里按宿主语义构造（此前把昵称装进 TitleInfo 导致标题/摘要颠倒）。
+             */
+            String previewText0 = QqKernel.previewTextOfAbstract(QqKernel.fieldValue(info, "abstractContent"));
+            if (previewText0 == null) {
+                previewText0 = "";
+            }
             Object title;
             try {
-                title = titleCls.getConstructor(String.class).newInstance(name);
+                title = titleCls.getConstructor(String.class).newInstance(previewText0);
             } catch (Throwable ignored) {
                 title = titleCls.newInstance();
                 try {
                     java.lang.reflect.Method st = titleCls.getMethod("a", String.class);
-                    st.invoke(title, name);
+                    st.invoke(title, previewText0);
                 } catch (Throwable ignored2) {
                 }
             }
 
-            String summaryText = QqKernel.previewTextOfAbstract(QqKernel.fieldValue(info, "abstractContent"));
-            if (summaryText == null) {
-                summaryText = "";
-            }
             Object summary;
             try {
-                summary = summaryCls.getConstructor(CharSequence.class).newInstance(summaryText);
+                summary = summaryCls.getConstructor(CharSequence.class).newInstance(name);
             } catch (Throwable ignored) {
                 summary = summaryCls.newInstance();
             }
@@ -1398,12 +1462,14 @@ public class ChatCardInjector {
                 Class<?> titleCls = Class.forName(
                         "com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$TitleInfo",
                         false, item.getClass().getClassLoader());
-                String name = QqKernel.strOf(QqKernel.fieldValue(info, "peerName"));
+                /* 宿主语义：TitleInfo.a=消息预览（s()填摘要），SummaryInfo.a=昵称（e()填标题） */
+                String prev0 = QqKernel.previewTextOfAbstract(QqKernel.fieldValue(info, "abstractContent"));
+                if (prev0 == null) prev0 = "";
                 title = buildSimple(titleCls,
                         new Class<?>[]{String.class, Integer.class, Integer.class, String.class},
-                        new Object[]{name, Integer.valueOf(0), Integer.valueOf(0), ""});
+                        new Object[]{prev0, Integer.valueOf(0), Integer.valueOf(0), ""});
                 if (title == null) {
-                    title = buildFirst(titleCls, name);
+                    title = buildFirst(titleCls, prev0);
                 }
             } catch (Throwable ignored) {
             }
@@ -1412,14 +1478,17 @@ public class ChatCardInjector {
                 Class<?> sumCls = Class.forName(
                         "com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$SummaryInfo",
                         false, item.getClass().getClassLoader());
-                String text = QqKernel.previewTextOfAbstract(QqKernel.fieldValue(info, "abstractContent"));
+                String nick0 = QqKernel.strOf(QqKernel.fieldValue(info, "peerName"));
+                if (nick0 != null) {
+                    nick0 = nick0.replace("（临时会话）", "").replace("(临时会话)", "").trim();
+                }
                 try {
                     summary = sumCls.getConstructor(CharSequence.class, Integer.TYPE)
-                            .newInstance(text, Integer.valueOf(0));
+                            .newInstance(nick0, Integer.valueOf(0));
                 } catch (Throwable ignored2) {
                 }
                 if (summary == null) {
-                    summary = buildFirst(sumCls, text);
+                    summary = buildFirst(sumCls, nick0);
                 }
             } catch (Throwable ignored) {
             }
@@ -2182,8 +2251,13 @@ public class ChatCardInjector {
         return null;
     }
 
-    /** 当前菜单目标是否为临时会话（peerUid 在临时会话表里） */
+    /** 当前菜单目标是否为临时会话：显式登记的 uid 优先（逐卡独立），否则从菜单 items 解析 */
     private static boolean menuTargetIsTempChat() {
+        String registered = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
+        if (registered != null && !registered.isEmpty()
+                && com.tencent.qqlitepro.http.QqKernel.isTempChat(registered)) {
+            return true;
+        }
         Object info = menuTargetInfo();
         if (info == null) {
             return false;
@@ -2196,8 +2270,13 @@ public class ChatCardInjector {
         }
     }
 
-    /** 当前菜单目标的 peerUid */
+    /** 当前菜单目标的 peerUid：登记 uid 优先 */
     private static String menuTargetPeerUid() {
+        String registered = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
+        if (registered != null && !registered.isEmpty()
+                && com.tencent.qqlitepro.http.QqKernel.isTempChat(registered)) {
+            return registered;
+        }
         Object info = menuTargetInfo();
         if (info == null) {
             return null;
@@ -3176,12 +3255,22 @@ public class ChatCardInjector {
 
         protected void afterHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
             sActiveMenu = methodHookParam.thisObject;
-            /* 群聊会话菜单：注入"消息数据"入口（统计近 N 天消息总数/发言排行/截图发送） */
+            /* 菜单打开即登记目标 uid：从 items 解析 RecentContactChatItem（字段 a）。
+             * 这样后续 onClick/onCheckedChanged 的 menuTargetUid() 立即可用、逐菜单独立。 */
             try {
-                ChatCardInjector.injectStatMenuButton(methodHookParam.thisObject);
-            }
-            catch (Throwable throwable) {
-                // empty catch block
+                Object info = ChatCardInjector.menuTargetInfo();
+                if (info != null) {
+                    String uid = (String) XposedHelpers.getObjectField(info, "peerUid");
+                    String nick = (String) XposedHelpers.getObjectField(info, "peerName");
+                    int chatType = XposedHelpers.getIntField(info, "chatType");
+                    long uin = XposedHelpers.getLongField(info, "peerUin");
+                    if (uid != null && !uid.isEmpty()) {
+                        com.tencent.qqlitepro.http.QqKernel.registerMenuTarget(uid, nick, chatType, uin);
+                        Log.i("菜单打开登记目标 uid=" + uid);
+                    }
+                }
+            } catch (Throwable th) {
+                Log.w("菜单登记失败: " + th);
             }
         }
     }
@@ -3195,6 +3284,8 @@ public class ChatCardInjector {
             if (sActiveMenu == methodHookParam.thisObject) {
                 sActiveMenu = null;
             }
+            /* 菜单关闭即清空登记目标，避免下一个菜单沿用旧 uid（互不影响的关键） */
+            com.tencent.qqlitepro.http.QqKernel.clearMenuTarget();
         }
     }
 
