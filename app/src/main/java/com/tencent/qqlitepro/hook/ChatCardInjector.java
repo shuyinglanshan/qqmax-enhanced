@@ -178,7 +178,25 @@ public class ChatCardInjector {
     }
 
     private static int extraCardCount() {
-        return ChatCardInjector.tempChatFeatureOn() ? 2 : 1;
+        /* 1 张邮箱卡 + N 张临时会话卡 */
+        int n = 1;
+        if (ChatCardInjector.tempChatFeatureOn()) {
+            n += Math.min(50, com.tencent.qqlitepro.http.QqKernel.tempChatCount());
+        }
+        return n;
+    }
+
+    /** 临时会话卡在列表中的起始下标（邮箱卡之后） */
+    private static int tempChatBaseSlot() {
+        return 1;
+    }
+
+    /** 该位置对应的临时会话序号（0..N-1），非临时卡返回 -1 */
+    private static int tempChatIndexAt(int pos) {
+        if (!ChatCardInjector.tempChatFeatureOn()) return -1;
+        int idx = pos - tempChatBaseSlot();
+        int n = Math.min(50, com.tencent.qqlitepro.http.QqKernel.tempChatCount());
+        return (idx >= 0 && idx < n) ? idx : -1;
     }
 
     private static boolean isTempChatCardPos(Object adapter, int pos) {
@@ -658,7 +676,16 @@ public class ChatCardInjector {
                                             new LinearLayout.LayoutParams(-1, -2));
                                 } else {
                                     builtCount[0] = builtCount[0] + 1;
-                                    fList.addView(card, new LinearLayout.LayoutParams(-1, -2));
+                                    /* 防溢出/防粘连：卡片外包裁切容器，上下各留 2dp */
+                                    android.widget.FrameLayout clipWrap = new android.widget.FrameLayout(fCtx);
+                                    clipWrap.setClipChildren(true);
+                                    clipWrap.setClipToPadding(true);
+                                    clipWrap.addView(card, new android.widget.FrameLayout.LayoutParams(-1, -2));
+                                    float dens = fCtx.getResources().getDisplayMetrics().density;
+                                    LinearLayout.LayoutParams cwLp = new LinearLayout.LayoutParams(-1, -2);
+                                    cwLp.topMargin = (int) (dens * 2);
+                                    cwLp.bottomMargin = (int) (dens * 2);
+                                    fList.addView(clipWrap, cwLp);
                                     card.setOnClickListener(new View.OnClickListener() {
                                         @Override
                                         public void onClick(View v) {
@@ -1693,6 +1720,172 @@ public class ChatCardInjector {
         return outer;
     }
 
+    /**
+     * 渲染第 idx 个临时会话卡（与宿主会话卡一致：昵称/头像/未读/时间/预览 + 原生长按菜单）。
+     * 数据来自 QqKernel.tempChatSnapshot()（按最后消息时间倒序）。
+     */
+    public static void bindTempChatItemCard(View view, int idx) {
+        try {
+            if (!(view instanceof android.view.ViewGroup)) {
+                return;
+            }
+            android.view.ViewGroup root = (android.view.ViewGroup) view;
+            java.util.List<java.lang.Object[]> list = com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
+            if (list == null || idx < 0 || idx >= list.size()) {
+                return;
+            }
+            final Object[] item = list.get(idx);
+            final String uid = (String) item[0];
+            final String nick = (item[1] == null ? "" : String.valueOf(item[1]))
+                    .replace("（临时会话）", "").replace("(临时会话)", "").trim();
+            final String preview = item[2] == null ? "" : String.valueOf(item[2]);
+            final int unread = item[3] instanceof Integer ? (Integer) item[3] : 0;
+            final long msgTime = com.tencent.qqlitepro.http.QqKernel.longOf(item[4]);
+            final long uinTmp = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(uid);
+
+            android.content.Context ctx = root.getContext();
+            root.removeAllViews();
+            /* 卡片背景（圆角 + 4/2dp 间距，防粘连） */
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(-14013129);
+            bg.setCornerRadius(dp(ctx, 10));
+            root.setBackground(bg);
+            root.setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8));
+            root.setClickable(true);
+            root.setLongClickable(true);
+            try {
+                android.view.ViewGroup.LayoutParams lp = root.getLayoutParams();
+                if (lp != null) {
+                    lp.height = -2;
+                }
+            } catch (Throwable ignored) {}
+
+            /* 横向：头像 + 右侧(昵称/预览/时间) + 未读 */
+            android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
+            row.setOrientation(0);
+            row.setGravity(16);
+            root.addView(row, new android.widget.LinearLayout.LayoutParams(-1, -2));
+
+            android.widget.ImageView avatar = new android.widget.ImageView(ctx);
+            int av = dp(ctx, 36);
+            android.widget.LinearLayout.LayoutParams avLp = new android.widget.LinearLayout.LayoutParams(av, av);
+            avatar.setLayoutParams(avLp);
+            android.graphics.drawable.GradientDrawable avBg = new android.graphics.drawable.GradientDrawable();
+            avBg.setColor(-13488056);   /* 中性占位（灰），加载成功后换成真实头像 */
+            avBg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+            avatar.setBackground(avBg);
+            avatar.setClipToOutline(true);
+            row.addView(avatar);
+            /* 头像异步加载（qlogo） */
+            try {
+                long uin = uinTmp;
+                if (uin > 0) {
+                    final android.widget.ImageView fAv = avatar;
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                java.net.URL u = new java.net.URL("https://q1.qlogo.cn/g?b=qq&nk=" + uin + "&s=100");
+                                java.net.HttpURLConnection c = (java.net.HttpURLConnection) u.openConnection();
+                                c.setConnectTimeout(6000);
+                                c.setReadTimeout(6000);
+                                c.setDoInput(true);
+                                final android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeStream(c.getInputStream());
+                                if (bm != null) {
+                                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            try {
+                                                fAv.setImageBitmap(bm);
+                                                fAv.setBackground(null);
+                                            } catch (Throwable ignored) {}
+                                        }
+                                    });
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }, "temp-av").start();
+                }
+            } catch (Throwable ignored) {}
+
+            android.widget.LinearLayout mid = new android.widget.LinearLayout(ctx);
+            mid.setOrientation(1);
+            android.widget.LinearLayout.LayoutParams midLp = new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f);
+            midLp.leftMargin = dp(ctx, 10);
+            row.addView(mid, midLp);
+
+            android.widget.TextView tvNick = new android.widget.TextView(ctx);
+            tvNick.setText(nick.isEmpty() ? uid : nick);
+            tvNick.setTextSize(15.0f);
+            tvNick.setTextColor(-1);
+            tvNick.setSingleLine(true);
+            tvNick.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            tvNick.setMaxWidth((int) (ctx.getResources().getDisplayMetrics().widthPixels * 0.52f));
+            mid.addView(tvNick);
+
+            android.widget.TextView tvPrev = new android.widget.TextView(ctx);
+            tvPrev.setText(preview);
+            tvPrev.setTextSize(12.5f);
+            tvPrev.setTextColor(-6643546);
+            tvPrev.setSingleLine(true);
+            tvPrev.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            tvPrev.setMaxWidth((int) (ctx.getResources().getDisplayMetrics().widthPixels * 0.52f));
+            android.widget.LinearLayout.LayoutParams pvLp = new android.widget.LinearLayout.LayoutParams(-1, -2);
+            pvLp.topMargin = dp(ctx, 2);
+            mid.addView(tvPrev, pvLp);
+
+            /* 时间 + 未读 */
+            android.widget.LinearLayout right = new android.widget.LinearLayout(ctx);
+            right.setOrientation(1);
+            right.setGravity(17);
+            row.addView(right, new android.widget.LinearLayout.LayoutParams(-2, -2));
+            android.widget.TextView tvTime = new android.widget.TextView(ctx);
+            tvTime.setTextSize(11.0f);
+            tvTime.setTextColor(-6643546);
+            tvTime.setSingleLine(true);
+            if (msgTime > 0) {
+                java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault());
+                tvTime.setText(sdf.format(new java.util.Date(msgTime)));
+            }
+            right.addView(tvTime);
+            if (unread > 0) {
+                android.widget.TextView badge = new android.widget.TextView(ctx);
+                badge.setText(unread > 99 ? "99+" : String.valueOf(unread));
+                badge.setTextSize(10.5f);
+                badge.setTextColor(-1);
+                badge.setGravity(17);
+                badge.setBackgroundColor(-65536);
+                android.widget.LinearLayout.LayoutParams bLp = new android.widget.LinearLayout.LayoutParams(-2, -2);
+                bLp.topMargin = dp(ctx, 3);
+                bLp.leftMargin = dp(ctx, 4);
+                right.addView(badge, bLp);
+            }
+
+            /* 点击进会话 */
+            root.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try {
+                        com.tencent.qqlitepro.http.QqKernel.setTempChatUnread(uid, 0);
+                        com.tencent.qqlitepro.http.QqKernel.openTempChatSession(v.getContext(), uid);
+                    } catch (Throwable ignored) {}
+                }
+            });
+            /* 长按 = 宿主原生长按菜单（与正常会话一致，逐会话独立） */
+            root.setOnLongClickListener(new android.view.View.OnLongClickListener() {
+                @Override
+                public boolean onLongClick(android.view.View v) {
+                    try {
+                        com.tencent.qqlitepro.http.QqKernel.showTempChatMenu(v.getContext(), uid);
+                    } catch (Throwable ignored) {}
+                    return true;
+                }
+            });
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("bindTempChatItemCard 失败: " + th);
+        }
+    }
+
     public static void bindTempChatCard(View view) {
         if (view == null) {
             return;
@@ -1877,14 +2070,27 @@ public class ChatCardInjector {
         if (Config.mailAddr((Context)context).isEmpty()) {
             return "\u672a\u914d\u7f6eQQ\u90ae\u7bb1\u4fe1\u606f";
         }
-        if (i <= 0) {
-            return "\u5f53\u524d\u672a\u6536\u5230\u65b0\u90ae\u4ef6";
+        /* 已配置：尽量展示更多邮箱信息（未读数 + 发件人 + 主题摘要） */
+        String from = "";
+        String subject = "";
+        try { from = Config.mailLatestFrom(context); } catch (Throwable ignored) {}
+        try { subject = Config.mailLatestSubject(context); } catch (Throwable ignored) {}
+        String latest = Config.mailLatestSummary((Context)context);
+        StringBuilder sb = new StringBuilder();
+        if (i > 0) {
+            sb.append("未读 ").append(i).append(" 封");
+        } else {
+            sb.append("暂无新邮件");
         }
-        String strMailLatestSummary = Config.mailLatestSummary((Context)context);
-        if (!strMailLatestSummary.isEmpty()) {
-            return ChatCardInjector.truncateText(strMailLatestSummary, 60);
+        if (from != null && !from.isEmpty()) {
+            sb.append(" · ").append(from);
         }
-        return "\u672a\u8bfb " + i + " \u5c01\u65b0\u90ae\u4ef6";
+        if (subject != null && !subject.isEmpty()) {
+            sb.append("：").append(subject);
+        } else if (latest != null && !latest.isEmpty()) {
+            sb.append("：").append(latest);
+        }
+        return truncateText(sb.toString(), 60);
     }
 
     private static String truncateText(String str, int i) {
@@ -2975,7 +3181,7 @@ public class ChatCardInjector {
                 int pos = numLastIntArg;
                 if (pos == ChatCardInjector.cardSlot(methodHookParam.thisObject)) {
                     methodHookParam.setResult(Integer.valueOf(-10));
-                } else if (ChatCardInjector.tempChatFeatureOn() && pos == ChatCardInjector.tempChatCardSlot(methodHookParam.thisObject)) {
+                } else if (ChatCardInjector.tempChatIndexAt(pos) >= 0) {
                     methodHookParam.setResult(Integer.valueOf(-11));
                 }
             }
@@ -3012,14 +3218,15 @@ public class ChatCardInjector {
                 boolean isTemp;
                 int pos = numLastIntArg;
                 boolean isMail = pos == ChatCardInjector.cardSlot(methodHookParam.thisObject);
-                boolean bl = isTemp = ChatCardInjector.tempChatFeatureOn() && pos == ChatCardInjector.tempChatCardSlot(methodHookParam.thisObject);
-                if (!isMail && !isTemp) {
+                int tempIdx = ChatCardInjector.tempChatIndexAt(pos);
+                boolean isTempCard = tempIdx >= 0;
+                if (!isMail && !isTempCard) {
                     return;
                 }
                 try {
                     View itemView = (View)XposedHelpers.getObjectField((Object)methodHookParam.args[0], (String)"itemView");
-                    if (isTemp) {
-                        ChatCardInjector.bindTempChatCard(itemView);
+                    if (isTempCard) {
+                        ChatCardInjector.bindTempChatItemCard(itemView, tempIdx);
                     } else {
                         ChatCardInjector.bindCard(itemView);
                     }
