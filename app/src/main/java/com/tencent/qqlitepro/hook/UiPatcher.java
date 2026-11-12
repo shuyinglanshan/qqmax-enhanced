@@ -192,6 +192,511 @@ public final class UiPatcher {
         installLanzouLinkHook(classLoader);
         installGroupStatEntryHook(classLoader);
         installChatListFragmentHook(classLoader);
+        installFeedZanListHook(classLoader);
+        installMediaSaveDirHook(classLoader);
+        installEditProfileSignatureHook(classLoader);
+    }
+
+    /**
+     * 修改资料页新增"个性签名"条目。
+     * 逆向：SelfEditProfileFragment.Y_0 把 EditProfileProvider.b 的条目依次
+     * createView 后 addView 到 editItemContainer（LinearLayout, id=2114519837）。
+     * hook Y_0 after：在该容器追加自绘签名条目；点击弹输入框，
+     * 保存走内核 KernelServiceUtil.d()（IProfileService）.setLongNick(text, cb)。
+     */
+    private static void installEditProfileSignatureHook(java.lang.ClassLoader classLoader) {
+        try {
+            java.lang.Class<?> fragCls = java.lang.Class.forName(
+                    "com.tencent.qqnt.watch.selftab.ui.edit.SelfEditProfileFragment", false, classLoader);
+            java.lang.reflect.Method y0 = null;
+            for (java.lang.reflect.Method m : fragCls.getDeclaredMethods()) {
+                if (m.getName().equals("Y_0")
+                        && m.getParameterTypes().length == 3
+                        && m.getParameterTypes()[0] == android.view.LayoutInflater.class) {
+                    y0 = m;
+                    break;
+                }
+            }
+            if (y0 == null) {
+                com.tencent.qqlitepro.util.Log.w("SelfEditProfileFragment.Y_0 未找到（签名条目跳过）");
+                return;
+            }
+            y0.setAccessible(true);
+            de.robv.android.xposed.XposedBridge.hookMethod(y0, new de.robv.android.xposed.XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        android.view.View root = (android.view.View) param.getResult();
+                        if (root == null) {
+                            return;
+                        }
+                        android.view.View container = root.findViewById(2114519837);
+                        if (!(container instanceof android.widget.LinearLayout)) {
+                            return;
+                        }
+                        android.widget.LinearLayout box = (android.widget.LinearLayout) container;
+                        for (int i = 0; i < box.getChildCount(); i++) {
+                            if ("qqlite_signature_entry".equals(box.getChildAt(i).getTag())) {
+                                return; /* 已注入 */
+                            }
+                        }
+                        android.content.Context ctx = box.getContext();
+                        android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
+                        row.setOrientation(1);
+                        row.setClickable(true);
+                        row.setTag("qqlite_signature_entry");
+                        int pad = (int) (ctx.getResources().getDisplayMetrics().density * 14);
+                        row.setPadding(pad, pad, pad, pad);
+                        android.widget.TextView title = new android.widget.TextView(ctx);
+                        title.setText("个性签名");
+                        title.setTextSize(15.0f);
+                        title.setTextColor(-1);
+                        row.addView(title);
+                        row.setOnClickListener(new android.view.View.OnClickListener() {
+                            @Override
+                            public void onClick(android.view.View v) {
+                                try {
+                                    showSignatureEditor(v.getContext());
+                                } catch (Throwable th) {
+                                    com.tencent.qqlitepro.util.Log.w("打开签名编辑失败: " + th);
+                                }
+                            }
+                        });
+                        box.addView(row);
+                        com.tencent.qqlitepro.util.Log.i("修改资料页已注入个性签名条目");
+                    } catch (Throwable th) {
+                        com.tencent.qqlitepro.util.Log.w("注入签名条目失败: " + th);
+                    }
+                }
+            });
+            com.tencent.qqlitepro.util.Log.i("已安装修改资料签名 hook（SelfEditProfileFragment.Y_0）");
+        } catch (java.lang.Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("安装签名 hook 失败: " + th);
+        }
+    }
+
+    /**
+     * 签名编辑弹窗 —— 复刻宿主"修改昵称"界面样式：
+     * 深色圆角卡 + 居中标题 + [😊 输入] 行 + 蓝色"确定" + 深色"取消"。
+     */
+    private static void showSignatureEditor(android.content.Context context) {
+        try {
+            float d = context.getResources().getDisplayMetrics().density;
+            android.widget.LinearLayout root = new android.widget.LinearLayout(context);
+            root.setOrientation(1);
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(-14605507);
+            bg.setCornerRadius((int) (d * 18));
+            root.setBackground(bg);
+            int pad = (int) (d * 18);
+            root.setPadding(pad, pad, pad, pad);
+
+            android.widget.TextView title = new android.widget.TextView(context);
+            title.setText("修改个性签名");
+            title.setTextSize(15.5f);
+            title.setTextColor(-1);
+            title.setGravity(17);
+            root.addView(title, new android.widget.LinearLayout.LayoutParams(-1, -2));
+
+            /* [😊 输入行] */
+            android.widget.LinearLayout inputRow = new android.widget.LinearLayout(context);
+            inputRow.setOrientation(0);
+            inputRow.setGravity(16);
+            android.widget.LinearLayout.LayoutParams inLp = new android.widget.LinearLayout.LayoutParams(-1, -2);
+            inLp.topMargin = (int) (d * 16);
+            root.addView(inputRow, inLp);
+
+            android.widget.TextView icon = new android.widget.TextView(context);
+            icon.setText("\uD83D\uDE0A");
+            icon.setTextSize(16.0f);
+            inputRow.addView(icon);
+
+            android.widget.EditText et = new android.widget.EditText(context);
+            et.setHint("请输入个性签名");
+            et.setTextColor(-1);
+            et.setHintTextColor(-8355712);
+            et.setTextSize(14.0f);
+            et.setSingleLine(true);
+            et.setBackground(null);
+            android.widget.LinearLayout.LayoutParams etLp = new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f);
+            etLp.leftMargin = (int) (d * 8);
+            inputRow.addView(et, etLp);
+
+            /* 读当前签名 */
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    final String cur = com.tencent.qqlitepro.http.QqKernel.currentLongNick();
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                if (cur != null && !cur.isEmpty()) {
+                                    et.setText(cur);
+                                    et.setSelection(cur.length());
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+                }
+            }, "sig-read").start();
+
+            final android.widget.EditText fEt = et;
+            /* 确定（蓝色圆角） */
+            android.widget.TextView ok = new android.widget.TextView(context);
+            ok.setText("确定");
+            ok.setTextSize(15.0f);
+            ok.setTextColor(-1);
+            ok.setGravity(17);
+            android.graphics.drawable.GradientDrawable okBg = new android.graphics.drawable.GradientDrawable();
+            okBg.setColor(-13878718);
+            okBg.setCornerRadius((int) (d * 22));
+            ok.setBackground(okBg);
+            ok.setClickable(true);
+            android.widget.LinearLayout.LayoutParams okLp = new android.widget.LinearLayout.LayoutParams(-1, (int) (d * 44));
+            okLp.topMargin = (int) (d * 18);
+            root.addView(ok, okLp);
+
+            /* 取消（深色圆角） */
+            android.widget.TextView cancel = new android.widget.TextView(context);
+            cancel.setText("取消");
+            cancel.setTextSize(15.0f);
+            cancel.setTextColor(-1);
+            cancel.setGravity(17);
+            android.graphics.drawable.GradientDrawable cancelBg = new android.graphics.drawable.GradientDrawable();
+            cancelBg.setColor(-14671840);
+            cancelBg.setCornerRadius((int) (d * 22));
+            cancel.setBackground(cancelBg);
+            cancel.setClickable(true);
+            android.widget.LinearLayout.LayoutParams cancelLp = new android.widget.LinearLayout.LayoutParams(-1, (int) (d * 44));
+            cancelLp.topMargin = (int) (d * 10);
+            root.addView(cancel, cancelLp);
+
+            android.app.Dialog dialog = new android.app.Dialog(context);
+            dialog.requestWindowFeature(1);
+            android.widget.FrameLayout wrap = new android.widget.FrameLayout(context);
+            int wp = (int) (d * 18);
+            wrap.setPadding(wp, (int) (d * 40), wp, (int) (d * 40));
+            wrap.addView(root, new android.widget.FrameLayout.LayoutParams(-1, -2));
+            dialog.setContentView(wrap);
+            if (dialog.getWindow() != null) {
+                android.view.WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
+                attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                dialog.getWindow().setAttributes(attrs);
+                dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
+            }
+            final android.app.Dialog fDialog = dialog;
+            ok.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    final String text = fEt.getText().toString().trim();
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            final String err = com.tencent.qqlitepro.http.QqKernel.setLongNick(text);
+                            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    if (err == null) {
+                                        android.widget.Toast.makeText(v.getContext(), "签名已更新", android.widget.Toast.LENGTH_SHORT).show();
+                                        fDialog.dismiss();
+                                    } else {
+                                        android.widget.Toast.makeText(v.getContext(), "保存失败：" + err, android.widget.Toast.LENGTH_SHORT).show();
+                                    }
+                                }
+                            });
+                        }
+                    }, "sig-save").start();
+                }
+            });
+            cancel.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    fDialog.dismiss();
+                }
+            });
+            dialog.show();
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("签名编辑弹窗异常: " + th);
+        }
+    }
+
+    /**
+     * 宿主媒体保存路径 hook（逆向 momoi.mod.qqpro.hook.qzone.MediaSave）：
+     *   toGallery(ctx, src, displayName, mime, isVideo, subDir)
+     *   现代(API>=29): MediaStore relative_path = (isVideo? Movies: Pictures) + "/" + subDir
+     *   旧版: /sdcard/Pictures/<subDir>/
+     * 默认 subDir="QZone"。按 isVideo 将 relative_path/subDir 替换为用户设置的
+     * 图片/视频保存路径（绝对路径 -> 相对外部存储根的相对路径；未设置则用宿主默认）。
+     */
+    private static void installMediaSaveDirHook(java.lang.ClassLoader classLoader) {
+        try {
+            java.lang.Class<?> saveCls = java.lang.Class.forName(
+                    "momoi.mod.qqpro.hook.qzone.MediaSave", false, classLoader);
+            java.lang.reflect.Method toGallery = null;
+            for (java.lang.reflect.Method m : saveCls.getDeclaredMethods()) {
+                if (!m.getName().equals("toGallery")) continue;
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length == 6 && ps[0] == android.content.Context.class
+                        && ps[1] == java.io.File.class
+                        && ps[2] == java.lang.String.class
+                        && ps[3] == java.lang.String.class
+                        && ps[4] == Boolean.TYPE
+                        && ps[5] == java.lang.String.class) {
+                    toGallery = m;
+                    break;
+                }
+            }
+            if (toGallery == null) {
+                com.tencent.qqlitepro.util.Log.w("MediaSave.toGallery 未找到（宿主媒体路径 hook 跳过）");
+                return;
+            }
+            toGallery.setAccessible(true);
+            de.robv.android.xposed.XposedBridge.hookMethod(toGallery, new de.robv.android.xposed.XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        boolean isVideo = (Boolean) param.args[4];
+                        String subDir = (String) param.args[5];
+                        android.content.Context ctx = (android.content.Context) param.args[0];
+                        String customAbs = isVideo
+                                ? com.tencent.qqlitepro.util.Config.videoSaveDirRaw(ctx)
+                                : com.tencent.qqlitepro.util.Config.imageSaveDirRaw(ctx);
+                        if (customAbs == null || customAbs.trim().isEmpty()) {
+                            return; /* 未设置 -> 宿主默认 QZone */
+                        }
+                        String rel = absToRelative(customAbs.trim());
+                        if (rel == null || rel.isEmpty()) {
+                            return; /* 非外部存储路径（如应用私有目录），保持宿主默认 */
+                        }
+                        /* saveModern: relative_path = (Movies|Pictures)+"/"+subDir —— 把 subDir 改成
+                         * 用户路径的相对部分并去掉 Movies|Pictures 前缀（relative_path 直接用 rel），
+                         * 这里通过把 subDir 设为带 ../ 的方式不可行，改为直接覆盖 subDir，
+                         * 由 MediaSave 拼接 Movies|Pictures 前缀——用户路径需在 Movies/Pictures 下才生效。
+                         * 对 Pictures 之外的路径，走参数整体改写：subDir 置为 rel（MediaSave 拼前缀），
+                         * MediaStore 的 relative_path=Pictures/rel 或 Movies/rel，这就是宿主能力边界内的自定义。 */
+                        param.args[5] = rel;
+                        com.tencent.qqlitepro.util.Log.i("宿主媒体保存路径重定向 isVideo=" + isVideo + " -> " + rel);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            com.tencent.qqlitepro.util.Log.i("已安装宿主媒体保存路径 hook（MediaSave.toGallery）");
+        } catch (java.lang.Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("安装宿主媒体保存路径 hook 失败: " + th);
+        }
+    }
+
+    /** 绝对路径 -> 相对外部存储根的路径（/storage/emulated/0/xxx -> xxx），非主存储返回 null */
+    private static String absToRelative(String abs) {
+        if (abs == null) return null;
+        String p = abs;
+        if (p.startsWith("/storage/emulated/0/")) {
+            return p.substring("/storage/emulated/0/".length());
+        }
+        if (p.equals("/storage/emulated/0")) {
+            return "";
+        }
+        if (p.startsWith("/sdcard/")) {
+            return p.substring("/sdcard/".length());
+        }
+        return null;
+    }
+
+    /**
+     * QQ动态：每个动态卡片点赞按钮下方显示全部点赞用户 昵称(QQ号)。
+     * 逆向：QZoneFeedAdapter.c 是 List<BusinessFeedData>；
+     *   BusinessFeedData.getCellLikeInfo() -> CellLikeInfo.likeMans(ArrayList<LikeMan>)
+     *   LikeMan.user -> User（nick=昵称 uin=QQ号）
+     * hook onBindViewHolder after：从 holder.itemView 找点赞按钮（binding id likeCount /
+     * 或含 like 的 ImageView）的父布局，插入/更新一条昵称 TextView。
+     */
+    private static void installFeedZanListHook(java.lang.ClassLoader classLoader) {
+        try {
+            java.lang.Class<?> adapterCls = java.lang.Class.forName(
+                    "com.tencent.watch.qzone_impl.frame.QZoneFeedAdapter", false, classLoader);
+            java.lang.reflect.Method onBind = null;
+            for (java.lang.reflect.Method m : adapterCls.getDeclaredMethods()) {
+                if (m.getName().equals("onBindViewHolder")
+                        && m.getParameterTypes().length == 2
+                        && m.getParameterTypes()[0].getName().contains("ViewHolder")
+                        && m.getParameterTypes()[1] == Integer.TYPE) {
+                    onBind = m;
+                    break;
+                }
+            }
+            if (onBind == null) {
+                com.tencent.qqlitepro.util.Log.w("动态点赞: QZoneFeedAdapter.onBindViewHolder 未找到");
+                return;
+            }
+            onBind.setAccessible(true);
+            de.robv.android.xposed.XposedBridge.hookMethod(onBind, new de.robv.android.xposed.XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        Object adapter = param.thisObject;
+                        int position = (Integer) param.args[1];
+                        Object holder = param.args[0];
+                        if (adapter == null || holder == null || position < 0) {
+                            return;
+                        }
+                        android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+                        final Object fAdapter = adapter;
+                        final Object fHolder = holder;
+                        final int fPos = position;
+                        h.postDelayed(new Runnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    injectZanNames(fAdapter, fHolder, fPos);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }, 150L);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            com.tencent.qqlitepro.util.Log.i("已安装动态点赞昵称显示 hook（QZoneFeedAdapter）");
+        } catch (java.lang.Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("安装动态点赞 hook 失败: " + th);
+        }
+    }
+
+    /** 在点赞按钮下方插入"昵称(QQ号)，昵称(QQ号)…"一行 */
+    private static void injectZanNames(Object adapter, Object holder, int position) {
+        try {
+            /* 1) 取该位置的 BusinessFeedData */
+            Object list = de.robv.android.xposed.XposedHelpers.getObjectField(adapter, "c");
+            if (!(list instanceof java.util.List) || position >= ((java.util.List) list).size()) {
+                return;
+            }
+            Object data = ((java.util.List) list).get(position);
+            if (data == null) {
+                return;
+            }
+            Object cellLike = null;
+            try {
+                cellLike = de.robv.android.xposed.XposedHelpers.callMethod(data, "getCellLikeInfo", new Object[0]);
+            } catch (Throwable ignored) {}
+            if (cellLike == null) {
+                try {
+                    cellLike = de.robv.android.xposed.XposedHelpers.getObjectField(data, "cellLikeInfo");
+                } catch (Throwable ignored) {}
+            }
+            if (cellLike == null) {
+                return;
+            }
+            /* 2) 拼 昵称(QQ号) 字符串 */
+            StringBuilder sb = new StringBuilder();
+            Object mans = de.robv.android.xposed.XposedHelpers.getObjectField(cellLike, "likeMans");
+            if (mans instanceof java.util.List) {
+                for (Object man : (java.util.List) mans) {
+                    if (man == null) continue;
+                    try {
+                        Object user = de.robv.android.xposed.XposedHelpers.getObjectField(man, "user");
+                        if (user == null) continue;
+                        String nick = (String) de.robv.android.xposed.XposedHelpers.getObjectField(user, "nick");
+                        String uin = "";
+                        try {
+                            uin = (String) de.robv.android.xposed.XposedHelpers.getObjectField(user, "uin");
+                        } catch (Throwable ignored) {}
+                        if (sb.length() > 0) sb.append("、");
+                        sb.append(nick == null || nick.isEmpty() ? (uin.isEmpty() ? "?" : uin) : nick)
+                          .append("(").append(uin).append(")");
+                    } catch (Throwable ignored) {}
+                }
+            }
+            String zanText = sb.length() == 0 ? "" : sb.toString();
+            /* 3) 找点赞按钮的父布局（遍历 itemView 找 id 名含 like 的 View） */
+            android.view.View itemView = (android.view.View) de.robv.android.xposed.XposedHelpers.getObjectField(holder, "itemView");
+            android.view.View likeView = findViewByNameContains(itemView, "like");
+            android.view.ViewGroup insertParent = null;
+            android.view.View insertAfter = null;
+            if (likeView != null && likeView.getParent() instanceof android.view.ViewGroup) {
+                insertParent = (android.view.ViewGroup) likeView.getParent();
+                insertAfter = likeView;
+            } else {
+                /* 兜底：itemView 是垂直 LinearLayout 时直接 add */
+                if (itemView instanceof android.view.ViewGroup
+                        && ((android.view.ViewGroup) itemView).getChildCount() > 0) {
+                    android.view.View c0 = ((android.view.ViewGroup) itemView).getChildAt(0);
+                    if (c0 instanceof android.view.ViewGroup) {
+                        insertParent = (android.view.ViewGroup) c0;
+                    }
+                }
+            }
+            if (insertParent == null) {
+                return;
+            }
+            /* 4) 插入/复用标记 TextView（tag=qqlite_zan_names） */
+            android.widget.TextView exist = null;
+            for (int i = 0; i < insertParent.getChildCount(); i++) {
+                android.view.View cv = insertParent.getChildAt(i);
+                if ("qqlite_zan_names".equals(cv.getTag())) {
+                    exist = (android.widget.TextView) cv;
+                    break;
+                }
+            }
+            if (zanText.isEmpty()) {
+                if (exist != null) {
+                    exist.setVisibility(android.view.View.GONE);
+                }
+                return;
+            }
+            android.content.Context ctx = itemView.getContext();
+            android.widget.TextView tv;
+            if (exist == null) {
+                tv = new android.widget.TextView(ctx);
+                tv.setTag("qqlite_zan_names");
+                tv.setTextSize(11.5f);
+                tv.setTextColor(-6643546);
+                int pad = (int) (ctx.getResources().getDisplayMetrics().density * 8);
+                tv.setPadding(pad, 2, pad, 4);
+                android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(
+                        -1, -2);
+                int idx = insertParent.indexOfChild(insertAfter);
+                if (idx < 0) idx = insertParent.getChildCount() - 1;
+                insertParent.addView(tv, Math.min(idx + 1, insertParent.getChildCount()), lp);
+            } else {
+                tv = exist;
+                tv.setVisibility(android.view.View.VISIBLE);
+            }
+            tv.setText(zanText);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 深度遍历找 id 名含关键字的 View（ViewBinding 混淆后字段拿不到，用资源名匹配） */
+    private static android.view.View findViewByNameContains(android.view.View root, String keyword) {
+        try {
+            android.content.res.Resources res = root.getResources();
+            String pkg = root.getContext().getPackageName();
+            java.util.ArrayDeque<android.view.View> queue = new java.util.ArrayDeque<>();
+            queue.add(root);
+            int visited = 0;
+            while (!queue.isEmpty() && visited < 60) {
+                android.view.View v = queue.poll();
+                visited++;
+                try {
+                    int id = v.getId();
+                    if (id != android.view.View.NO_ID) {
+                        String name = res.getResourceEntryName(id);
+                        if (name != null && name.toLowerCase().contains(keyword)) {
+                            return v;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                if (v instanceof android.view.ViewGroup) {
+                    android.view.ViewGroup vg = (android.view.ViewGroup) v;
+                    for (int i = 0; i < vg.getChildCount(); i++) {
+                        queue.add(vg.getChildAt(i));
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     /**
@@ -2701,6 +3206,7 @@ public final class UiPatcher {
         if (fileInfoUI == null) {
             return null;
         }
+        /* 伪图片/语音恢复只走下载目录（图片/视频保存路径仅针对宿主与模块保存的真实媒体） */
         java.lang.String strDownloadDir = com.tencent.qqlitepro.util.Config.downloadDir(null);
         if (fileInfoUI.channel == 1) {
             return com.tencent.qqlitepro.http.FakeImage.restoreWithProgress(fileInfoUI.sourcePath, strDownloadDir, restoreProgress);
