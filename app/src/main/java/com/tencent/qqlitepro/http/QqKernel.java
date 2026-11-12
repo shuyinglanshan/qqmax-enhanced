@@ -5085,7 +5085,8 @@ public final class QqKernel {
             if (uin != 0 && usedContactIds.contains(java.lang.Long.valueOf(uin))) {
                 continue;
             }
-            java.lang.Object info = buildTempChatInfo(template, uid, uin, 1,
+            /* 这里只合成 RecentContactInfo（数据源层要求），不能塞 ChatItem */
+            java.lang.Object info = buildTempChatInfoRecentInfoOnly(template, uid, uin, 1,
                     value != null ? strOf(value[1]) : "",
                     value != null ? longOf(value[2]) : 0L);
             if (info == null) {
@@ -6047,7 +6048,82 @@ public final class QqKernel {
         }
     }
 
+    /** 会话列表时间格式：今天 HH:mm / 昨天 / MM/dd */
+    public static java.lang.String formatChatTime(long ms) {
+        try {
+            if (ms <= 0) return "";
+            if (ms < 100000000000L) ms *= 1000L;
+            long now = java.lang.System.currentTimeMillis();
+            java.util.Calendar a = java.util.Calendar.getInstance();
+            java.util.Calendar b = java.util.Calendar.getInstance();
+            a.setTimeInMillis(now);
+            b.setTimeInMillis(ms);
+            boolean sameDay = a.get(java.util.Calendar.YEAR) == b.get(java.util.Calendar.YEAR)
+                    && a.get(java.util.Calendar.DAY_OF_YEAR) == b.get(java.util.Calendar.DAY_OF_YEAR);
+            if (sameDay) {
+                return new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                        .format(new java.util.Date(ms));
+            }
+            java.util.Calendar y = java.util.Calendar.getInstance();
+            y.setTimeInMillis(now - 86400000L);
+            if (y.get(java.util.Calendar.YEAR) == b.get(java.util.Calendar.YEAR)
+                    && y.get(java.util.Calendar.DAY_OF_YEAR) == b.get(java.util.Calendar.DAY_OF_YEAR)) {
+                return "昨天";
+            }
+            return new java.text.SimpleDateFormat("MM/dd", java.util.Locale.getDefault())
+                    .format(new java.util.Date(ms));
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
     /** 反射安全设 int（字段不存在时静默跳过） */
+    private static final java.lang.reflect.InvocationHandler NOOP_HANDLER =
+            new java.lang.reflect.InvocationHandler() {
+                @Override
+                public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
+                    Class<?> rt = m.getReturnType();
+                    if (rt == Boolean.TYPE) return Boolean.FALSE;
+                    if (rt == Integer.TYPE) return Integer.valueOf(0);
+                    if (rt == Long.TYPE) return Long.valueOf(0L);
+                    if (rt == Float.TYPE) return Float.valueOf(0f);
+                    if (rt == Double.TYPE) return Double.valueOf(0d);
+                    return null;
+                }
+            };
+
+    /** 异步回调捕获的消息列表 */
+    private static volatile java.util.List<?> sPendingMsgs;
+
+    /** 任意回调接口的 Proxy（宿主 checkNotNullParameter 不能收 null） */
+    private static Object makeCallbackProxy(Class<?> iface) {
+        try {
+            return java.lang.reflect.Proxy.newProxyInstance(
+                    iface.getClassLoader(), new Class<?>[]{iface}, new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
+                            try {
+                                if (args != null) {
+                                    for (Object a : args) {
+                                        if (a instanceof java.util.List) {
+                                            sPendingMsgs = (java.util.List<?>) a;
+                                            break;
+                                        }
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                            Class<?> rt = m.getReturnType();
+                            if (rt == Boolean.TYPE) return Boolean.FALSE;
+                            if (rt == Integer.TYPE) return Integer.valueOf(0);
+                            if (rt == Long.TYPE) return Long.valueOf(0L);
+                            return null;
+                        }
+                    });
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     public static void safeSetIntField(Object obj, String name, int v) {
         try { de.robv.android.xposed.XposedHelpers.setIntField(obj, name, v); } catch (Throwable ignored) {}
     }
@@ -6095,19 +6171,43 @@ public final class QqKernel {
             try {
                 de.robv.android.xposed.XposedHelpers.setObjectField(contact, "peerUid", String.valueOf(groupUin));
             } catch (Throwable ignored) {}
+            try {
+                de.robv.android.xposed.XposedHelpers.setObjectField(contact, "guildId", "");
+            } catch (Throwable ignored) {}
 
-            Class<?> cbCls = cls("com.tencent.qqnt.kernel.nativeinterface.IKernelGetMsgsCallback");
-            final Object[] msgsBox = new Object[1];
+            /* 精确签名：getMsgs(Contact, long, int, boolean, IMsgOperateCallback) */
+            final Class<?> cbCls = cls("com.tencent.qqnt.kernel.nativeinterface.IMsgOperateCallback");
+            if (cbCls == null) {
+                st.error = "IMsgOperateCallback 不可用";
+                return st;
+            }
+            final java.util.List<?>[] box = new java.util.List<?>[1];
+            final Object[] rawBox = new Object[1];
             final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
             Object cb = java.lang.reflect.Proxy.newProxyInstance(cbCls.getClassLoader(),
                     new Class<?>[]{cbCls},
                     new java.lang.reflect.InvocationHandler() {
                         @Override
                         public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
-                            if ("onResult".equals(m.getName()) && args != null && args.length >= 3) {
-                                msgsBox[0] = args[2];
-                                latch.countDown();
-                            }
+                            try {
+                                if (args != null) {
+                                    for (Object a : args) {
+                                        if (a instanceof java.util.List) {
+                                            box[0] = (java.util.List<?>) a;
+                                            rawBox[0] = a;
+                                            break;
+                                        }
+                                        if (a != null && a.getClass().isArray()) {
+                                            rawBox[0] = a;
+                                        }
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                            latch.countDown();
+                            Class<?> rt = m.getReturnType();
+                            if (rt == Boolean.TYPE) return Boolean.FALSE;
+                            if (rt == Integer.TYPE) return Integer.valueOf(0);
+                            if (rt == Long.TYPE) return Long.valueOf(0L);
                             return null;
                         }
                     });
@@ -6116,104 +6216,93 @@ public final class QqKernel {
             for (java.lang.reflect.Method m : svc.getClass().getDeclaredMethods()) {
                 if (!m.getName().equals("getMsgs")) continue;
                 Class<?>[] ps = m.getParameterTypes();
-                if (ps.length >= 4 && ps[0] == contactCls && ps[1] == Long.TYPE && ps[2] == Integer.TYPE) {
+                if (ps.length == 5 && ps[0] == contactCls && ps[1] == Long.TYPE
+                        && ps[2] == Integer.TYPE && ps[3] == Boolean.TYPE) {
                     getMsgs = m;
                     break;
                 }
             }
             if (getMsgs == null) {
-                st.error = "IKernelMsgService.getMsgs 未找到";
+                st.error = "getMsgs(Contact,long,int,boolean,cb) 未找到";
                 return st;
             }
             getMsgs.setAccessible(true);
-            Object[] invokeArgs = new Object[getMsgs.getParameterTypes().length];
-            invokeArgs[0] = contact;
-            invokeArgs[1] = Long.valueOf(0L);
-            invokeArgs[2] = Integer.valueOf(1500);
-            for (int i = 3; i < invokeArgs.length; i++) {
-                Class<?> pt = getMsgs.getParameterTypes()[i];
-                if (pt == Boolean.TYPE) invokeArgs[i] = Boolean.TRUE;
-                else if (pt == Integer.TYPE) invokeArgs[i] = Integer.valueOf(0);
-                else if (pt == Long.TYPE) invokeArgs[i] = Long.valueOf(0L);
-                else if (pt == cbCls) invokeArgs[i] = cb;
-                else if (pt == java.util.List.class || pt == java.util.ArrayList.class) invokeArgs[i] = new java.util.ArrayList();
-                else invokeArgs[i] = null;
-            }
-            getMsgs.invoke(svc, invokeArgs);
-            if (!latch.await(15000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                st.error = "拉取消息超时";
-                return st;
-            }
-            Object result = msgsBox[0];
-            java.util.List<?> list = null;
-            if (result instanceof java.util.List) {
-                list = (java.util.List<?>) result;
-            } else if (result != null) {
+            getMsgs.invoke(svc, contact, Long.valueOf(0L), Integer.valueOf(800),
+                    Boolean.TRUE, cb);
+            latch.await(15, java.util.concurrent.TimeUnit.SECONDS);
+
+            java.util.List<?> msgs = box[0];
+            if (msgs == null && rawBox[0] != null) {
                 try {
-                    Object arr = de.robv.android.xposed.XposedHelpers.callMethod(result, "getMsgList", new Object[0]);
-                    if (arr instanceof java.util.List) list = (java.util.List<?>) arr;
+                    int n = java.lang.reflect.Array.getLength(rawBox[0]);
+                    java.util.ArrayList<Object> tmp = new java.util.ArrayList<Object>();
+                    for (int i = 0; i < n; i++) {
+                        tmp.add(java.lang.reflect.Array.get(rawBox[0], i));
+                    }
+                    msgs = tmp;
                 } catch (Throwable ignored) {}
             }
-            if (list == null) {
-                st.error = "消息列表为空";
+            if (msgs == null || msgs.isEmpty()) {
+                st.error = "未取到消息（可能群消息未同步）";
                 return st;
             }
 
-            long cutoff = System.currentTimeMillis() - days * 86400000L;
+            long cutoffMs = java.lang.System.currentTimeMillis() - (long) days * 86400000L;
             java.util.HashMap<String, Integer> bySender = new java.util.HashMap<String, Integer>();
             java.util.HashMap<String, String> nameBySender = new java.util.HashMap<String, String>();
-            java.util.HashSet<String> seenMsgIds = new java.util.HashSet<String>();
-            for (Object msg : list) {
+            java.util.HashSet<String> seen = new java.util.HashSet<String>();
+            for (Object msg : msgs) {
+                if (msg == null) continue;
                 try {
-                    String msgKey = null;
-                    try { msgKey = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "msgId")); } catch (Throwable ignored) {}
-                    if (msgKey == null || "0".equals(msgKey)) {
-                        try { msgKey = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "msgSeq")); } catch (Throwable ignored) {}
-                    }
-                    if (msgKey != null && !"0".equals(msgKey) && !seenMsgIds.add(msgKey)) {
-                        continue;
-                    }
                     long msgTime = 0;
                     try { msgTime = de.robv.android.xposed.XposedHelpers.getLongField(msg, "msgTime"); } catch (Throwable ignored) {}
                     if (msgTime <= 0) {
                         try { msgTime = de.robv.android.xposed.XposedHelpers.getLongField(msg, "time"); } catch (Throwable ignored) {}
                     }
                     if (msgTime <= 0) continue;
-                    if (msgTime * 1000L < cutoff) continue;
-                    if (msgTime * 1000L > System.currentTimeMillis() + 86400000L) continue;
-                    String senderKey = null;
+                    long ms = msgTime < 100000000000L ? msgTime * 1000L : msgTime;
+                    if (ms < cutoffMs) continue;
+                    if (ms > java.lang.System.currentTimeMillis() + 86400000L) continue;
+
+                    String key = null;
                     String nm = null;
-                    try { senderKey = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "senderUid"); } catch (Throwable ignored) {}
+                    try { key = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "senderUid"); } catch (Throwable ignored) {}
                     try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendMemberName"); } catch (Throwable ignored) {}
                     if (nm == null || nm.isEmpty()) {
                         try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendNickName"); } catch (Throwable ignored) {}
                     }
-                    if (senderKey == null || senderKey.isEmpty()) {
-                        try { senderKey = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "senderUin")); } catch (Throwable ignored) {}
+                    if (key == null || key.isEmpty()) {
+                        try { key = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "senderUin")); } catch (Throwable ignored) {}
                     }
-                    if (senderKey == null || senderKey.isEmpty() || "0".equals(senderKey)) continue;
-                    Integer c = bySender.get(senderKey);
-                    bySender.put(senderKey, Integer.valueOf(c == null ? 1 : c.intValue() + 1));
-                    if (!nameBySender.containsKey(senderKey)) {
-                        nameBySender.put(senderKey, nm == null || nm.isEmpty() ? senderKey : nm);
+                    if (key == null || key.isEmpty() || "0".equals(key)) continue;
+                    String uniq = key + "|" + msgTime;
+                    if (!seen.add(uniq)) continue;
+
+                    Integer c = bySender.get(key);
+                    bySender.put(key, Integer.valueOf(c == null ? 1 : c.intValue() + 1));
+                    if (!nameBySender.containsKey(key)) {
+                        nameBySender.put(key, nm == null || nm.isEmpty() ? key : nm);
                     }
                     st.total++;
-                } catch (Throwable ignored) {
-                }
+                } catch (Throwable ignored) {}
             }
-            /* 排行 Top15 */
+            if (st.total == 0) {
+                st.error = "所选时间范围内没有消息";
+                return st;
+            }
             java.util.ArrayList<java.util.Map.Entry<String, Integer>> sorted =
                     new java.util.ArrayList<java.util.Map.Entry<String, Integer>>(bySender.entrySet());
             java.util.Collections.sort(sorted, new java.util.Comparator<java.util.Map.Entry<String, Integer>>() {
                 @Override
-                public int compare(java.util.Map.Entry<String, Integer> a, java.util.Map.Entry<String, Integer> b) {
+                public int compare(java.util.Map.Entry<String, Integer> a,
+                                   java.util.Map.Entry<String, Integer> b) {
                     return Integer.compare(b.getValue().intValue(), a.getValue().intValue());
                 }
             });
             int limit = Math.min(15, sorted.size());
             for (int i = 0; i < limit; i++) {
                 java.util.Map.Entry<String, Integer> e = sorted.get(i);
-                String k = (String) e.getKey();
+                String k = e.getKey();
                 st.rank.add(new String[]{nameBySender.get(k), String.valueOf(e.getValue()), k});
             }
             return st;
@@ -6271,6 +6360,136 @@ public final class QqKernel {
             return "code=" + code[0] + (err[0].isEmpty() ? "" : " " + err[0]);
         } catch (Throwable t) {
             return "异常 " + chain(t);
+        }
+    }
+
+        /**
+     * 打开宿主原生文本输入界面（与"修改昵称"同一个界面）。
+     * smali：LWatchPicElementExtKt;->U2(IVoiceInputService, androidx.fragment.app.Fragment,
+     *        String title, int, String pageId, Function2, int, Object)
+     */
+    public static boolean showHostTextInput(android.app.Activity activity,
+                                            Object androidxFragment,
+                                            String title, String pageId,
+                                            final java.util.function.BiConsumer<Boolean, String> onResult) {
+        try {
+            final ClassLoader cl = activity.getClassLoader();
+            Object runtime = null;
+            try {
+                Object mobileQQ = Class.forName("mqq.app.MobileQQ", false, cl).getField("sMobileQQ").get(null);
+                runtime = mobileQQ.getClass().getMethod("peekAppRuntime").invoke(mobileQQ);
+            } catch (Throwable ignored) {}
+            if (runtime == null) {
+                return false;
+            }
+            Class<?> visCls = Class.forName("com.tencent.qqnt.watch.ptt.api.IVoiceInputService", false, cl);
+            Object voiceSvc = runtime.getClass()
+                    .getMethod("getRuntimeService", Class.class, String.class)
+                    .invoke(runtime, visCls, "");
+            if (voiceSvc == null) {
+                return false;
+            }
+            Class<?> ext = null;
+            for (String cn : new String[]{"WatchPicElementExtKt",
+                    "com.tencent.qqnt.watch.ui.kit.WatchPicElementExtKt"}) {
+                try {
+                    ext = Class.forName(cn, false, cl);
+                    if (ext != null) break;
+                } catch (Throwable ignored) {}
+            }
+            if (ext == null) {
+                com.tencent.qqlitepro.util.Log.w("showHostTextInput: WatchPicElementExtKt 未找到");
+                return false;
+            }
+            Class<?> fragCls = Class.forName("androidx.fragment.app.Fragment", false, cl);
+            Class<?> fn2 = Class.forName("kotlin.jvm.functions.Function2", false, cl);
+            java.lang.reflect.Method u2 = null;
+            for (java.lang.reflect.Method m : ext.getDeclaredMethods()) {
+                if (!m.getName().equals("U2")) continue;
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length == 8 && ps[1] == fragCls && ps[5] == fn2) {
+                    u2 = m;
+                    break;
+                }
+            }
+            if (u2 == null) {
+                com.tencent.qqlitepro.util.Log.w("showHostTextInput: U2(8) 未找到");
+                return false;
+            }
+            u2.setAccessible(true);
+            Object cb = java.lang.reflect.Proxy.newProxyInstance(fn2.getClassLoader(), new Class<?>[]{fn2},
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
+                            if ("invoke".equals(m.getName()) && args != null && args.length >= 2) {
+                                Boolean ok = args[0] instanceof Boolean ? (Boolean) args[0] : Boolean.FALSE;
+                                String text = args[1] == null ? "" : String.valueOf(args[1]);
+                                try {
+                                    onResult.accept(ok, text);
+                                } catch (Throwable ignored) {}
+                                try {
+                                    return Class.forName("kotlin.Unit", false, cl).getField("INSTANCE").get(null);
+                                } catch (Throwable ignored) {
+                                    return null;
+                                }
+                            }
+                            return null;
+                        }
+                    });
+            u2.invoke(null, voiceSvc, androidxFragment, title, Integer.valueOf(0), pageId, cb,
+                    Integer.valueOf(4), null);
+            com.tencent.qqlitepro.util.Log.i("已打开宿主文本输入界面 title=" + title);
+            return true;
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("showHostTextInput 失败: " + th);
+            return false;
+        }
+    }
+
+    /** 用宿主包装层 IProfileService.n(text, cb) 保存签名（与改昵称完全同一条链路） */
+    public static String setLongNickViaHostWrapper(String text) {
+        try {
+            ClassLoader cl = QqKernel.class.getClassLoader();
+            Object mobileQQ = Class.forName("mqq.app.MobileQQ", false, cl).getField("sMobileQQ").get(null);
+            Object runtime = mobileQQ.getClass().getMethod("peekAppRuntime").invoke(mobileQQ);
+            Class<?> kernelSvcCls = Class.forName("com.tencent.qqnt.kernel.api.IKernelService", false, cl);
+            Object kernelSvc = runtime.getClass().getMethod("getRuntimeService", Class.class, String.class)
+                    .invoke(runtime, kernelSvcCls, "");
+            Object profile = kernelSvc.getClass().getMethod("getProfileService").invoke(kernelSvc);
+            if (profile == null) {
+                return "IProfileService 不可用";
+            }
+            java.lang.reflect.Method n = findMethod(profile.getClass(), "n", String.class, cls("com.tencent.qqnt.kernel.nativeinterface.IOperateCallback"));
+            if (n == null) {
+                for (java.lang.reflect.Method m : profile.getClass().getDeclaredMethods()) {
+                    if (m.getParameterTypes().length == 2
+                            && m.getParameterTypes()[0] == String.class
+                            && m.getParameterTypes()[1].isInterface()) {
+                        n = m;
+                        break;
+                    }
+                }
+            }
+            if (n == null) {
+                return "IProfileService 保存方法未找到";
+            }
+            n.setAccessible(true);
+            Class<?> cbIface = n.getParameterTypes()[1];
+            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            Object cb = java.lang.reflect.Proxy.newProxyInstance(cbIface.getClassLoader(), new Class<?>[]{cbIface},
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, java.lang.reflect.Method m, Object[] args) {
+                            latch.countDown();
+                            Class<?> rt = m.getReturnType();
+                            return rt == Boolean.TYPE ? Boolean.FALSE : null;
+                        }
+                    });
+            n.invoke(profile, text, cb);
+            latch.await(12, java.util.concurrent.TimeUnit.SECONDS);
+            return null;
+        } catch (Throwable th) {
+            return "异常 " + chain(th);
         }
     }
 
@@ -6451,6 +6670,54 @@ public final class QqKernel {
         }
     }
 
+
+    /** 临时会话 ChatItem 缓存：同一 uid 必须返回同一对象（RecyclerView 稳定性要求） */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.lang.Object> sTempItemCache =
+            new java.util.concurrent.ConcurrentHashMap<String, java.lang.Object>();
+    /** 缓存对应的数据指纹（预览/未读/时间变了才重建） */
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> sTempItemSig =
+            new java.util.concurrent.ConcurrentHashMap<String, String>();
+
+    /** 清空缓存（数据变化后调用） */
+    public static void invalidateTempItemCache() {
+        sTempItemCache.clear();
+        sTempItemSig.clear();
+    }
+
+    /** 为指定临时会话构建宿主 RecentContactChatItem（长按菜单需要） */
+    public static java.lang.Object tempChatItemFor(java.lang.String peerUid) {
+        try {
+            if (sTempChatTemplate == null) {
+                return null;
+            }
+            Object[] v = tempChatKnownEntry(peerUid);
+            long uin = v != null ? longOf(v[0]) : 0L;
+            String nick = v != null ? strOf(v[1]) : peerUid;
+            long msgTime = v != null ? longOf(v[2]) : 0L;
+            int unread = tempChatUnread(peerUid);
+            String preview = previewOf(sTempChatKnown.get(peerUid));
+            boolean top = isTempChatTop(peerUid);
+            String sig = unread + "|" + msgTime + "|" + preview + "|" + nick + "|" + top;
+            Object cached = sTempItemCache.get(peerUid);
+            if (cached != null && sig.equals(sTempItemSig.get(peerUid))) {
+                return cached;
+            }
+            Object built = buildTempChatInfo(sTempChatTemplate, peerUid, uin, 1, nick, msgTime);
+            if (built != null) {
+                sTempItemCache.put(peerUid, built);
+                sTempItemSig.put(peerUid, sig);
+            }
+            return built;
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("tempChatItemFor 失败: " + t);
+            return null;
+        }
+    }
+
+    /** 快照已实时读取 sTempChatKnown，这里保留入口以便未来加缓存 */
+    public static void ensureTempChatSnapshotFresh() {
+        /* no-op：tempChatSnapshot() 每次实时构建 */
+    }
 
     public static java.util.List<java.lang.Object[]> tempChatSnapshot() {
         java.util.ArrayList<java.lang.Object[]> out = new java.util.ArrayList<>();
@@ -6827,6 +7094,25 @@ public final class QqKernel {
         }
     }
 
+    /** 只合成 RecentContactInfo（用于数据源列表，不能返回 ChatItem） */
+    private static java.lang.Object buildTempChatInfoRecentInfoOnly(java.lang.Object obj, java.lang.String str,
+                                                                    long j, int i, java.lang.String str2, long j2) {
+        java.lang.Object wrapped = buildTempChatInfo(obj, str, j, i, str2, j2);
+        if (wrapped == null) {
+            return null;
+        }
+        /* buildTempChatInfo 可能返回 ChatItem（含 a 字段 = RecentContactInfo）；这里取回 info */
+        try {
+            if (!wrapped.getClass().getName().endsWith("RecentContactInfo")) {
+                java.lang.Object inner = de.robv.android.xposed.XposedHelpers.getObjectField(wrapped, "a");
+                if (inner != null && inner.getClass().getName().endsWith("RecentContactInfo")) {
+                    return inner;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return wrapped;
+    }
+
     private static java.lang.Object buildTempChatInfo(java.lang.Object obj, java.lang.String str, long j, int i, java.lang.String str2, long j2) {
         try {
             java.lang.Object objNewInstance = cls("com.tencent.qqnt.kernel.nativeinterface.RecentContactInfo").newInstance();
@@ -6885,6 +7171,211 @@ public final class QqKernel {
                 de.robv.android.xposed.XposedHelpers.setIntField(objNewInstance, "unreadCnt", 0);
                 de.robv.android.xposed.XposedHelpers.setLongField(objNewInstance, "unreadFlag", 0L);
             }
+            /* ===== 关键：按宿主 WatchRecentItemBuilder 的读取路径写入展示字段 =====
+             * e(): 标题  = item.h.a  (SummaryInfo.a)
+             * s(): 摘要  = item.f.a  (TitleInfo.a)
+             * r(): 时间  = item.g
+             * 否则宿主会显示布局默认值（title / content）。
+             */
+            try {
+                ClassLoader cl2 = objNewInstance.getClass().getClassLoader();
+                Class<?> itemCls = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem");
+                Class<?> sumCls = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$SummaryInfo");
+                Class<?> titleCls = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$TitleInfo");
+                Class<?> unreadCls = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$UnreadInfo");
+                Class<?> vasCls = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$VasInfo");
+                Class<?> avatarCls = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$AvatarInfo");
+                if (itemCls != null && sumCls != null && titleCls != null) {
+                    String showNameTxt = str3;             /* 含（临时会话）标识 */
+                    String previewTxt = previewOf(sTempChatKnown.get(str));
+                    String timeTxt = formatChatTime(j2);
+
+                    /* 优先：克隆宿主真实 ChatItem 原型（避免 Kotlin 非空参数校验） */
+                    Object proto = null;
+                    try {
+                        proto = com.tencent.qqlitepro.hook.ChatCardInjector.hostChatItemPrototypePublic();
+                    } catch (Throwable ignored) {}
+                    Object sumObj = sumCls.newInstance();
+                    de.robv.android.xposed.XposedHelpers.setObjectField(sumObj, "a", previewTxt);
+
+                    Object titleObj = titleCls.newInstance();
+                    de.robv.android.xposed.XposedHelpers.setObjectField(titleObj, "a", showNameTxt);
+
+                    Object unreadObj = unreadCls != null ? unreadCls.newInstance() : null;
+                    if (unreadObj != null) {
+                        de.robv.android.xposed.XposedHelpers.setIntField(unreadObj, "a", unread);
+                        de.robv.android.xposed.XposedHelpers.setLongField(unreadObj, "b", unread > 0 ? 1L : 0L);
+                    }
+                    Object vasObj = vasCls != null ? vasCls.newInstance() : null;
+                    Object avObj = null;
+                    if (avatarCls != null) {
+                        try {
+                            avObj = avatarCls.newInstance();
+                            de.robv.android.xposed.XposedHelpers.setObjectField(avObj, "b", String.valueOf(jDigitsOf));
+                        } catch (Throwable ignored) {}
+                    }
+                    /* ===== 方案A：Unsafe 分配 + 逐字段赋值（绕过 Kotlin 非空构造器校验） ===== */
+                    try {
+                        Class<?> unsafeCls = Class.forName("sun.misc.Unsafe");
+                        java.lang.reflect.Field tf = unsafeCls.getDeclaredField("theUnsafe");
+                        tf.setAccessible(true);
+                        Object unsafe = tf.get(null);
+                        Object inst = unsafeCls.getMethod("allocateInstance", Class.class).invoke(unsafe, itemCls);
+                        if (inst != null) {
+                            de.robv.android.xposed.XposedHelpers.setObjectField(inst, "a", objNewInstance);
+                            de.robv.android.xposed.XposedHelpers.setLongField(inst, "b", jDigitsOf);
+                            de.robv.android.xposed.XposedHelpers.setObjectField(inst, "d", str);
+                            de.robv.android.xposed.XposedHelpers.setObjectField(inst, "f", titleObj);
+                            de.robv.android.xposed.XposedHelpers.setObjectField(inst, "g", timeTxt);
+                            de.robv.android.xposed.XposedHelpers.setObjectField(inst, "h", sumObj);
+                            if (unreadObj != null) {
+                                de.robv.android.xposed.XposedHelpers.setObjectField(inst, "i", unreadObj);
+                            }
+                            Object avUse = avObj;
+                            if (avUse == null) {
+                                try {
+                                    avUse = avatarCls.getDeclaredConstructor().newInstance();
+                                    de.robv.android.xposed.XposedHelpers.setObjectField(avUse, "b", String.valueOf(jDigitsOf));
+                                } catch (Throwable ignored) {}
+                            }
+                            if (avUse != null) {
+                                de.robv.android.xposed.XposedHelpers.setObjectField(inst, "e", avUse);
+                            }
+                            try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "n", new java.util.ArrayList()); } catch (Throwable ignored) {}
+                            try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "o", new java.util.ArrayList()); } catch (Throwable ignored) {}
+                            try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "u", new java.util.ArrayList()); } catch (Throwable ignored) {}
+                            try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "A", new java.util.HashSet()); } catch (Throwable ignored) {}
+                            try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "B", new java.util.ArrayList()); } catch (Throwable ignored) {}
+                            try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "y", new java.util.HashMap()); } catch (Throwable ignored) {}
+                            try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "z", new android.os.Bundle()); } catch (Throwable ignored) {}
+                            de.robv.android.xposed.XposedHelpers.setBooleanField(inst, "k", isTempChatTop(str));
+                            com.tencent.qqlitepro.util.Log.i("临时会话: Unsafe 构建宿主 ChatItem 成功 uid=" + str);
+                            return inst;
+                        }
+                    } catch (Throwable tUnsafe) {
+                        com.tencent.qqlitepro.util.Log.w("临时会话: Unsafe 构建失败 " + chain(tUnsafe));
+                    }
+
+                    /* 若拿到原型：先从原型拷贝一份完整字段（含 avatarInfo 等非空对象），再覆盖 */
+                    Object avatarFromProto = null;
+                    Object vasFromProto = null;
+                    if (proto != null) {
+                        try { avatarFromProto = de.robv.android.xposed.XposedHelpers.getObjectField(proto, "e"); } catch (Throwable ignored) {}
+                        try { vasFromProto = de.robv.android.xposed.XposedHelpers.getObjectField(proto, "j"); } catch (Throwable ignored) {}
+                    }
+                    if (avObj == null) avObj = avatarFromProto;
+                    if (vasObj == null) vasObj = vasFromProto;
+
+                    /* 找 (RecentContactInfo, J, I, String, AvatarInfo, TitleInfo, String,
+                     *     SummaryInfo, UnreadInfo, VasInfo, Z, Z, I, ArrayList,
+                     *     ArrayList, Z, J, B, J, Z, ArrayList) 构造器 */
+                    java.lang.reflect.Constructor<?> ctor = null;
+                    StringBuilder ctorLog = new StringBuilder();
+                    for (java.lang.reflect.Constructor<?> c : itemCls.getDeclaredConstructors()) {
+                        Class<?>[] ps2 = c.getParameterTypes();
+                        ctorLog.append("\n  ctor(").append(ps2.length).append("): ");
+                        for (Class<?> pp : ps2) {
+                            ctorLog.append(pp.getSimpleName()).append(",");
+                        }
+                        /* 真实构造器：首参 RecentContactInfo，末参不是 int（int 是合成默认值版） */
+                        if (ps2.length >= 18 && ps2[0].isInstance(objNewInstance)
+                                && ps2[ps2.length - 1] != Integer.TYPE) {
+                            ctor = c;
+                            break;
+                        }
+                    }
+                    com.tencent.qqlitepro.util.Log.i("临时会话: item 构造器探测" + ctorLog);
+                    if (ctor != null) {
+                        ctor.setAccessible(true);
+                        Object[] argv = new Object[ctor.getParameterTypes().length];
+                        argv[0] = objNewInstance;
+                        for (int k = 1; k < argv.length; k++) {
+                            Class<?> pt2 = ctor.getParameterTypes()[k];
+                            if (k == 1) argv[k] = Long.valueOf(jDigitsOf);
+                            else if (pt2 == Integer.TYPE) argv[k] = Integer.valueOf(0);
+                            else if (pt2 == Long.TYPE) argv[k] = Long.valueOf(0L);
+                            else if (pt2 == Boolean.TYPE) argv[k] = Boolean.FALSE;
+                            else if (pt2 == Byte.TYPE) argv[k] = Byte.valueOf((byte) 0);
+                            else if (pt2 == String.class) argv[k] = (k == 3 ? str : (k == 6 ? timeTxt : ""));
+                            else if (pt2.isInstance(sumObj)) argv[k] = sumObj;
+                            else if (pt2.isInstance(titleObj)) argv[k] = titleObj;
+                            else if (pt2.isInstance(unreadObj)) argv[k] = unreadObj;
+                            else if (pt2.isInstance(vasObj)) argv[k] = vasObj;
+                            else if (avObj != null && pt2.isInstance(avObj)) argv[k] = avObj;
+                            else if (pt2 == java.util.ArrayList.class) argv[k] = new java.util.ArrayList();
+                            else argv[k] = null;
+                        }
+                        Object wrapped = ctor.newInstance(argv);
+                        com.tencent.qqlitepro.util.Log.i("临时会话: 已构建宿主 RecentContactChatItem uid=" + str);
+                        return wrapped;
+                    }
+                }
+            } catch (Throwable t2) {
+                com.tencent.qqlitepro.util.Log.w("临时会话: 构建宿主 item 失败 " + chain(t2));
+            }
+
+            /* ===== 回退方案：Unsafe 分配 + 逐字段赋值（绕过 Kotlin 非空构造器校验） ===== */
+            try {
+                Class<?> itemCls2 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem");
+                Class<?> sumCls2 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$SummaryInfo");
+                Class<?> titleCls2 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$TitleInfo");
+                Class<?> unreadCls2 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$UnreadInfo");
+                Class<?> avatarCls2 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$AvatarInfo");
+                if (itemCls2 != null && sumCls2 != null && titleCls2 != null) {
+                    String previewTxt2 = previewOf(sTempChatKnown.get(str));
+                    String timeTxt2 = formatChatTime(j2);
+                    Object sum2 = sumCls2.newInstance();
+                    de.robv.android.xposed.XposedHelpers.setObjectField(sum2, "a", previewTxt2);
+                    Object title2 = titleCls2.newInstance();
+                    de.robv.android.xposed.XposedHelpers.setObjectField(title2, "a", str3);
+                    Object unread2 = null;
+                    if (unreadCls2 != null) {
+                        unread2 = unreadCls2.newInstance();
+                        de.robv.android.xposed.XposedHelpers.setIntField(unread2, "a", unread);
+                        de.robv.android.xposed.XposedHelpers.setLongField(unread2, "b", unread > 0 ? 1L : 0L);
+                    }
+                    Object av2 = null;
+                    if (avatarCls2 != null) {
+                        try {
+                            av2 = avatarCls2.getDeclaredConstructor().newInstance();
+                            de.robv.android.xposed.XposedHelpers.setObjectField(av2, "b", String.valueOf(jDigitsOf));
+                        } catch (Throwable ignored) {
+                            av2 = null;
+                        }
+                    }
+                    Class<?> unsafeCls = Class.forName("sun.misc.Unsafe");
+                    java.lang.reflect.Field tf = unsafeCls.getDeclaredField("theUnsafe");
+                    tf.setAccessible(true);
+                    Object unsafe = tf.get(null);
+                    Object inst = unsafeCls.getMethod("allocateInstance", Class.class).invoke(unsafe, itemCls2);
+                    if (inst != null) {
+                        de.robv.android.xposed.XposedHelpers.setObjectField(inst, "a", objNewInstance);
+                        de.robv.android.xposed.XposedHelpers.setLongField(inst, "b", jDigitsOf);
+                        de.robv.android.xposed.XposedHelpers.setObjectField(inst, "d", str3);
+                        de.robv.android.xposed.XposedHelpers.setObjectField(inst, "e", av2);
+                        de.robv.android.xposed.XposedHelpers.setObjectField(inst, "f", title2);
+                        de.robv.android.xposed.XposedHelpers.setObjectField(inst, "g", timeTxt2);
+                        de.robv.android.xposed.XposedHelpers.setObjectField(inst, "h", sum2);
+                        if (unread2 != null) {
+                            de.robv.android.xposed.XposedHelpers.setObjectField(inst, "i", unread2);
+                        }
+                        try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "n", new java.util.ArrayList()); } catch (Throwable ignored) {}
+                        try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "o", new java.util.ArrayList()); } catch (Throwable ignored) {}
+                        try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "u", new java.util.ArrayList()); } catch (Throwable ignored) {}
+                        try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "A", new java.util.HashSet()); } catch (Throwable ignored) {}
+                        try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "B", new java.util.ArrayList()); } catch (Throwable ignored) {}
+                        try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "y", new java.util.HashMap()); } catch (Throwable ignored) {}
+                        try { de.robv.android.xposed.XposedHelpers.setObjectField(inst, "z", new android.os.Bundle()); } catch (Throwable ignored) {}
+                        de.robv.android.xposed.XposedHelpers.setBooleanField(inst, "k", isTempChatTop(str));
+                        com.tencent.qqlitepro.util.Log.i("临时会话: Unsafe 构建宿主 ChatItem 成功 uid=" + str
+                                + " title=" + str3 + " preview=" + previewTxt2 + " time=" + timeTxt2);
+                        return inst;
+                    }
+                }
+            } catch (Throwable tU) {
+                com.tencent.qqlitepro.util.Log.w("临时会话: Unsafe 构建失败 " + chain(tU));
+            }
+
             java.lang.String strPreviewOf = previewOf(sTempChatKnown.get(str));
             de.robv.android.xposed.XposedHelpers.setObjectField(objNewInstance, "abstractContent", buildAbstractContent(strPreviewOf));
             java.lang.StringBuilder sb = new java.lang.StringBuilder("临时会话: 合成会话条目 peerUid=");
