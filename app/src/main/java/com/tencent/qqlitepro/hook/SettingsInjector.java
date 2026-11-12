@@ -155,6 +155,308 @@ public final class SettingsInjector {
     }
 
     /** 门禁状态 + 刷新按钮：加入群后点一下即可立即检测并注入 */
+    /* ==================== 群聊消息数据（近 N 天消息总数 + 发言排行榜 + 截图发送） ==================== */
+    private static volatile android.widget.EditText sStatDays;
+
+    /** 群聊消息数据界面：总数/排行/天数自定义/截图发送 */
+    public static void openGroupMsgStats(final android.content.Context context, final long groupUin, final String groupName) {
+        try {
+            android.app.Dialog dialog = new android.app.Dialog(context);
+            dialog.requestWindowFeature(1);
+            dialog.setCanceledOnTouchOutside(true);
+            android.widget.ScrollView scroll = new android.widget.ScrollView(context);
+            android.widget.LinearLayout root = new android.widget.LinearLayout(context);
+            root.setOrientation(1);
+            root.setBackgroundColor(-15657960);
+            int pad = dp(context, 16.0f);
+            root.setPadding(pad, dp(context, 14.0f), pad, dp(context, 16.0f));
+
+            // 标题栏
+            android.widget.LinearLayout header = new android.widget.LinearLayout(context);
+            header.setOrientation(0);
+            header.setGravity(16);
+            header.addView(text(context, "消息数据", TITLE, 17.0f, 3),
+                    new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f));
+            android.widget.TextView close = text(context, "关闭", ACCENT, 13.0f, 17);
+            close.setPadding(dp(context, 10.0f), dp(context, 4.0f), 0, dp(context, 4.0f));
+            close.setClickable(true);
+            close.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try { dialog.dismiss(); } catch (Throwable ignored) {}
+                }
+            });
+            header.addView(close);
+            root.addView(header, rootLp());
+            root.addView(text(context, groupName + "（" + String.valueOf(groupUin) + "）", SUB, 12.5f, 3), withTop(context, 4.0f));
+
+            // 天数输入
+            android.widget.EditText etDays = edit(context,
+                    String.valueOf(com.tencent.qqlitepro.util.Config.groupStatDays(context)),
+                    "统计天数（1-30，默认 7）", 1);
+            sStatDays = etDays;
+            android.widget.LinearLayout daysCard = filledCard(context);
+            daysCard.addView(text(context, "统计范围（天）", TITLE, 14.0f, 8388611), rootLp());
+            daysCard.addView(editInCard(context, etDays), inputLp());
+            root.addView(daysCard, withTop(context, 10.0f));
+
+            // 结果区
+            final android.widget.TextView resultView = text(context, "点击下方按钮开始统计", HINT, 13.0f, 3);
+            resultView.setLineSpacing(dp(context, 4.0f), 1.0f);
+            root.addView(resultView, withTop(context, 10.0f));
+
+            final android.content.Context fCtx = context;
+            // 统计按钮
+            android.view.View statBtn = saveButton(context, "开始统计", new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        int days = 7;
+                        try {
+                            days = Integer.parseInt(sStatDays.getText().toString().trim());
+                        } catch (Throwable ignored) {}
+                        final int fDays = Math.max(1, Math.min(30, days));
+                        com.tencent.qqlitepro.util.Config.setGroupStatDays(fCtx, fDays);
+                        resultView.setText("统计中…");
+                        new Thread(new Runnable() {
+                            @Override
+                            public void run() {
+                                final com.tencent.qqlitepro.http.QqKernel.GroupMsgStats st =
+                                        com.tencent.qqlitepro.http.QqKernel.groupMsgStats(groupUin, fDays);
+                                new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (st.error != null && !st.error.isEmpty()) {
+                                            resultView.setText("统计失败：" + st.error);
+                                            return;
+                                        }
+                                        StringBuilder sb = new StringBuilder();
+                                        sb.append("近 ").append(st.days).append(" 天消息总数：").append(st.total).append("\n");
+                                        sb.append("发言排行：\n");
+                                        int limit = Math.min(15, st.rank.size());
+                                        for (int i = 0; i < limit; i++) {
+                                            String[] one = st.rank.get(i);
+                                            sb.append("  ").append(i + 1).append(". ").append(one[0])
+                                              .append("  ").append(one[1]).append(" 条\n");
+                                        }
+                                        if (st.rank.isEmpty()) {
+                                            sb.append("  （无数据）");
+                                        }
+                                        resultView.setText(sb.toString());
+                                    }
+                                });
+                            }
+                        }, "group-stat").start();
+                    } catch (Throwable th) {
+                        com.tencent.qqlitepro.util.Log.w("群统计异常: " + th);
+                    }
+                }
+            });
+            root.addView(statBtn, withTop(context, 12.0f));
+
+            // 截图按钮：进入聊天界面由用户操作后截图，这里给快捷入口
+            android.view.View shotBtn = saveButton(context, "打开聊天并截图", new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        dialog.dismiss();
+                        // 进入聊天（宿主 AIO），用户在聊天内用宿主自带"截图"按钮完成截图与发送
+                        com.tencent.qqlitepro.http.QqKernel.openChatByUin(fCtx, groupUin, groupName, 2);
+                    } catch (Throwable th) {
+                        com.tencent.qqlitepro.util.Log.w("跳转聊天失败: " + th);
+                    }
+                }
+            });
+            root.addView(shotBtn, withTop(context, 8.0f));
+
+            scroll.addView(root);
+            dialog.setContentView(scroll);
+            if (dialog.getWindow() != null) {
+                android.view.WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
+                attrs.width = (int) (context.getResources().getDisplayMetrics().widthPixels * 0.94f);
+                attrs.height = (int) (context.getResources().getDisplayMetrics().heightPixels * 0.85f);
+                dialog.getWindow().setAttributes(attrs);
+            }
+            dialog.show();
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("打开消息数据失败: " + th);
+        }
+    }
+
+    /** 在线状态点赞（逆向自宿主 IKernelOnlineStatusService） */
+    private static volatile android.widget.TextView sZanLog;
+    private static volatile android.widget.EditText sZanUin;
+    private static volatile android.widget.EditText sZanCount;
+
+    private static void addZanBlock(android.content.Context context, android.view.ViewGroup viewGroup) {
+        try {
+            android.widget.LinearLayout card = new android.widget.LinearLayout(context);
+            card.setOrientation(1);
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(-14013129);
+            bg.setCornerRadius(dpLite(10.0f));
+            card.setBackground(bg);
+            int p = dp(context, 12);
+            card.setPadding(p, p, p, p);
+
+            card.addView(text(context, "给好友点在线状态赞（赞/心/狗头）", TITLE, 13.5f, 3), rootLp());
+
+            // 好友 QQ 号
+            android.widget.EditText etUin = new android.widget.EditText(context);
+            etUin.setHint("好友 QQ 号");
+            etUin.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
+            etUin.setTextSize(13.5f);
+            etUin.setTextColor(TITLE);
+            etUin.setHintTextColor(HINT);
+            etUin.setSingleLine(true);
+            android.widget.LinearLayout.LayoutParams lp1 = rootLp();
+            lp1.topMargin = dp(context, 8);
+            card.addView(etUin, lp1);
+            sZanUin = etUin;
+
+            // 次数
+            android.widget.EditText etCount = new android.widget.EditText(context);
+            etCount.setHint("点赞次数（1-20，默认 1）");
+            etCount.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
+            etCount.setTextSize(13.5f);
+            etCount.setTextColor(TITLE);
+            etCount.setHintTextColor(HINT);
+            etCount.setSingleLine(true);
+            android.widget.LinearLayout.LayoutParams lp2 = rootLp();
+            lp2.topMargin = dp(context, 6);
+            card.addView(etCount, lp2);
+            sZanCount = etCount;
+
+            // 类型选择
+            final String[] names = {"赞", "心", "狗头", "惊了", "宝宝"};
+            final int[] types = {
+                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_ZAN,
+                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_XIN,
+                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_GOUTOU,
+                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_JINGLI,
+                    com.tencent.qqlitepro.http.QqKernel.LIKE_TYPE_BAOBAO
+            };
+            final int[] chosen = {0};
+            android.widget.LinearLayout typeRow = new android.widget.LinearLayout(context);
+            typeRow.setOrientation(0);
+            for (int i = 0; i < names.length; i++) {
+                final int idx2 = i;
+                android.widget.TextView tv = text(context, names[i], i == 0 ? ACCENT : HINT, 13.0f, 17);
+                tv.setPadding(dp(context, 10), dp(context, 6), dp(context, 10), dp(context, 6));
+                tv.setClickable(true);
+                tv.setOnClickListener(new android.view.View.OnClickListener() {
+                    @Override
+                    public void onClick(android.view.View v) {
+                        chosen[0] = idx2;
+                        // 高亮选中的
+                        for (int j = 0; j < typeRow.getChildCount(); j++) {
+                            android.widget.TextView c = (android.widget.TextView) typeRow.getChildAt(j);
+                            c.setTextColor(j == idx2 ? ACCENT : HINT);
+                        }
+                    }
+                });
+                typeRow.addView(tv);
+            }
+            android.widget.LinearLayout.LayoutParams lp3 = rootLp();
+            lp3.topMargin = dp(context, 8);
+            card.addView(typeRow, lp3);
+
+            // 日志区
+            android.widget.TextView logView = text(context, "", HINT, 12.0f, 3);
+            logView.setLineSpacing(dp(context, 3), 1.0f);
+            android.widget.LinearLayout.LayoutParams lp4 = rootLp();
+            lp4.topMargin = dp(context, 8);
+            card.addView(logView, lp4);
+            sZanLog = logView;
+
+            /* 从会话选择框选好友：样式跟随基础设置内的"原生会话选择器"开关 */
+            final android.content.Context fCtxSel = context;
+            android.view.View pickBtn = saveButton(context, "从会话选择好友", new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        android.widget.EditText et = sZanUin;
+                        showSessionPicker(fCtxSel, true, null, new Runnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    java.util.Set<java.lang.String> sel = sSelectedKeys;
+                                    if (sel == null || sel.isEmpty() || et == null) {
+                                        return;
+                                    }
+                                    String first = sel.iterator().next();
+                                    et.setText(first);
+                                    toast(fCtxSel, "已选择 " + sel.size() + " 个，填入第一个 " + first);
+                                } catch (Throwable th) {
+                                    com.tencent.qqlitepro.util.Log.w("会话选择回填失败: " + th);
+                                }
+                            }
+                        });
+                    } catch (Throwable th) {
+                        com.tencent.qqlitepro.util.Log.w("打开会话选择器失败: " + th);
+                    }
+                }
+            });
+            android.widget.LinearLayout.LayoutParams pickLp = rootLp();
+            pickLp.topMargin = dp(context, 10);
+            card.addView(pickBtn, pickLp);
+
+            // 执行按钮
+            final android.content.Context fCtx = context;
+            android.view.View btn = saveButton(context, "发送点赞", new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        final String uinStr = sZanUin != null ? sZanUin.getText().toString().trim() : "";
+                        if (uinStr.isEmpty() || !uinStr.matches("\\d{5,12}")) {
+                            toast(fCtx, "请输入有效的好友 QQ 号");
+                            return;
+                        }
+                        int cnt = 1;
+                        try {
+                            cnt = Integer.parseInt(sZanCount != null ? sZanCount.getText().toString().trim() : "1");
+                        } catch (Throwable ignored) {
+                        }
+                        final int fCnt = Math.max(1, Math.min(20, cnt));
+                        final long fUin = Long.parseLong(uinStr);
+                        final int fType = types[chosen[0]];
+                        appendLog(sZanLog, "发送中：uin=" + fUin + " 次数=" + fCnt + " 类型=" + names[chosen[0]]);
+                        new Thread(new Runnable() {
+                            @Override
+                            public void run() {
+                                final String err = com.tencent.qqlitepro.http.QqKernel
+                                        .sendOnlineStatusLike(fUin, fType, fCnt);
+                                new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (err == null) {
+                                            appendLog(sZanLog, "点赞成功 ✓");
+                                            toast(fCtx, "已给 " + fUin + " 点赞");
+                                        } else {
+                                            appendLog(sZanLog, "失败：" + err);
+                                            toast(fCtx, "点赞失败：" + err);
+                                        }
+                                    }
+                                });
+                            }
+                        }, "qqmax-zan").start();
+                    } catch (Throwable th) {
+                        com.tencent.qqlitepro.util.Log.w("点赞界面异常: " + th);
+                    }
+                }
+            });
+            android.widget.LinearLayout.LayoutParams lp5 = rootLp();
+            lp5.topMargin = dp(context, 10);
+            card.addView(btn, lp5);
+
+            android.widget.LinearLayout.LayoutParams cardLp = rootLp();
+            cardLp.topMargin = dp(context, 8);
+            viewGroup.addView(card, cardLp);
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("构建点赞区块失败: " + th);
+        }
+    }
+
     private static void addGateStatusRow(final android.content.Context context, android.view.ViewGroup viewGroup) {
         try {
             boolean passed = com.tencent.qqlitepro.MainHook.isGroupPassed();
@@ -978,7 +1280,8 @@ public final class SettingsInjector {
         }
     }
 
-    public static void pm_openWhitelistPicker() {
+    /* QQ动态黑名单选择器：选中的用户其动态不处理 */
+    public static void pm_openBlacklistPicker() {
         try {
             android.content.Context contextAppContext = com.tencent.qqlitepro.cache.MsgCache.appContext();
             android.content.Context contextCurrentActivity = com.tencent.qqlitepro.plugin.PluginEngine.currentActivity();
@@ -986,35 +1289,35 @@ public final class SettingsInjector {
                 contextCurrentActivity = contextAppContext;
             }
             if (contextCurrentActivity == null) {
-                com.tencent.qqlitepro.util.Log.w("白名单选择失败: 无可用 Context");
+                com.tencent.qqlitepro.util.Log.w("黑名单选择失败: 无可用 Context");
                 return;
             }
             java.util.LinkedHashSet linkedHashSet = new java.util.LinkedHashSet();
-            for (java.lang.String str : (contextAppContext != null ? com.tencent.qqlitepro.util.Config.qqDynamicWhitelist(contextAppContext) : "").split("[,,\r\n ]+")) {
+            for (java.lang.String str : (contextAppContext != null ? com.tencent.qqlitepro.util.Config.qqDynamicBlacklist(contextAppContext) : "").split("[,,\r\n ]+")) {
                 if (str.matches("\\d+")) {
                     linkedHashSet.add(str);
                 }
             }
             showSessionPicker(contextCurrentActivity, true, linkedHashSet, new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda27(contextAppContext, contextCurrentActivity));
         } catch (java.lang.Throwable th) {
-            com.tencent.qqlitepro.util.Log.w("打开白名单选择器失败: " + th);
+            com.tencent.qqlitepro.util.Log.w("打开黑名单选择器失败: " + th);
         }
     }
 
-    static /* synthetic */ void lambda$pm_openWhitelistPicker$13(android.content.Context context, android.content.Context context2) {
+    static /* synthetic */ void lambda$pm_openBlacklistPicker$13(android.content.Context context, android.content.Context context2) {
         try {
-            java.lang.String strBuildWhitelistFromSelection = buildWhitelistFromSelection();
+            java.lang.String strBuildBlacklistFromSelection = buildWhitelistFromSelection();
             if (context != null) {
-                com.tencent.qqlitepro.util.Config.setQqDynamicWhitelist(context, strBuildWhitelistFromSelection);
+                com.tencent.qqlitepro.util.Config.setQqDynamicBlacklist(context, strBuildBlacklistFromSelection);
             }
-            java.lang.StringBuilder sb = new java.lang.StringBuilder("内置接口已选择 ");
+            java.lang.StringBuilder sb = new java.lang.StringBuilder("已选择 ");
             java.util.Set<java.lang.String> set = sSelectedKeys;
             sb.append(set.size());
-            sb.append(" 个私聊白名单用户");
+            sb.append(" 个黑名单用户（不处理其动态）");
             appendQqLog(sb.toString());
-            toast(context2, "已选择 " + set.size() + " 个私聊用户");
+            toast(context2, "已选择 " + set.size() + " 个黑名单用户");
         } catch (java.lang.Throwable th) {
-            com.tencent.qqlitepro.util.Log.w("白名单写入失败: " + th);
+            com.tencent.qqlitepro.util.Log.w("黑名单写入失败: " + th);
         }
     }
 
@@ -2110,7 +2413,7 @@ public final class SettingsInjector {
         addDivider(viewGroup);
         viewGroup.addView(navRow(context, "插件管理", "导入 / 删除 / 启停插件 / 拓展功能 / 运行日志", 13));
         addDivider(viewGroup);
-        viewGroup.addView(navRow(context, "QQ 动态", "定时点赞 / 评论动态 / 白名单 / 日志", 15));
+        viewGroup.addView(navRow(context, "QQ 动态", "定时点赞 / 评论动态 / 黑名单 / 日志", 15));
         addDivider(viewGroup);
         viewGroup.addView(navRow(context, "关于模块", "版本 / 作者 / 官方群聊", 4));
         addDivider(viewGroup);
@@ -2456,6 +2759,9 @@ public final class SettingsInjector {
         viewGroup.addView(backRow(context));
         viewGroup.addView(section(context, "防撤回"));
         viewGroup.addView(switchRow(context, "防撤回总开关", "关闭后不拦截消息撤回", com.tencent.qqlitepro.util.Config.enabled(context), new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda80(context)));
+        addDivider(viewGroup);
+        viewGroup.addView(section(context, "在线状态点赞"));
+        addZanBlock(context, viewGroup);
         addDivider(viewGroup);
         viewGroup.addView(section(context, "防撤回模式"));
         int iMode = com.tencent.qqlitepro.util.Config.mode(context);
@@ -5869,14 +6175,14 @@ public final class SettingsInjector {
         linearLayoutFilledCard.addView(text(context, "每天执行时刻 (HH:MM)", TITLE, 14.0f, 8388611), rootLp());
         linearLayoutFilledCard.addView(editInCard(context, editTextEdit), inputLp());
         viewGroup.addView(linearLayoutFilledCard);
-        android.widget.EditText editTextEdit2 = edit(context, com.tencent.qqlitepro.util.Config.qqDynamicWhitelist(context), "逗号/换行分隔 uin；填写/选择后仅处理白名单动态", 3);
+        android.widget.EditText editTextEdit2 = edit(context, com.tencent.qqlitepro.util.Config.qqDynamicBlacklist(context), "逗号/换行分隔 uin；名单内用户的动态不处理", 3);
         makeGroupGap(viewGroup);
         android.widget.LinearLayout linearLayoutFilledCard2 = filledCard(context);
-        linearLayoutFilledCard2.addView(text(context, "白名单用户", TITLE, 14.0f, 8388611), rootLp());
+        linearLayoutFilledCard2.addView(text(context, "黑名单用户（不处理其动态）", TITLE, 14.0f, 8388611), rootLp());
         linearLayoutFilledCard2.addView(editInCard(context, editTextEdit2), inputLp());
         viewGroup.addView(linearLayoutFilledCard2);
         makeGroupGap(viewGroup);
-        android.view.View viewSaveButton = saveButton(context, "从会话选择白名单(只私聊)", new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda18(editTextEdit2, context));
+        android.view.View viewSaveButton = saveButton(context, "从会话选择黑名单(只私聊)", new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda18(editTextEdit2, context));
         marginBottom(viewSaveButton, 10.0f);
         viewGroup.addView(viewSaveButton);
         android.widget.EditText editTextEdit3 = edit(context, com.tencent.qqlitepro.util.Config.qqDynamicCommentText(context), "评论模板文字，默认“不错哦~”", 1);
