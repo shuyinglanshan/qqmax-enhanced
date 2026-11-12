@@ -121,6 +121,8 @@ public class ChatCardInjector {
     private static final String ADAPTER_CLASS = "androidx.recyclerview.widget.RecyclerView$Adapter";
     private static final String AVATAR_URL = "https://img2.baidu.com/it/u=3554844775,4056477822&fm=253&fmt=auto&app=120&f=JPEG?w=247&h=247";
     private static final int CARD_TYPE = -10;
+    /** 宿主原生会话卡 viewType（0 = ItemRecentContact） */
+    private static final int HOST_ITEM_TYPE = 0;
     private static final int TEMP_CHAT_CARD_TYPE = -11;
     private static final String CLEAR_ITEM = "momoi.mod.qqpro.hook.ClearMsgListItem";
     private static final String DELETE_ITEM = "com.tencent.qqnt.watch.chat.list.longclick.DeleteItem";
@@ -177,8 +179,18 @@ public class ChatCardInjector {
         }
     }
 
+    /** 当前 adapter 的额外卡片数（必须与 getItemViewType/getItem 的实际产出严格一致） */
+    private static int extraCardCountFor(Object adapter) {
+        int n = 1;   /* 邮箱卡 */
+        if (ChatCardInjector.tempChatFeatureOn()) {
+            try {
+                n += insertPlan(adapter).size();
+            } catch (Throwable ignored) {}
+        }
+        return n;
+    }
+
     private static int extraCardCount() {
-        /* 1 张邮箱卡 + N 张临时会话卡 */
         int n = 1;
         if (ChatCardInjector.tempChatFeatureOn()) {
             n += Math.min(50, com.tencent.qqlitepro.http.QqKernel.tempChatCount());
@@ -189,6 +201,167 @@ public class ChatCardInjector {
     /** 临时会话卡在列表中的起始下标（邮箱卡之后） */
     private static int tempChatBaseSlot() {
         return 1;
+    }
+
+    /**
+     * 逐位时间穿插：临时会话按 msgTime 与宿主会话混排。
+     * 返回 List<int[]>：{临时序号, 宿主会话下标(0..hostCount)}
+     */
+    private static java.util.List<int[]> insertPlan(Object adapter) {
+        java.util.List<int[]> plan = new java.util.ArrayList<int[]>();
+        try {
+            java.util.List<Object[]> snap = com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
+            if (snap == null || snap.isEmpty()) {
+                return plan;
+            }
+            long[] hostTimes = hostItemTimes(adapter);
+            int hostCount = hostTimes.length;
+            int limit = Math.min(50, snap.size());
+            for (int i = 0; i < limit; i++) {
+                Object[] one = snap.get(i);
+                long t = com.tencent.qqlitepro.http.QqKernel.longOf(one[4]);
+                int at = hostCount;
+                for (int k = 0; k < hostCount; k++) {
+                    if (hostTimes[k] <= t) {
+                        at = k;
+                        break;
+                    }
+                }
+                plan.add(new int[]{i, at});
+            }
+        } catch (Throwable th) {
+            Log.w("insertPlan 失败: " + th);
+        }
+        return plan;
+    }
+
+    /** 宿主当前列表每条会话的 lastMsgTime（秒->毫秒归一化） */
+    private static long[] hostItemTimes(Object adapter) {
+        try {
+            Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
+            if (!(cur instanceof List)) {
+                return new long[0];
+            }
+            List list = (List) cur;
+            java.util.ArrayList<Long> times = new java.util.ArrayList<Long>();
+            for (int i = 0; i < list.size(); i++) {
+                Object it = list.get(i);
+                if (it == null) continue;
+                String cn = it.getClass().getName();
+                /* 只统计真实会话卡（跳过 BannerHeaderItem 等头部项） */
+                if (!cn.endsWith("RecentContactChatItem")) continue;
+                long t = 0;
+                try {
+                    Object info = XposedHelpers.getObjectField(it, "a");
+                    t = com.tencent.qqlitepro.http.QqKernel.longOf(
+                            XposedHelpers.getObjectField(info, "msgTime"));
+                    if (t > 0 && t < 100000000000L) t *= 1000L;
+                } catch (Throwable ignored) {}
+                times.add(Long.valueOf(t));
+            }
+            long[] out = new long[times.size()];
+            for (int i = 0; i < out.length; i++) {
+                out[i] = times.get(i).longValue();
+            }
+            return out;
+        } catch (Throwable ignored) {
+            return new long[0];
+        }
+    }
+
+    /**
+     * 统一位置解析：显示位置 pos 属于哪一段。
+     * 布局：[0]=邮箱卡，[1..N]=临时会话卡（按时间），[N+1..]=宿主会话（按时间穿插）。
+     * 返回 int[]{类型, 索引}：类型 0=邮箱卡，1=临时卡，2=宿主卡
+     */
+    private static int[] resolvePos(Object adapter, int pos) {
+        try {
+            java.util.List<int[]> plan = insertPlan(adapter);
+            int hostCount = hostItemTimes(adapter).length;
+            int n = plan.size();
+            /* 展开显示序列 */
+            int cursor = 0;
+            if (pos == cursor) {
+                return new int[]{0, 0};
+            }
+            cursor++;
+            int planIdx = 0;
+            int hostIdx = 0;
+            while (planIdx < n || hostIdx < hostCount) {
+                /* 该宿主位置前要插入的临时卡 */
+                while (planIdx < n && plan.get(planIdx)[1] <= hostIdx) {
+                    if (pos == cursor) {
+                        return new int[]{1, plan.get(planIdx)[0]};
+                    }
+                    cursor++;
+                    planIdx++;
+                }
+                if (hostIdx < hostCount) {
+                    if (pos == cursor) {
+                        return new int[]{2, hostIdx};
+                    }
+                    cursor++;
+                    hostIdx++;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return new int[]{-1, -1};
+    }
+
+    /**
+     * 显示位置 pos -> 宿主真实 list 下标（时间穿插的逆映射）。
+     * 临时卡返回 0（占位，getItem 结果会被 onBindViewHolder 覆盖渲染）。
+     */
+    private static int hostIndexForPos(Object adapter, int pos) {
+        try {
+            int[] r = resolvePos(adapter, pos);
+            if (r[0] == 2) {
+                return r[1];
+            }
+            return 0;
+        } catch (Throwable ignored) {
+            return Math.max(0, pos);
+        }
+    }
+
+
+    /** 位置 pos 是否为临时会话卡；是则返回其序号，否则 -1（时间穿插版） */
+    private static int tempChatIndexAtPos(Object adapter, int pos) {
+        if (!ChatCardInjector.tempChatFeatureOn()) return -1;
+        try {
+            Object mailPos = Integer.valueOf(cardSlot(adapter));
+            int mp = mailPos instanceof Integer ? (Integer) mailPos : 0;
+            java.util.List<int[]> plan = insertPlan(adapter);
+            int cursor = 1;   /* 邮箱卡占 0 */
+            int planIdx = 0;
+            int hostIdx = 0;
+            int hostCount = hostItemTimes(adapter).length;
+            while (true) {
+                boolean mailSlot = (mp == cursor);
+                if (mailSlot) {
+                    if (pos == cursor) return -1;
+                    cursor++;
+                    continue;
+                }
+                while (planIdx < plan.size() && plan.get(planIdx)[1] <= hostIdx) {
+                    if (pos == cursor) {
+                        return plan.get(planIdx)[0];
+                    }
+                    cursor++;
+                    planIdx++;
+                }
+                if (hostIdx >= hostCount && planIdx >= plan.size()) {
+                    return -1;
+                }
+                if (pos == cursor) {
+                    return -1;   /* 宿主普通项 */
+                }
+                cursor++;
+                hostIdx++;
+            }
+        } catch (Throwable ignored) {
+            return -1;
+        }
     }
 
     /** 该位置对应的临时会话序号（0..N-1），非临时卡返回 -1 */
@@ -1342,6 +1515,13 @@ public class ChatCardInjector {
             if (name == null || name.trim().isEmpty()) {
                 name = QqKernel.strOf(QqKernel.fieldValue(info, "peerUid"));
             }
+            /* 临时会话（chatType=1 且来源为临时登记）显示「（临时会话）」标识 */
+            try {
+                String uidT = QqKernel.strOf(QqKernel.fieldValue(info, "peerUid"));
+                if (uidT != null && com.tencent.qqlitepro.http.QqKernel.tempChatKnownEntry(uidT) != null) {
+                    name = name.replace("（临时会话）", "").replace("(临时会话)", "").trim() + "（临时会话）";
+                }
+            } catch (Throwable ignored) {}
             /*
              * 逆向宿主渲染语义（WatchRecentItemBuilder）：
              *   e(item): binding.c(标题)  = item.h.a  -> SummaryInfo.a 应装【昵称】
@@ -1724,6 +1904,239 @@ public class ChatCardInjector {
      * 渲染第 idx 个临时会话卡（与宿主会话卡一致：昵称/头像/未读/时间/预览 + 原生长按菜单）。
      * 数据来自 QqKernel.tempChatSnapshot()（按最后消息时间倒序）。
      */
+    /**
+     * 取宿主真实会话 item 作为原型（克隆法：所有非空字段天然满足 Kotlin 非空校验）。
+     * 优先从 adapter 的 getCurrentList() 里拿第一个 RecentContactChatItem。
+     */
+    /** 供 QqKernel 调用：取宿主真实 ChatItem 原型 */
+    public static Object hostChatItemPrototypePublic() {
+        try {
+            /* 直接用缓存的 adapter（getItem 期间一定有效） */
+            Object adapter = sTempChatAdapter;
+            if (adapter == null && sAppCtx != null) {
+                adapter = tempChatAdapter(sAppCtx);
+            }
+            if (adapter == null) return null;
+            Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
+            if (!(cur instanceof List)) return null;
+            for (Object it : (List) cur) {
+                if (it == null) continue;
+                if (it.getClass().getName().endsWith("RecentContactChatItem")) {
+                    return it;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static Object hostChatItemPrototype(android.content.Context context) {
+        try {
+            Object adapter = tempChatAdapter(context);
+            if (adapter == null) return null;
+            Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
+            if (!(cur instanceof List)) return null;
+            for (Object it : (List) cur) {
+                if (it == null) continue;
+                if (it.getClass().getName().endsWith("RecentContactChatItem")) {
+                    return it;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** 按字段名取 binding 里任意类型字段 */
+    private static Object readAnyField(Object target, String name) {
+        if (target == null) return null;
+        Class<?> c = target.getClass();
+        while (c != null && c != Object.class) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(target);
+            } catch (Throwable ignored) {}
+            c = c.getSuperclass();
+        }
+        return null;
+    }
+
+    /** 给任意文本控件（TextView / SingleLineTextView）设文本 */
+    private static void setAnyText(Object v, String text) {
+        if (v == null) return;
+        try {
+            if (v instanceof android.widget.TextView) {
+                ((android.widget.TextView) v).setText(text);
+                return;
+            }
+            java.lang.reflect.Method m = v.getClass().getMethod("setText", CharSequence.class);
+            m.setAccessible(true);
+            m.invoke(v, text);
+        } catch (Throwable ignored) {
+            try {
+                java.lang.reflect.Method m2 = v.getClass().getMethod("setText", String.class);
+                m2.setAccessible(true);
+                m2.invoke(v, text);
+            } catch (Throwable ignored2) {}
+        }
+    }
+
+    /**
+     * 用宿主 WatchRecentContactHolder 的 binding 直接填充临时会话（样式与宿主完全一致）。
+     * 逆向：WatchRecentContactHolder.b = ItemRecentContactBinding
+     *   b.c -> 昵称  b.e -> 摘要  b.d -> 时间  b.f -> 置顶图标
+     */
+    public static void bindTempChatByHostBinding(Object holder, int idx) {
+        try {
+            java.util.List<Object[]> list = com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
+            if (list == null || idx < 0 || idx >= list.size()) {
+                return;
+            }
+            Object[] item = list.get(idx);
+            String uid = (String) item[0];
+            String nick = item[1] == null ? "" : String.valueOf(item[1]);
+            nick = nick.replace("（临时会话）", "").replace("(临时会话)", "").trim();
+            if (nick.isEmpty()) {
+                nick = uid;
+            }
+            String preview = item[2] == null ? "" : String.valueOf(item[2]);
+            int unread = item[3] instanceof Integer ? (Integer) item[3] : 0;
+            long msgTime = com.tencent.qqlitepro.http.QqKernel.longOf(item[4]);
+            long uin = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(uid);
+            boolean top = com.tencent.qqlitepro.http.QqKernel.isTempChatTop(uid);
+
+            Object binding = null;
+            try {
+                binding = XposedHelpers.getObjectField(holder, "b");
+            } catch (Throwable ignored) {}
+            if (binding == null && holder != null) {
+                /* 兜底：holder 自身可能是 binding */
+                binding = holder;
+            }
+            View itemView = null;
+            try {
+                itemView = (View) XposedHelpers.getObjectField(holder, "itemView");
+            } catch (Throwable ignored) {}
+
+            /* 字段：a=ConstraintLayout b=AvatarView c=昵称 d=时间 e=摘要 f=置顶 g=未读 */
+            Object oNick = readAnyField(binding, "c");
+            Object oSummary = readAnyField(binding, "e");
+            Object oTime = readAnyField(binding, "d");
+            View vTop = (View) readAnyField(binding, "f");
+            Object oUnread = readAnyField(binding, "g");
+            View vAvatar = (View) readAnyField(binding, "b");
+            View vUnread = (oUnread instanceof View) ? (View) oUnread : null;
+
+            /* 字段 d 是时间、c 是"上排"、e 是"下排"。
+             * 逆向确认：宿主把 item.h.a(SummaryInfo) 放 c，item.f.a(TitleInfo) 放 e。
+             * 这里按视觉语义：c=昵称，e=预览。 */
+            /* 实测：binding.e 为上排(昵称)，binding.c 为下排(摘要) */
+            setAnyText(oSummary, nick + "（临时会话）");
+            setAnyText(oNick, preview);
+            setAnyText(oTime, com.tencent.qqlitepro.http.QqKernel.formatChatTime(msgTime));
+            if (vTop != null) {
+                vTop.setVisibility(top ? View.VISIBLE : View.GONE);
+            }
+            if (vUnread != null) {
+                try {
+                    XposedHelpers.callMethod(vUnread, "setRedNum", Integer.valueOf(Math.max(0, unread)));
+                    XposedHelpers.callMethod(vUnread, "setVisibility",
+                            Integer.valueOf(unread > 0 ? View.VISIBLE : View.GONE));
+                } catch (Throwable ignored) {}
+            }
+            if (vAvatar instanceof android.widget.ImageView && uin > 0) {
+                final android.widget.ImageView iv = (android.widget.ImageView) vAvatar;
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            java.net.URL u = new java.net.URL(
+                                    "https://q1.qlogo.cn/g?b=qq&nk=" + uin + "&s=140");
+                            java.net.HttpURLConnection c = (java.net.HttpURLConnection) u.openConnection();
+                            c.setConnectTimeout(6000);
+                            c.setReadTimeout(6000);
+                            final android.graphics.Bitmap bm =
+                                    android.graphics.BitmapFactory.decodeStream(c.getInputStream());
+                            if (bm != null) {
+                                new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try { iv.setImageBitmap(bm); } catch (Throwable ignored) {}
+                                    }
+                                });
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }, "temp-av").start();
+            }
+
+            /* 点击进会话 / 长按原生菜单 */
+            if (itemView != null) {
+                itemView.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        try {
+                            com.tencent.qqlitepro.http.QqKernel.setTempChatUnread(uid, 0);
+                            com.tencent.qqlitepro.http.QqKernel.openTempChatSession(v.getContext(), uid);
+                        } catch (Throwable ignored) {}
+                    }
+                });
+                itemView.setOnLongClickListener(new View.OnLongClickListener() {
+                    @Override
+                    public boolean onLongClick(View v) {
+                        try {
+                            Object chatItem = com.tencent.qqlitepro.http.QqKernel.tempChatItemFor(uid);
+                            Object frag = ChatCardInjector.topAndroidXFragmentOf(v.getContext());
+                            if (chatItem != null
+                                    && ChatCardInjector.showHostSessionMenu(v.getContext(), chatItem, frag)) {
+                                return true;
+                            }
+                            com.tencent.qqlitepro.http.QqKernel.showTempChatMenu(v.getContext(), uid);
+                        } catch (Throwable ignored) {}
+                        return true;
+                    }
+                });
+            }
+        } catch (Throwable th) {
+            Log.w("bindTempChatByHostBinding 失败: " + th);
+        }
+    }
+
+    /** 从 Context 找到宿主栈顶 androidx Fragment（菜单 show 需要） */
+    private static Object topAndroidXFragmentOf(android.content.Context context) {
+        try {
+            android.app.Activity act = null;
+            android.content.Context c = context;
+            while (c instanceof android.content.ContextWrapper) {
+                if (c instanceof android.app.Activity) {
+                    act = (android.app.Activity) c;
+                    break;
+                }
+                c = ((android.content.ContextWrapper) c).getBaseContext();
+            }
+            if (act == null) {
+                java.util.Iterator<android.app.Activity> it = allActivities().iterator();
+                if (it.hasNext()) act = it.next();
+            }
+            if (act == null) return null;
+            Class<?> supCls = Class.forName("androidx.fragment.app.FragmentActivity");
+            if (!supCls.isInstance(act)) return null;
+            Object fm = supCls.getMethod("getSupportFragmentManager").invoke(act);
+            java.util.List<?> frags = (java.util.List<?>) fm.getClass().getMethod("getFragments").invoke(fm);
+            if (frags == null || frags.isEmpty()) return null;
+            for (int i = frags.size() - 1; i >= 0; i--) {
+                if (frags.get(i) != null) return frags.get(i);
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /**
+     * 渲染第 idx 个临时会话卡。
+     * 样式严格对齐宿主 ItemRecentContact（WatchRecentItemBuilder.a 的 inflate 布局）：
+     *   圆角 16dp / 卡片内边距 12dp / 头像 40dp / 昵称 15sp / 预览 12.5sp /
+     *   时间 11sp / 未读红色徽章 + 置顶小图标。
+     * 数据：QqKernel.tempChatSnapshot() = {uid, nick, preview, unread, msgTime}
+     */
     public static void bindTempChatItemCard(View view, int idx) {
         try {
             if (!(view instanceof android.view.ViewGroup)) {
@@ -1736,92 +2149,127 @@ public class ChatCardInjector {
             }
             final Object[] item = list.get(idx);
             final String uid = (String) item[0];
-            final String nick = (item[1] == null ? "" : String.valueOf(item[1]))
-                    .replace("（临时会话）", "").replace("(临时会话)", "").trim();
+            String nick0 = item[1] == null ? "" : String.valueOf(item[1]);
+            nick0 = nick0.replace("（临时会话）", "").replace("(临时会话)", "").trim();
+            if (nick0.isEmpty()) {
+                nick0 = uid;
+            }
+            final String nick = nick0;
             final String preview = item[2] == null ? "" : String.valueOf(item[2]);
             final int unread = item[3] instanceof Integer ? (Integer) item[3] : 0;
             final long msgTime = com.tencent.qqlitepro.http.QqKernel.longOf(item[4]);
             final long uinTmp = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(uid);
+            final boolean topped = com.tencent.qqlitepro.http.QqKernel.isTempChatTop(uid);
 
-            android.content.Context ctx = root.getContext();
+            final android.content.Context ctx = root.getContext();
             root.removeAllViews();
-            /* 卡片背景（圆角 + 4/2dp 间距，防粘连） */
+            /* 卡片背景：与宿主一致的圆角容器 */
             android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
             bg.setColor(-14013129);
-            bg.setCornerRadius(dp(ctx, 10));
+            bg.setCornerRadius(dp(ctx, 16));
             root.setBackground(bg);
-            root.setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8));
+            root.setPadding(dp(ctx, 12), dp(ctx, 10), dp(ctx, 12), dp(ctx, 10));
             root.setClickable(true);
             root.setLongClickable(true);
+            /* 卡片外边距（宿主卡间距） */
             try {
                 android.view.ViewGroup.LayoutParams lp = root.getLayoutParams();
-                if (lp != null) {
-                    lp.height = -2;
+                if (lp instanceof android.view.ViewGroup.MarginLayoutParams) {
+                    android.view.ViewGroup.MarginLayoutParams mlp = (android.view.ViewGroup.MarginLayoutParams) lp;
+                    mlp.leftMargin = dp(ctx, 6);
+                    mlp.rightMargin = dp(ctx, 6);
+                    mlp.topMargin = dp(ctx, 3);
+                    mlp.bottomMargin = dp(ctx, 3);
+                    root.setLayoutParams(mlp);
                 }
             } catch (Throwable ignored) {}
 
-            /* 横向：头像 + 右侧(昵称/预览/时间) + 未读 */
             android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
             row.setOrientation(0);
             row.setGravity(16);
             root.addView(row, new android.widget.LinearLayout.LayoutParams(-1, -2));
 
-            android.widget.ImageView avatar = new android.widget.ImageView(ctx);
-            int av = dp(ctx, 36);
+            /* 头像 40dp（圆角方形，与宿主一致） */
+            final android.widget.ImageView avatar = new android.widget.ImageView(ctx);
+            int av = dp(ctx, 40);
             android.widget.LinearLayout.LayoutParams avLp = new android.widget.LinearLayout.LayoutParams(av, av);
             avatar.setLayoutParams(avLp);
+            avatar.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP);
             android.graphics.drawable.GradientDrawable avBg = new android.graphics.drawable.GradientDrawable();
-            avBg.setColor(-13488056);   /* 中性占位（灰），加载成功后换成真实头像 */
-            avBg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+            avBg.setColor(-13421773);
+            avBg.setCornerRadius(dp(ctx, 8));
             avatar.setBackground(avBg);
             avatar.setClipToOutline(true);
             row.addView(avatar);
-            /* 头像异步加载（qlogo） */
-            try {
-                long uin = uinTmp;
-                if (uin > 0) {
-                    final android.widget.ImageView fAv = avatar;
-                    new Thread(new Runnable() {
-                        @Override
-                        public void run() {
-                            try {
-                                java.net.URL u = new java.net.URL("https://q1.qlogo.cn/g?b=qq&nk=" + uin + "&s=100");
-                                java.net.HttpURLConnection c = (java.net.HttpURLConnection) u.openConnection();
-                                c.setConnectTimeout(6000);
-                                c.setReadTimeout(6000);
-                                c.setDoInput(true);
-                                final android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeStream(c.getInputStream());
-                                if (bm != null) {
-                                    new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            try {
-                                                fAv.setImageBitmap(bm);
-                                                fAv.setBackground(null);
-                                            } catch (Throwable ignored) {}
-                                        }
-                                    });
-                                }
-                            } catch (Throwable ignored) {}
-                        }
-                    }, "temp-av").start();
-                }
-            } catch (Throwable ignored) {}
+            if (uinTmp > 0) {
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            java.net.URL u = new java.net.URL("https://q1.qlogo.cn/g?b=qq&nk=" + uinTmp + "&s=140");
+                            java.net.HttpURLConnection c = (java.net.HttpURLConnection) u.openConnection();
+                            c.setConnectTimeout(6000);
+                            c.setReadTimeout(6000);
+                            c.setDoInput(true);
+                            c.setRequestProperty("User-Agent", "Mozilla/5.0 (Android)");
+                            final android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeStream(c.getInputStream());
+                            if (bm != null) {
+                                new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            avatar.setImageBitmap(bm);
+                                            avatar.setBackground(null);
+                                        } catch (Throwable ignored) {}
+                                    }
+                                });
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }, "temp-av").start();
+            }
 
+            /* 中间：昵称 + 预览 */
             android.widget.LinearLayout mid = new android.widget.LinearLayout(ctx);
             mid.setOrientation(1);
-            android.widget.LinearLayout.LayoutParams midLp = new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f);
+            android.widget.LinearLayout.LayoutParams midLp =
+                    new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f);
             midLp.leftMargin = dp(ctx, 10);
             row.addView(mid, midLp);
 
+            android.widget.LinearLayout titleRow = new android.widget.LinearLayout(ctx);
+            titleRow.setOrientation(0);
+            titleRow.setGravity(16);
+            mid.addView(titleRow, new android.widget.LinearLayout.LayoutParams(-1, -2));
+
             android.widget.TextView tvNick = new android.widget.TextView(ctx);
-            tvNick.setText(nick.isEmpty() ? uid : nick);
+            tvNick.setText(nick);
             tvNick.setTextSize(15.0f);
             tvNick.setTextColor(-1);
             tvNick.setSingleLine(true);
             tvNick.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            tvNick.setMaxWidth((int) (ctx.getResources().getDisplayMetrics().widthPixels * 0.52f));
-            mid.addView(tvNick);
+            titleRow.addView(tvNick, new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f));
+
+            /* 「（临时会话）」小字标识（灰色，不挤占昵称） */
+            android.widget.TextView tvTag = new android.widget.TextView(ctx);
+            tvTag.setText("（临时会话）");
+            tvTag.setTextSize(9.5f);
+            tvTag.setTextColor(-8355712);
+            tvTag.setSingleLine(true);
+            android.widget.LinearLayout.LayoutParams tagLp =
+                    new android.widget.LinearLayout.LayoutParams(-2, -2);
+            tagLp.leftMargin = dp(ctx, 4);
+            titleRow.addView(tvTag, tagLp);
+
+            /* 置顶小图标（宿主原生是 binding.f ImageView） */
+            android.widget.TextView tvTop = new android.widget.TextView(ctx);
+            tvTop.setText("\uD83D\uDCCC");
+            tvTop.setTextSize(10.0f);
+            tvTop.setTextColor(-6643546);
+            tvTop.setVisibility(topped ? android.view.View.VISIBLE : android.view.View.GONE);
+            android.widget.LinearLayout.LayoutParams topLp = new android.widget.LinearLayout.LayoutParams(-2, -2);
+            topLp.leftMargin = dp(ctx, 4);
+            titleRow.addView(tvTop, topLp);
 
             android.widget.TextView tvPrev = new android.widget.TextView(ctx);
             tvPrev.setText(preview);
@@ -1829,35 +2277,51 @@ public class ChatCardInjector {
             tvPrev.setTextColor(-6643546);
             tvPrev.setSingleLine(true);
             tvPrev.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            tvPrev.setMaxWidth((int) (ctx.getResources().getDisplayMetrics().widthPixels * 0.52f));
             android.widget.LinearLayout.LayoutParams pvLp = new android.widget.LinearLayout.LayoutParams(-1, -2);
-            pvLp.topMargin = dp(ctx, 2);
+            pvLp.topMargin = dp(ctx, 3);
             mid.addView(tvPrev, pvLp);
 
-            /* 时间 + 未读 */
+            /* 右侧：时间 + 未读徽章 */
             android.widget.LinearLayout right = new android.widget.LinearLayout(ctx);
             right.setOrientation(1);
             right.setGravity(17);
-            row.addView(right, new android.widget.LinearLayout.LayoutParams(-2, -2));
+            android.widget.LinearLayout.LayoutParams rightLp = new android.widget.LinearLayout.LayoutParams(-2, -2);
+            rightLp.leftMargin = dp(ctx, 6);
+            row.addView(right, rightLp);
+
             android.widget.TextView tvTime = new android.widget.TextView(ctx);
             tvTime.setTextSize(11.0f);
             tvTime.setTextColor(-6643546);
             tvTime.setSingleLine(true);
             if (msgTime > 0) {
-                java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault());
+                long now = java.lang.System.currentTimeMillis();
+                java.text.SimpleDateFormat sdf;
+                if (now - msgTime < 86400000L) {
+                    sdf = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault());
+                } else {
+                    sdf = new java.text.SimpleDateFormat("MM/dd", java.util.Locale.getDefault());
+                }
                 tvTime.setText(sdf.format(new java.util.Date(msgTime)));
             }
-            right.addView(tvTime);
+            right.addView(tvTime, new android.widget.LinearLayout.LayoutParams(-2, -2));
+
             if (unread > 0) {
                 android.widget.TextView badge = new android.widget.TextView(ctx);
                 badge.setText(unread > 99 ? "99+" : String.valueOf(unread));
-                badge.setTextSize(10.5f);
+                badge.setTextSize(10.0f);
                 badge.setTextColor(-1);
                 badge.setGravity(17);
-                badge.setBackgroundColor(-65536);
-                android.widget.LinearLayout.LayoutParams bLp = new android.widget.LinearLayout.LayoutParams(-2, -2);
-                bLp.topMargin = dp(ctx, 3);
-                bLp.leftMargin = dp(ctx, 4);
+                badge.setSingleLine(true);
+                android.graphics.drawable.GradientDrawable bd = new android.graphics.drawable.GradientDrawable();
+                bd.setColor(-2142769);
+                bd.setCornerRadius(dp(ctx, 9));
+                badge.setBackground(bd);
+                int minW = dp(ctx, 18);
+                badge.setMinWidth(minW);
+                badge.setPadding(dp(ctx, 4), 0, dp(ctx, 4), 0);
+                android.widget.LinearLayout.LayoutParams bLp = new android.widget.LinearLayout.LayoutParams(-2, dp(ctx, 18));
+                bLp.topMargin = dp(ctx, 4);
+                bLp.gravity = 17;
                 right.addView(badge, bLp);
             }
 
@@ -1871,11 +2335,17 @@ public class ChatCardInjector {
                     } catch (Throwable ignored) {}
                 }
             });
-            /* 长按 = 宿主原生长按菜单（与正常会话一致，逐会话独立） */
+            /* 长按：复用宿主原生会话卡片设置链路（逐会话独立生效） */
             root.setOnLongClickListener(new android.view.View.OnLongClickListener() {
                 @Override
                 public boolean onLongClick(android.view.View v) {
                     try {
+                        Object chatItem = com.tencent.qqlitepro.http.QqKernel.tempChatItemFor(uid);
+                        Object frag = ChatCardInjector.topAndroidXFragmentOf(v.getContext());
+                        if (chatItem != null
+                                && ChatCardInjector.showHostSessionMenu(v.getContext(), chatItem, frag)) {
+                            return true;
+                        }
                         com.tencent.qqlitepro.http.QqKernel.showTempChatMenu(v.getContext(), uid);
                     } catch (Throwable ignored) {}
                     return true;
@@ -2305,6 +2775,70 @@ public class ChatCardInjector {
             }
         }
         return best;
+    }
+
+    /**
+     * 临时会话卡长按：完全复用宿主会话卡片的长按设置链路（逆向 listener$1.a_0）：
+     *   new SelectDialogFragment(listOf(new DeleteItem(item), new SetTopItem(item),
+     *        new SetDisturbItem(item)), null, null, 6)
+     *       .show(fragment.getParentFragmentManager(), "SelectFragment")
+     * item 用真实的构造函数传入（不是 Unsafe），故菜单项能按该会话生效、互不影响。
+     */
+    public static boolean showHostSessionMenu(Context context, Object chatItem, Object fragment) {
+        try {
+            ClassLoader cl = chatItem.getClass().getClassLoader();
+            Class<?> deleteCls = Class.forName("com.tencent.qqnt.watch.chat.list.longclick.DeleteItem", false, cl);
+            Class<?> topCls = Class.forName("com.tencent.qqnt.watch.chat.list.longclick.SetTopItem", false, cl);
+            Class<?> disturbCls = Class.forName("com.tencent.qqnt.watch.chat.list.longclick.SetDisturbItem", false, cl);
+            Class<?> absCls = Class.forName("com.tencent.qqnt.watch.ui.componet.AbsItem", false, cl);
+            java.util.ArrayList<Object> items = new java.util.ArrayList<Object>();
+            items.add(deleteCls.getConstructor(chatItem.getClass().getInterfaces().length > 0
+                    ? chatItem.getClass().getInterfaces()[0] : chatItem.getClass()).newInstance(chatItem));
+            items.add(topCls.getConstructor(chatItem.getClass().getInterfaces().length > 0
+                    ? chatItem.getClass().getInterfaces()[0] : chatItem.getClass()).newInstance(chatItem));
+            items.add(disturbCls.getConstructor(chatItem.getClass().getInterfaces().length > 0
+                    ? chatItem.getClass().getInterfaces()[0] : chatItem.getClass()).newInstance(chatItem));
+            /* 模块自带的"清空消息" */
+            try {
+                Class<?> clearCls = Class.forName("momoi.mod.qqpro.hook.ClearMsgListItem", false, cl);
+                items.add(clearCls.getConstructor(chatItem.getClass().getInterfaces().length > 0
+                        ? chatItem.getClass().getInterfaces()[0] : chatItem.getClass()).newInstance(chatItem));
+            } catch (Throwable ignored) {}
+            Class<?> selectCls = Class.forName("com.tencent.qqnt.watch.ui.componet.select.SelectDialogFragment", false, cl);
+            Class<?> fn0 = Class.forName("kotlin.jvm.functions.Function0", false, cl);
+            Object dialog = selectCls.getConstructor(java.util.List.class, fn0, String.class, Integer.TYPE)
+                    .newInstance(items, null, null, Integer.valueOf(6));
+            /* 用宿主 Fragment 的 parentFragmentManager show（与原生一致） */
+            Object fm = null;
+            if (fragment != null) {
+                try {
+                    fm = fragment.getClass().getMethod("getParentFragmentManager").invoke(fragment);
+                } catch (Throwable ignored) {}
+            }
+            if (fm == null) {
+                fm = findSupportFragmentManager(context);
+            }
+            if (fm == null) {
+                return false;
+            }
+            /* 让菜单 hook 立刻拿到目标 uid（双保险：items 里也有 item） */
+            try {
+                Object info = XposedHelpers.getObjectField(chatItem, "a");
+                String uid = (String) XposedHelpers.getObjectField(info, "peerUid");
+                String nick = (String) XposedHelpers.getObjectField(info, "peerName");
+                int ct = XposedHelpers.getIntField(info, "chatType");
+                long uin = XposedHelpers.getLongField(info, "peerUin");
+                com.tencent.qqlitepro.http.QqKernel.registerMenuTarget(uid, nick, ct, uin);
+            } catch (Throwable ignored) {}
+            markCardMenuItems(items);
+            selectCls.getMethod("show", Class.forName("androidx.fragment.app.FragmentManager", false, cl), String.class)
+                    .invoke(dialog, fm, "SelectFragment");
+            Log.i("临时会话: 已用宿主原生链路弹出长按菜单（item=" + chatItem.hashCode() + "）");
+            return true;
+        } catch (Throwable th) {
+            Log.w("showHostSessionMenu 失败: " + th);
+            return false;
+        }
     }
 
     public static void showNativeMenu(Context context, String kind) {
@@ -3165,7 +3699,8 @@ public class ChatCardInjector {
             if (ChatCardInjector.isTarget(methodHookParam.thisObject)) {
                 Object result = methodHookParam.getResult();
                 int iLongValue = result instanceof Integer ? (Integer)result : (result instanceof Long ? (int)((Long)result).longValue() : 0);
-                methodHookParam.setResult((Object)(iLongValue + ChatCardInjector.extraCardCount()));
+                methodHookParam.setResult((Object)(iLongValue
+                        + ChatCardInjector.extraCardCountFor(methodHookParam.thisObject)));
             }
         }
     }
@@ -3181,8 +3716,9 @@ public class ChatCardInjector {
                 int pos = numLastIntArg;
                 if (pos == ChatCardInjector.cardSlot(methodHookParam.thisObject)) {
                     methodHookParam.setResult(Integer.valueOf(-10));
-                } else if (ChatCardInjector.tempChatIndexAt(pos) >= 0) {
-                    methodHookParam.setResult(Integer.valueOf(-11));
+                } else if (ChatCardInjector.tempChatIndexAtPos(methodHookParam.thisObject, pos) >= 0) {
+                    /* 临时卡：用宿主原生 viewType，让宿主 inflate 自己的 ItemRecentContact 布局 */
+                    methodHookParam.setResult(Integer.valueOf(ChatCardInjector.HOST_ITEM_TYPE));
                 }
             }
         }
@@ -3196,13 +3732,26 @@ public class ChatCardInjector {
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
             Integer numLastIntArg;
             if (ChatCardInjector.isTarget(methodHookParam.thisObject) && (numLastIntArg = ChatCardInjector.lastIntArg(methodHookParam)) != null && methodHookParam.args.length != 0 && methodHookParam.args[0] instanceof Integer) {
-                int iCardSlot = ChatCardInjector.cardSlot(methodHookParam.thisObject);
-                int iCurrentListSize = ChatCardInjector.currentListSize(methodHookParam.thisObject);
-                int iMax = numLastIntArg < iCardSlot ? numLastIntArg : (numLastIntArg > iCardSlot ? numLastIntArg - 1 : Math.max(0, iCardSlot - 1));
-                if (iCurrentListSize > 0) {
-                    iMax = Math.min(iMax, iCurrentListSize - 1);
+                /* 临时卡：直接返回宿主 RecentContactChatItem，由宿主原生渲染（样式 100% 一致） */
+                int tIdx = ChatCardInjector.tempChatIndexAtPos(methodHookParam.thisObject, numLastIntArg);
+                if (tIdx >= 0) {
+                    java.util.List<Object[]> snap = com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
+                    if (snap != null && tIdx < snap.size()) {
+                        String uidT = (String) snap.get(tIdx)[0];
+                        Object okItem = com.tencent.qqlitepro.http.QqKernel.tempChatItemFor(uidT);
+                        if (okItem != null) {
+                            methodHookParam.setResult(okItem);
+                            return;
+                        }
+                    }
                 }
-                methodHookParam.args[0] = iMax;
+                /* 时间穿插版索引映射：pos(显示位) -> 宿主真实 list 下标 */
+                int mapped = ChatCardInjector.hostIndexForPos(methodHookParam.thisObject, numLastIntArg);
+                int iCurrentListSize = ChatCardInjector.currentListSize(methodHookParam.thisObject);
+                if (iCurrentListSize > 0) {
+                    mapped = Math.min(mapped, iCurrentListSize - 1);
+                }
+                methodHookParam.args[0] = Math.max(0, mapped);
             }
         }
     }
@@ -3218,7 +3767,7 @@ public class ChatCardInjector {
                 boolean isTemp;
                 int pos = numLastIntArg;
                 boolean isMail = pos == ChatCardInjector.cardSlot(methodHookParam.thisObject);
-                int tempIdx = ChatCardInjector.tempChatIndexAt(pos);
+                int tempIdx = ChatCardInjector.tempChatIndexAtPos(methodHookParam.thisObject, pos);
                 boolean isTempCard = tempIdx >= 0;
                 if (!isMail && !isTempCard) {
                     return;
@@ -3226,7 +3775,7 @@ public class ChatCardInjector {
                 try {
                     View itemView = (View)XposedHelpers.getObjectField((Object)methodHookParam.args[0], (String)"itemView");
                     if (isTempCard) {
-                        ChatCardInjector.bindTempChatItemCard(itemView, tempIdx);
+                        ChatCardInjector.bindTempChatByHostBinding(methodHookParam.args[0], tempIdx);
                     } else {
                         ChatCardInjector.bindCard(itemView);
                     }
@@ -3385,6 +3934,11 @@ public class ChatCardInjector {
         }
     }
 
+    private static volatile int sGetItemProbe = 0;
+    private static volatile int sVTProbe = 0;
+    private static volatile int sBindProbe = 0;
+    private static volatile int sTimeProbe = 0;
+
     static class GetItemOverride
     extends XC_MethodHook {
         GetItemOverride() {
@@ -3394,7 +3948,31 @@ public class ChatCardInjector {
             Object override = sBindOverride;
             if (override != null) {
                 param.setResult(override);
+                return;
             }
+            /* 临时会话卡：返回宿主 RecentContactChatItem，由宿主原生渲染（样式 100% 一致） */
+            try {
+                if (!ChatCardInjector.isTarget(param.thisObject)) {
+                    return;
+                }
+                Integer pos = ChatCardInjector.lastIntArg(param);
+                if (pos == null) {
+                    return;
+                }
+                int tIdx = ChatCardInjector.tempChatIndexAtPos(param.thisObject, pos.intValue());
+                if (tIdx < 0) {
+                    return;
+                }
+                java.util.List<Object[]> snap = com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
+                if (snap == null || tIdx >= snap.size()) {
+                    return;
+                }
+                /* 占位：返回"宿主真实列表首项"（一定合法），实际渲染由 onBindViewHolder 覆盖 */
+                Object cur = XposedHelpers.callMethod(param.thisObject, "getCurrentList", new Object[0]);
+                if (cur instanceof List && !((List) cur).isEmpty()) {
+                    param.setResult(((List) cur).get(0));
+                }
+            } catch (Throwable ignored) {}
         }
     }
 
