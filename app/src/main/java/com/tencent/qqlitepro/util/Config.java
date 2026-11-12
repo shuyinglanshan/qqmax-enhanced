@@ -68,7 +68,7 @@ public final class Config {
     private static final java.lang.String KEY_QQ_DYNAMIC_LIKE = "qq_dynamic_like";
     private static final java.lang.String KEY_QQ_DYNAMIC_LIKE_COUNT = "qq_dynamic_like_count";
     private static final java.lang.String KEY_QQ_DYNAMIC_TIME = "qq_dynamic_time";
-    private static final java.lang.String KEY_QQ_DYNAMIC_WHITELIST = "qq_dynamic_whitelist";
+    private static final java.lang.String KEY_QQ_DYNAMIC_BLACKLIST = "qq_dynamic_blacklist";
     private static final java.lang.String KEY_SEND_MODE = "send_mode";
     private static final java.lang.String KEY_SHARD_ENABLED = "shard_enabled";
     private static final java.lang.String KEY_SUMMARY_API_KEY = "summary_api_key";
@@ -139,7 +139,7 @@ public final class Config {
     private static volatile boolean sQqDynamicLike = true;
     private static volatile int sQqDynamicLikeCount = 0;
     private static volatile java.lang.String sQqDynamicTime = "09:00";
-    private static volatile java.lang.String sQqDynamicWhitelist = "";
+    private static volatile java.lang.String sQqDynamicBlacklist = "";
     private static volatile int sSendMode = 0;
     private static volatile boolean sShardEnabled = false;
     private static volatile java.lang.String sSummaryApiKey = "";
@@ -370,18 +370,19 @@ public final class Config {
         markDirtyAndPersist(context);
     }
 
-    public static java.lang.String qqDynamicWhitelist(android.content.Context context) {
+    /* QQ动态黑名单：不处理其动态的用户 QQ 号（换行/逗号分隔） */
+    public static java.lang.String qqDynamicBlacklist(android.content.Context context) {
         if (!fastHit()) {
             reload(context);
         }
-        return sQqDynamicWhitelist;
+        return sQqDynamicBlacklist;
     }
 
-    public static void setQqDynamicWhitelist(android.content.Context context, java.lang.String str) {
+    public static void setQqDynamicBlacklist(android.content.Context context, java.lang.String str) {
         if (str == null) {
             str = "";
         }
-        sQqDynamicWhitelist = str;
+        sQqDynamicBlacklist = str;
         markDirtyAndPersist(context);
     }
 
@@ -432,7 +433,7 @@ public final class Config {
         if (str2 == null) {
             str2 = "";
         }
-        sQqDynamicWhitelist = str2;
+        sQqDynamicBlacklist = str2;
         if (str3 == null) {
             str3 = "";
         }
@@ -1048,6 +1049,22 @@ public final class Config {
         markDirtyAndPersist(context);
     }
 
+    /* 群聊消息统计天数 */
+    private static final java.lang.String KEY_GROUP_STAT_DAYS = "group_stat_days";
+    private static volatile int sGroupStatDays = 7;
+
+    public static int groupStatDays(android.content.Context context) {
+        if (!fastHit()) {
+            reload(context);
+        }
+        return sGroupStatDays;
+    }
+
+    public static void setGroupStatDays(android.content.Context context, int days) {
+        sGroupStatDays = Math.max(1, Math.min(30, days));
+        markDirtyAndPersist(context);
+    }
+
     /** 临时会话功能是否启用（默认开） */
     public static boolean tempChatEnabled(android.content.Context context) {
         if (!fastHit()) {
@@ -1355,7 +1372,7 @@ public final class Config {
         jsonObject.addProperty(KEY_QQ_DYNAMIC_INTERVAL, java.lang.Integer.valueOf(sQqDynamicInterval));
         jsonObject.addProperty(KEY_QQ_DYNAMIC_LIKE, java.lang.Boolean.valueOf(sQqDynamicLike));
         jsonObject.addProperty(KEY_QQ_DYNAMIC_COMMENT, java.lang.Boolean.valueOf(sQqDynamicComment));
-        jsonObject.addProperty(KEY_QQ_DYNAMIC_WHITELIST, sQqDynamicWhitelist);
+        jsonObject.addProperty(KEY_QQ_DYNAMIC_BLACKLIST, sQqDynamicBlacklist);
         jsonObject.addProperty(KEY_QQ_DYNAMIC_COMMENT_TEXT, sQqDynamicCommentText);
         jsonObject.addProperty(KEY_QQ_DYNAMIC_TIME, sQqDynamicTime);
         jsonObject.addProperty(KEY_QQ_DYNAMIC_LIKE_COUNT, java.lang.Integer.valueOf(sQqDynamicLikeCount));
@@ -1373,6 +1390,7 @@ public final class Config {
         jsonObject.addProperty(KEY_MAIL_ENABLED, java.lang.Boolean.valueOf(sMailEnabled));
         jsonObject.addProperty(KEY_GROUP_TOAST, java.lang.Boolean.valueOf(sGroupToastEnabled));
         jsonObject.addProperty(KEY_TEMP_CHAT_ENABLED, java.lang.Boolean.valueOf(sTempChatEnabled));
+        jsonObject.addProperty(KEY_GROUP_STAT_DAYS, java.lang.Integer.valueOf(sGroupStatDays));
         jsonObject.addProperty(KEY_MAIL_WEB_BG, sMailWebBg);
         jsonObject.addProperty(KEY_FORCE_NOTICE_READ, sForceNoticeRead);
         return jsonObject;
@@ -1439,7 +1457,7 @@ public final class Config {
         }
         sQqDynamicLike = getBool(jsonObject, KEY_QQ_DYNAMIC_LIKE, DEFAULT_ENABLED);
         sQqDynamicComment = getBool(jsonObject, KEY_QQ_DYNAMIC_COMMENT, false);
-        sQqDynamicWhitelist = getStr(jsonObject, KEY_QQ_DYNAMIC_WHITELIST, "");
+        sQqDynamicBlacklist = getStr(jsonObject, KEY_QQ_DYNAMIC_BLACKLIST, "");
         sQqDynamicCommentText = getStr(jsonObject, KEY_QQ_DYNAMIC_COMMENT_TEXT, "不错哦~");
         sQqDynamicTime = normalizeTime(getStr(jsonObject, KEY_QQ_DYNAMIC_TIME, "09:00"));
         sQqDynamicLikeCount = java.lang.Math.max(0, getInt(jsonObject, KEY_QQ_DYNAMIC_LIKE_COUNT, 0));
@@ -1611,7 +1629,7 @@ public final class Config {
         sQqDynamicInterval = 30;
         sQqDynamicLike = DEFAULT_ENABLED;
         sQqDynamicComment = false;
-        sQqDynamicWhitelist = "";
+        sQqDynamicBlacklist = "";
         sQqDynamicCommentText = "不错哦~";
         sQqDynamicTime = "09:00";
         sQqDynamicLikeCount = 0;
