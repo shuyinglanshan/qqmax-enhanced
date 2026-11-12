@@ -97,12 +97,35 @@ public class MainActivity extends android.app.Activity {
         this.mHint = textViewTv;
         linearLayout.addView(textViewTv, lp());
         refreshStatus();
+        /* 刷新官方群门禁：立即重检官方群并注入（无需重启宿主） */
+        android.widget.TextView refreshGate = tv("刷新官方群门禁", 15.0f, -12878593, 17);
+        refreshGate.setGravity(17);
+        refreshGate.setPadding(0, dp(8.0f), 0, dp(8.0f));
+        android.graphics.drawable.GradientDrawable gateBg = new android.graphics.drawable.GradientDrawable();
+        gateBg.setColor(-13816010);
+        gateBg.setCornerRadius(dp(12.0f));
+        refreshGate.setBackground(gateBg);
+        refreshGate.setClickable(true);
+        refreshGate.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override
+            public void onClick(android.view.View v) {
+                try {
+                    android.widget.Toast.makeText(v.getContext(),
+                            "正在重新检测官方群…", android.widget.Toast.LENGTH_SHORT).show();
+                    com.tencent.qqlitepro.MainHook.recheckGroupNow();
+                } catch (Throwable th) {
+                    android.widget.Toast.makeText(v.getContext(),
+                            "刷新失败：" + th.getMessage(), android.widget.Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+        linearLayout.addView(refreshGate, lp());
         linearLayout.addView(tv("所有功能均在 QQMax → 设置 →【增强模块设置】中配置", 16.0f, -6491966, 8388611), lp());
         android.widget.TextView textViewTv2 = tv("功能一览：\n· 防撤回：强制阻止撤回（红边角标）/ 原文还原\n· 群公告全量显示、翻译接口替换\n· 自定义后缀、定时消息\n· 关键词回复 / 自动回复（支持 AI）\n· AI 总结、URL 转语音发送\n· 任意格式文件发送（伪图片/伪语音/分片）\n· 下载管理、JS 插件扩展\n· 本地 HTTP API、QQ 动态定时点赞/评论\n\n使用步骤：\n1. 在 LSPosed / EdXp 中启用本模块；\n2. 勾选作用域：com.tencent.qqlite；\n3. 加入官方群聊 801524531\n    （未加入时不会注入任何功能）；\n4. 重启目标应用生效；\n5. 打开 QQMax → 设置 →【增强模块设置】\n    配置各功能；\n6. 详见【关于模块】页。", 14.0f, -2236963, 8388611);
         textViewTv2.setLineSpacing(0.0f, 1.3f);
         linearLayout.addView(textViewTv2, lp());
         android.widget.TextView textView = new android.widget.TextView(this);
-        textView.setText("\n版本:v1.2.1\n作者:疏影阑珊\n官方群聊:801524531\n\n");
+        textView.setText("\n版本:v1.2.3\n作者:疏影阑珊\n官方群聊:801524531\n\n");
         textView.setTextSize(sp(15.0f));
         textView.setTextColor(-1052689);
         textView.setGravity(17);
