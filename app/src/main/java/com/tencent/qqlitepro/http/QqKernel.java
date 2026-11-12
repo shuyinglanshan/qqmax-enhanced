@@ -1274,6 +1274,28 @@ public final class QqKernel {
         }
     }
 
+    /** peerUid 转 QQ 号（供点赞等多处调用；非 u_ 开头原样返回） */
+    public static long uidToUinPublic(java.lang.String uid) {
+        if (uid == null || uid.isEmpty()) {
+            return 0L;
+        }
+        if (!uid.startsWith("u_")) {
+            try {
+                if (uid.matches("\\d+")) {
+                    return Long.parseLong(uid);
+                }
+            } catch (Throwable ignored) {}
+            return 0L;
+        }
+        try {
+            String v = uidToUin(uid);
+            if (v != null && v.matches("\\d+")) {
+                return Long.parseLong(v);
+            }
+        } catch (Throwable ignored) {}
+        return 0L;
+    }
+
     private static java.lang.String uidToUin(java.lang.String str) {
         java.lang.Object obj;
         if (str != null && !str.isEmpty() && str.startsWith("u_")) {
@@ -5770,29 +5792,83 @@ public final class QqKernel {
      */
     /**
      * 打开临时会话聊天界面。
-     *
-     * 逆向自宿主（QQ Max M2.5）WatchRecentItemBuilder$listener$1.b()：
-     *   Bundle bundle = WatchPicElementExtKt.c0(peerUid, chatType, nick, 0, uin, 8);
-     *   NavController nav = NavHostFragment.findNavController(builder 的 d 字段 WatchFragment);
-     *   nav.f(2114519145, bundle, null)   [builder.d 即 WatchFragment]
-     * 这是宿主会话卡片点击进聊天的真实路径（手表版 ViewPager 页面导航），
-     * 而非 QRoute AIO 路由（手表版走的是 NavHostFragment）。
+     * 逆向：WatchRecentItemBuilder$listener$1.b(item) =
+     *   WatchPicElementExtKt.c0(item.d=peerUid, item.c=chatType, nick, 0, uin, 8) 得 bundle
+     *   → NavHostFragment.findNavController(WatchFragment).navigate(2114519145, bundle)
+     * 我们用捕获的 ChatListFragment 实例（UiPatcher hook onCreate）拿 NavController，
+     * 自己构造同样的 bundle 后 navigate —— 与宿主点击行为一致。
      */
     public static boolean openTempChatSession(android.content.Context context, java.lang.String peerUid) {
         if (context == null || peerUid == null || peerUid.isEmpty()) {
             return false;
         }
         try {
-            java.lang.Object[] entry = tempChatKnownEntry(peerUid);
+            Object[] entry = tempChatKnownEntry(peerUid);
+            String nickPre = nick0(entry);
+            Object frag = com.tencent.qqlitepro.hook.UiPatcher.chatListFragment();
+            if (frag == null) {
+                /* 兜底：用主列表 RecyclerView 的 Activity → decorView → Navigation.findNavController */
+                android.app.Activity act = null;
+                try {
+                    Object rv = com.tencent.qqlitepro.hook.ChatCardInjector.mainRecyclerView();
+                    if (rv instanceof android.view.View) {
+                        android.content.Context c = ((android.view.View) rv).getContext();
+                        while (c instanceof android.content.ContextWrapper) {
+                            if (c instanceof android.app.Activity) { act = (android.app.Activity) c; break; }
+                            c = ((android.content.ContextWrapper) c).getBaseContext();
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                if (act == null) {
+                    act = findCurrentActivity();
+                }
+                if (act != null && act.getWindow() != null) {
+                    /* 关键：findNavController 必须传 NavHost 树内的 View。
+                     * 主列表 RecyclerView 就在 NavHost 的 fragment 布局里——用它。 */
+                    android.view.View probe = null;
+                    try {
+                        Object rv = com.tencent.qqlitepro.hook.ChatCardInjector.mainRecyclerView();
+                        if (rv instanceof android.view.View) {
+                            probe = (android.view.View) rv;
+                        }
+                    } catch (Throwable ignored) {}
+                    if (probe == null) {
+                        probe = act.getWindow().getDecorView();
+                    }
+                    Class<?> navCls = clsQuiet("androidx.navigation.Navigation");
+                    com.tencent.qqlitepro.util.Log.i("临时会话: 兜底 Navigation 类=" + navCls);
+                    if (navCls != null) {
+                        for (java.lang.reflect.Method m : navCls.getDeclaredMethods()) {
+                            if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+                            Class<?>[] ps = m.getParameterTypes();
+                            if (ps.length == 1 && android.view.View.class.isAssignableFrom(ps[0])
+                                    && m.getReturnType().getName().equals("androidx.navigation.NavController")) {
+                                try {
+                                    m.setAccessible(true);
+                                    Object nc = m.invoke(null, probe);
+                                    if (nc != null) {
+                                        com.tencent.qqlitepro.util.Log.i("临时会话: Navigation.findNavController 成功 m=" + m.getName() + " probe=" + (probe == null ? "decor" : probe.getClass().getSimpleName()));
+                                        // 直接走 navigate
+                                        return navNavigate(nc, peerUid, entry, nickPre);
+                                    }
+                                } catch (Throwable t) {
+                                    com.tencent.qqlitepro.util.Log.i("临时会话: findNavController(decor) 异常: " + t);
+                                }
+                            }
+                        }
+                    }
+                }
+                com.tencent.qqlitepro.util.Log.w("临时会话: ChatListFragment 实例未捕获且 decor 路径失败");
+                return false;
+            }
             long uin = entry != null ? longOf(entry[0]) : 0L;
-            java.lang.String nick = entry != null ? strOf(entry[1]) : "";
+            String nick = nickPre;
             if (nick != null) {
                 nick = nick.replace("（临时会话）", "").replace("(临时会话)", "").trim();
             }
             if (nick == null || nick.isEmpty()) {
                 nick = peerUid;
             }
-            // 1) 构造与宿主一致的参数 Bundle
             android.os.Bundle bundle = new android.os.Bundle();
             bundle.putString("key_bundle_peer_id", peerUid);
             bundle.putInt("key_bundle_chat_type", 1);
@@ -5800,74 +5876,35 @@ public final class QqKernel {
             if (uin > 0) {
                 bundle.putString("key_bundle_chat_uin", String.valueOf(uin));
             }
-            // 2) 找一个 NavHost 内的 Fragment（宿主主界面 MainActivity 的 fragment 树）。
-            //    主列表 builder 是 WatchChatListBuilder（无 d 字段），所以从 Activity 的
-            //    FragmentManager 遍历取第一个 Fragment，findNavController 会向上找宿主 NavHost。
-            android.app.Activity act = findCurrentActivity();
-            Object watchFragment = null;
-            if (act != null) {
-                try {
-                    android.view.View decor = act.getWindow().getDecorView();
-                    // 直接从 Activity 取 FragmentManager 遍历
-                    Object fm = null;
-                    try {
-                        fm = de.robv.android.xposed.XposedHelpers.callMethod(act,
-                                "getSupportFragmentManager", new Object[0]);
-                    } catch (Throwable ignored) {}
-                    if (fm == null) {
-                        // androidx activity: getSupportFragmentManager 是 FragmentActivity 方法
-                        try {
-                            fm = de.robv.android.xposed.XposedHelpers.callMethod(act,
-                                    "getFragmentManager", new Object[0]);
-                        } catch (Throwable ignored) {}
-                    }
-                    if (fm != null) {
-                        watchFragment = firstFragmentIn(fm, 0);
-                    }
-                } catch (Throwable th) {
-                    com.tencent.qqlitepro.util.Log.w("临时会话: 遍历 Fragment 失败 " + chain(th));
-                }
-            }
-            if (watchFragment == null) {
-                com.tencent.qqlitepro.util.Log.w("临时会话: 未找到可用 Fragment（NavHost 未就绪）");
-                return false;
-            }
-            // NavHostFragment.findNavController(fragment) — 静态方法名在 release 里可能是 S
+            // NavHostFragment.findNavController(fragment) → navigate(2114519145, bundle)
+            Class<?> navHostCls = cls("androidx.navigation.fragment.NavHostFragment");
             Object navController = null;
             try {
                 navController = de.robv.android.xposed.XposedHelpers.callStaticMethod(
-                        cls("androidx.navigation.fragment.NavHostFragment"),
-                        "findNavController",
-                        watchFragment);
+                        navHostCls, "findNavController", frag);
             } catch (Throwable t1) {
-                // 混淆名兜底：遍历 NavHostFragment 静态方法（返回 NavController 且参数是 Fragment）
-                try {
-                    Class<?> navHostCls = cls("androidx.navigation.fragment.NavHostFragment");
-                    for (java.lang.reflect.Method m : navHostCls.getDeclaredMethods()) {
-                        if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
-                        Class<?>[] ps = m.getParameterTypes();
-                        if (ps.length == 1 && ps[0].getName().endsWith("Fragment")
-                                && m.getReturnType().getName().equals("androidx.navigation.NavController")) {
-                            m.setAccessible(true);
-                            navController = m.invoke(null, watchFragment);
-                            break;
-                        }
+                for (java.lang.reflect.Method m : navHostCls.getDeclaredMethods()) {
+                    if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+                    Class<?>[] ps = m.getParameterTypes();
+                    if (ps.length == 1 && ps[0].isInstance(frag)
+                            && m.getReturnType().getName().equals("androidx.navigation.NavController")) {
+                        m.setAccessible(true);
+                        navController = m.invoke(null, frag);
+                        break;
                     }
-                } catch (Throwable t2) {
-                    com.tencent.qqlitepro.util.Log.w("临时会话: findNavController 失败 " + chain(t2));
                 }
             }
             if (navController == null) {
+                com.tencent.qqlitepro.util.Log.w("临时会话: findNavController 失败");
                 return false;
             }
-            // 3) nav.f(2114519145, bundle, null) — 混淆名 f，遍历找单参 int 的 NavController 方法
             boolean navigated = false;
+            // navigate(int, Bundle, NavOptions) —— 混淆后可能叫 f/n/a，按签名遍历
             for (java.lang.reflect.Method m : navController.getClass().getDeclaredMethods()) {
-                if (!java.lang.reflect.Modifier.isPublic(m.getModifiers())) continue;
                 Class<?>[] ps = m.getParameterTypes();
                 if (ps.length == 3 && ps[0] == Integer.TYPE
                         && ps[1] == android.os.Bundle.class
-                        && (ps[2] == null || ps[2].getName().endsWith("NavOptions"))) {
+                        && ps[2] != null && ps[2].getName().endsWith("NavOptions")) {
                     m.setAccessible(true);
                     m.invoke(navController, Integer.valueOf(2114519145), bundle, null);
                     navigated = true;
@@ -5875,9 +5912,14 @@ public final class QqKernel {
                 }
             }
             if (!navigated) {
-                // 再试公开方法（含继承）
                 for (java.lang.reflect.Method m : navController.getClass().getMethods()) {
                     Class<?>[] ps = m.getParameterTypes();
+                    if (ps.length == 2 && ps[0] == Integer.TYPE && ps[1] == android.os.Bundle.class) {
+                        m.setAccessible(true);
+                        m.invoke(navController, Integer.valueOf(2114519145), bundle);
+                        navigated = true;
+                        break;
+                    }
                     if (ps.length == 3 && ps[0] == Integer.TYPE
                             && ps[1] == android.os.Bundle.class
                             && ps[2] != null && ps[2].getName().endsWith("NavOptions")) {
@@ -5889,15 +5931,63 @@ public final class QqKernel {
                 }
             }
             if (navigated) {
-                com.tencent.qqlitepro.util.Log.i("临时会话: NavController 导航成功 uid=" + peerUid);
+                com.tencent.qqlitepro.util.Log.i("临时会话: navigate(2114519145) 成功 uid=" + peerUid);
                 return true;
             }
-            com.tencent.qqlitepro.util.Log.w("临时会话: NavController 导航方法未找到");
+            com.tencent.qqlitepro.util.Log.w("临时会话: navigate 方法未匹配 nav=" + navController.getClass().getName());
             return false;
         } catch (java.lang.Throwable th) {
             com.tencent.qqlitepro.util.Log.w("临时会话: 打开会话失败 " + chain(th));
         }
         return false;
+    }
+
+    private static String nick0(Object[] entry) {
+        if (entry == null) return "";
+        String n = strOf(entry[1]);
+        if (n != null) n = n.replace("（临时会话）", "").replace("(临时会话)", "").trim();
+        return n == null || n.isEmpty() ? "" : n;
+    }
+
+    /** 用拿到的 NavController 执行 navigate(2114519145, bundle) */
+    private static boolean navNavigate(Object navController, String peerUid, Object[] entry, String nick) {
+        try {
+            long uin = entry != null ? longOf(entry[0]) : 0L;
+            android.os.Bundle bundle = new android.os.Bundle();
+            bundle.putString("key_bundle_peer_id", peerUid);
+            bundle.putInt("key_bundle_chat_type", 1);
+            bundle.putString("key_bundle_chat_nick", nick == null || nick.isEmpty() ? peerUid : nick);
+            if (uin > 0) {
+                bundle.putString("key_bundle_chat_uin", String.valueOf(uin));
+            }
+            for (java.lang.reflect.Method m : navController.getClass().getDeclaredMethods()) {
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length == 3 && ps[0] == Integer.TYPE
+                        && ps[1] == android.os.Bundle.class
+                        && ps[2] != null && ps[2].getName().endsWith("NavOptions")) {
+                    m.setAccessible(true);
+                    m.invoke(navController, Integer.valueOf(2114519145), bundle, null);
+                    com.tencent.qqlitepro.util.Log.i("临时会话: navigate(2114519145) 成功 uid=" + peerUid);
+                    return true;
+                }
+            }
+            for (java.lang.reflect.Method m : navController.getClass().getMethods()) {
+                Class<?>[] ps = m.getParameterTypes();
+                if (ps.length == 3 && ps[0] == Integer.TYPE
+                        && ps[1] == android.os.Bundle.class
+                        && ps[2] != null && ps[2].getName().endsWith("NavOptions")) {
+                    m.setAccessible(true);
+                    m.invoke(navController, Integer.valueOf(2114519145), bundle, null);
+                    com.tencent.qqlitepro.util.Log.i("临时会话: navigate(2114519145) 成功(公开) uid=" + peerUid);
+                    return true;
+                }
+            }
+            com.tencent.qqlitepro.util.Log.w("临时会话: navigate 方法未匹配 nav=" + navController.getClass().getName());
+            return false;
+        } catch (Throwable th) {
+            com.tencent.qqlitepro.util.Log.w("临时会话: navigate 异常 " + chain(th));
+            return false;
+        }
     }
 
     /** 通过 QRoute 取得 API 实现（反射封装） */
@@ -5929,87 +6019,58 @@ public final class QqKernel {
 
     /**
      * 取内核在线状态服务（IKernelOnlineStatusService）。
-     * 逆向链路：IQQNTWrapperSession.getOnlineStatusService()
+     * 与 kernelMsgService 同源：KernelServiceUtil.c() 返回 IQQNTWrapperSession，
+     * 再 getOnlineStatusService()。
      */
     private static Object onlineStatusService() throws Throwable {
         try {
-            java.lang.reflect.Method mSession = Class.forName("com.tencent.qqnt.kernel.nativeinterface.IQQNTWrapperSession")
-                    .getMethod("getOnlineStatusService");
-            // session 实例：与 getMsgService 同源，从已缓存的 kernel session 取
             Object session = kernelSessionInstance();
             if (session == null) {
+                com.tencent.qqlitepro.util.Log.w("在线状态: 内核 session 未就绪（KernelServiceUtil.c 为空）");
                 return null;
             }
-            return mSession.invoke(session);
+            java.lang.reflect.Method m = session.getClass().getMethod("getOnlineStatusService");
+            m.setAccessible(true);
+            Object svc = m.invoke(session);
+            if (svc == null) {
+                com.tencent.qqlitepro.util.Log.w("在线状态: getOnlineStatusService 返回空");
+            }
+            return svc;
         } catch (Throwable t) {
             com.tencent.qqlitepro.util.Log.w("在线状态: 获取 service 失败 " + chain(t));
             return null;
         }
     }
 
-    /** 取内核 session 实例（与 getMsgService / recallMsg 一致的获取方式） */
+    /**
+     * 内核 session：KernelServiceUtil.c()（模块 sendMsg/recallMsg 同款路径）。
+     * 若 c() 没找到则遍历该类静态无参方法兜底。
+     */
     private static Object kernelSessionInstance() {
         try {
-            java.lang.reflect.Method m = QqKernel.class.getDeclaredMethod("invokeKernelSession");
-            m.setAccessible(true);
-            return m.invoke(null);
-        } catch (Throwable t) {
-            try {
-                // 兜底：反射找任何返回 session 的静态入口
-                Class<?> sesCls = cls("com.tencent.qqnt.kernel.nativeinterface.IQQNTWrapperSession");
-                if (sesCls != null) {
-                    for (java.lang.reflect.Method m2 : sesCls.getDeclaredMethods()) {
-                        if (java.lang.reflect.Modifier.isStatic(m2.getModifiers())
-                                && m2.getParameterTypes().length == 0
-                                && m2.getReturnType() == sesCls) {
-                            m2.setAccessible(true);
-                            return m2.invoke(null);
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {
-            }
-            return null;
-        }
-    }
-
-    /** 内核 session 获取的公共入口（若模块已有同名方法则直接复用其返回值） */
-    private static Object invokeKernelSession() {
-        try {
-            // 已有代码里 recallMsg 使用的方式是拿 sCl 后调用宿主 QRoute；
-            // 这里退回用 getMsgService 所在类里保存的 session（如有）
-            java.lang.reflect.Field f = QqKernel.class.getDeclaredField("sSessionRef");
-            f.setAccessible(true);
-            Object v = f.get(null);
-            if (v != null) {
-                return v;
-            }
-        } catch (Throwable ignored) {
-        }
-        try {
-            // 宿主全局 Kernel：IQQNTWrapperSession 的 CppProxy 由内核持有，
-            // 通过 BaseService 的静态字段是最常见入口
-            Class<?> base = cls("com.tencent.qqnt.kernel.api.impl.BaseService");
-            if (base != null) {
-                for (java.lang.reflect.Field f : base.getDeclaredFields()) {
-                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())
-                            && f.getType().getName().endsWith("IQQNTWrapperSession")) {
-                        f.setAccessible(true);
-                        Object v = f.get(null);
-                        if (v != null) {
-                            try {
-                                java.lang.reflect.Field sf = QqKernel.class.getDeclaredField("sSessionRef");
-                                sf.setAccessible(true);
-                                sf.set(null, v);
-                            } catch (Throwable ignored) {
-                            }
-                            return v;
-                        }
-                    }
+            java.lang.reflect.Method m = findMethod(cls("com.tencent.qqnt.msg.KernelServiceUtil"), "c", new java.lang.Class[0]);
+            if (m != null) {
+                Object v = m.invoke(null, new Object[0]);
+                if (v != null) {
+                    return v;
                 }
             }
-        } catch (Throwable ignored) {
-        }
+            // 兜底：遍历 KernelServiceUtil 全部静态无参方法
+            Class<?> utilCls = cls("com.tencent.qqnt.msg.KernelServiceUtil");
+            if (utilCls != null) {
+                for (java.lang.reflect.Method m2 : utilCls.getDeclaredMethods()) {
+                    if (!java.lang.reflect.Modifier.isStatic(m2.getModifiers())) continue;
+                    if (m2.getParameterTypes().length != 0) continue;
+                    try {
+                        m2.setAccessible(true);
+                        Object v2 = m2.invoke(null, new Object[0]);
+                        if (v2 != null && v2.getClass().getName().contains("WrapperSession")) {
+                            return v2;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable ignored) {}
         return null;
     }
 
@@ -6390,6 +6451,23 @@ public final class QqKernel {
     }
 
     /** 临时会话是否置顶 */
+    /** 清空某个临时会话的预览（清空消息菜单用） */
+    public static void clearTempChatPreview(java.lang.String peerUid) {
+        if (peerUid == null || peerUid.isEmpty()) {
+            return;
+        }
+        java.lang.Object[] v = sTempChatKnown.get(peerUid);
+        if (v != null && v.length > 5) {
+            v[5] = "";
+        }
+        refreshTempChatList();
+    }
+
+    /** 该 peerUid 是否为登记过的临时会话 */
+    public static boolean isTempChat(java.lang.String peerUid) {
+        return peerUid != null && !peerUid.isEmpty() && sTempChatKnown.containsKey(peerUid);
+    }
+
     public static boolean isTempChatTop(java.lang.String peerUid) {
         if (peerUid == null || peerUid.isEmpty()) {
             return false;
