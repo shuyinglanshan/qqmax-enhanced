@@ -10,8 +10,8 @@ android {
         applicationId "com.tencent.qqlitepro"
         minSdk 21
         targetSdk 30
-        versionCode 8
-        versionName "1.2.1"
+        versionCode 10
+        versionName "1.2.3"
     }
 
     /*
