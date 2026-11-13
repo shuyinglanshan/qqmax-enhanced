@@ -311,126 +311,124 @@ public final class QzoneDynamicHook {
 
     private static void applyZanText(android.view.View itemView, String zanText) {
         /*
-         * 插入位置：直接挂在"卡片根"（itemView 本身）的最末尾。
-         * 之前找"最靠下的纵向容器"会插到内层小容器里，被布局裁掉或压在图片下方不可见。
+         * 独立一行，插在"点赞按钮"下方。
+         *
+         * 关键约束（踩过的坑）：
+         *  1. 不能替换 RecyclerView 的直接 child —— 会让 ViewHolder 与 child 映射失效，
+         *     直接抛 NPE（findMinMaxChildLayoutPositions on null ViewHolder）。
+         *  2. 卡片内部有高度被约束的容器，随便 addView 会被裁掉。
+         * 因此：在卡片内部的"纵向容器"里，紧跟点赞行之后插入，并强制 requestLayout。
          */
-        android.view.ViewGroup parent = null;
-        if (itemView instanceof android.view.ViewGroup) {
-            parent = (android.view.ViewGroup) itemView;
-            /* 若根是 FrameLayout（叠层），退到内部第一个纵向 LinearLayout */
-            if (!(parent instanceof android.widget.LinearLayout)) {
-                android.view.ViewGroup vp = findVerticalContainerIn(parent);
-                if (vp != null) {
-                    parent = vp;
+        try {
+            if (itemView == null) {
+                return;
+            }
+            /* 1) 找点赞行（含纯数字赞数的横向容器） */
+            android.view.View zanRow = findZanRow(itemView);
+            android.view.ViewGroup parent = null;
+            int insertIndex = -1;
+            if (zanRow != null && zanRow.getParent() instanceof android.view.ViewGroup) {
+                parent = (android.view.ViewGroup) zanRow.getParent();
+                insertIndex = parent.indexOfChild(zanRow) + 1;
+            }
+            if (parent == null) {
+                android.view.ViewGroup vc = (itemView instanceof android.view.ViewGroup)
+                        ? findVerticalContainerIn((android.view.ViewGroup) itemView) : null;
+                if (vc != null) {
+                    parent = vc;
+                } else if (itemView instanceof android.view.ViewGroup) {
+                    parent = (android.view.ViewGroup) itemView;
+                }
+                insertIndex = parent == null ? -1 : parent.getChildCount();
+            }
+            if (parent == null || insertIndex < 0) {
+                return;
+            }
+
+            /* 2) 复用或新建 */
+            android.widget.TextView line = null;
+            for (int i = 0; i < parent.getChildCount(); i++) {
+                android.view.View cv = parent.getChildAt(i);
+                if ("qqlite_zan_names".equals(cv.getTag())) {
+                    line = (android.widget.TextView) cv;
+                    break;
                 }
             }
-        }
-        if (parent == null) {
-            parent = findZanParent(itemView);
-        }
-        if (parent == null) {
-            return;
-        }
-        if (sZanProbe < 20) {
-            int pid = -1;
-            String pname = "?";
-            try {
-                pid = parent.getId();
-                pname = itemView.getContext().getResources().getResourceEntryName(pid);
-            } catch (Throwable ignored) {}
-            com.tencent.qqlitepro.util.Log.i("动态点赞诊断: 插入 parent="
-                    + parent.getClass().getSimpleName() + " id=" + pid + "/" + pname
-                    + " children=" + parent.getChildCount()
-                    + " itemViewH=" + itemView.getHeight()
-                    + " parentH=" + parent.getHeight());
-        }
-        android.widget.TextView exist = null;
-        for (int i = 0; i < parent.getChildCount(); i++) {
-            android.view.View cv = parent.getChildAt(i);
-            if ("qqlite_zan_names".equals(cv.getTag())) {
-                exist = (android.widget.TextView) cv;
-                break;
+            if (zanText == null || zanText.isEmpty()) {
+                if (line != null) {
+                    line.setVisibility(android.view.View.GONE);
+                }
+                return;
             }
-        }
-        if (zanText == null || zanText.isEmpty()) {
-            if (exist != null) {
-                exist.setVisibility(android.view.View.GONE);
+            if (line == null) {
+                line = new android.widget.TextView(itemView.getContext());
+                line.setTag("qqlite_zan_names");
+                line.setTextSize(11.5f);
+                line.setTextColor(-6643546);
+                line.setSingleLine(false);
+                line.setMaxLines(30);
+                line.setEllipsize(null);
+                line.setLineSpacing(0f, 1.2f);
+                int pad = (int) (itemView.getContext().getResources()
+                        .getDisplayMetrics().density * 10);
+                line.setPadding(pad, 2, pad, 8);
+                /* 用父容器自己的 LayoutParams 类型，避免类型不匹配被忽略 */
+                android.view.ViewGroup.LayoutParams lp = null;
+                try {
+                    java.lang.reflect.Method gm = android.view.ViewGroup.class
+                            .getDeclaredMethod("generateDefaultLayoutParams");
+                    gm.setAccessible(true);
+                    lp = (android.view.ViewGroup.LayoutParams) gm.invoke(parent);
+                } catch (Throwable ignored) {}
+                if (lp == null) {
+                    lp = new android.view.ViewGroup.LayoutParams(-1, -2);
+                }
+                lp.width = -1;
+                lp.height = -2;
+                parent.addView(line, Math.min(insertIndex, parent.getChildCount()), lp);
+            } else {
+                line.setVisibility(android.view.View.VISIBLE);
             }
-            return;
-        }
-        /*
-         * 首选：直接把点赞列表追加到"点赞数 TextView"（纯数字、字号小）后面。
-         * 这样一定在可视区域内，且不影响布局结构。
-         */
-        android.widget.TextView numTv = findZanCountTv(itemView);
-        if (numTv != null) {
-            String origin = String.valueOf(numTv.getText());
-            String base = origin;
-            int cut = origin.indexOf(" · ");
-            if (cut >= 0) {
-                base = origin.substring(0, cut);
-            }
-            final android.widget.TextView fNumTv = numTv;
-            final String fWant = base + " · " + zanText;
-            final String fBase = base;
-            fNumTv.setText(fWant);
-            /* 守护：宿主 onBind 会覆盖，绘制前再写回（只在当前文本等于"纯赞数"时覆盖） */
-            try {
-                fNumTv.setTag(-0x7f0e0001, fWant);
-                fNumTv.getViewTreeObserver().addOnPreDrawListener(
-                        new android.view.ViewTreeObserver.OnPreDrawListener() {
-                            @Override
-                            public boolean onPreDraw() {
-                                try {
-                                    String cur = String.valueOf(fNumTv.getText());
-                                    if (!cur.equals(fWant) && !cur.contains(" · ")) {
-                                        /* 仍是纯赞数（被宿主覆盖）→ 再写回 */
-                                        boolean digits = true;
-                                        for (int i = 0; i < cur.length(); i++) {
-                                            if (!Character.isDigit(cur.charAt(i))) {
-                                                digits = false;
-                                                break;
-                                            }
-                                        }
-                                        if (digits) {
-                                            fNumTv.setText(fWant);
-                                        }
-                                    }
-                                } catch (Throwable ignored) {}
-                                return true;
-                            }
-                        });
-            } catch (Throwable ignored) {}
+            line.setText("赞：" + zanText);
+
             if (sZanProbe < 20) {
-                com.tencent.qqlitepro.util.Log.i("动态点赞诊断: 已写入点赞数TextView ["
-                        + fWant + "]");
+                com.tencent.qqlitepro.util.Log.i("动态点赞诊断: 已插入独立一行 parent="
+                        + parent.getClass().getSimpleName()
+                        + " idx=" + insertIndex + "/" + parent.getChildCount()
+                        + " textLen=" + zanText.length());
             }
-            return;
+            try {
+                parent.requestLayout();
+                itemView.requestLayout();
+            } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            if (sZanErr++ < 5) {
+                com.tencent.qqlitepro.util.Log.w("动态点赞异常: " + t);
+            }
         }
-        android.content.Context ctx = itemView.getContext();
-        android.widget.TextView tv = exist;
-        if (tv == null) {
-            tv = new android.widget.TextView(ctx);
-            tv.setTag("qqlite_zan_names");
-            tv.setTextSize(11.5f);
-            tv.setTextColor(-6643546);
-            tv.setSingleLine(false);
-            tv.setMaxLines(30);
-            tv.setEllipsize(null);
-            tv.setLineSpacing(0f, 1.15f);
-            int pad = (int) (ctx.getResources().getDisplayMetrics().density * 8);
-            tv.setPadding(pad, 2, pad, 6);
-            /* 插在"点赞行"之后会落到卡片底部之外；改为插到 parent 的最前面，
-             * 保证一定在可视区域内（同时也方便先验证功能是否生效）。 */
-            parent.addView(tv, 0, new android.widget.LinearLayout.LayoutParams(-1, -2));
-        } else {
-            tv.setVisibility(android.view.View.VISIBLE);
+    }
+
+    /** 找"点赞行"：包含纯数字赞数 TextView 的最内层横向容器 */
+    private static android.view.View findZanRow(android.view.View root) {
+        java.util.ArrayList<android.view.View> all = new java.util.ArrayList<>();
+        collectAll(root, all, 0);
+        android.view.View best = null;
+        for (android.view.View v : all) {
+            if (!(v instanceof android.widget.TextView)) continue;
+            android.widget.TextView tv = (android.widget.TextView) v;
+            String txt = String.valueOf(tv.getText()).trim();
+            if (txt.isEmpty() || txt.length() > 4) continue;
+            boolean allDigit = true;
+            for (int i = 0; i < txt.length(); i++) {
+                if (!Character.isDigit(txt.charAt(i))) { allDigit = false; break; }
+            }
+            if (!allDigit) continue;
+            android.view.ViewParent p = tv.getParent();
+            if (p instanceof android.view.ViewGroup) {
+                best = (android.view.View) p;
+            }
         }
-        tv.setText("赞：" + zanText);
-        try {
-            parent.requestLayout();
-            itemView.requestLayout();
-        } catch (Throwable ignored) {}
+        return best;
     }
 
     /** 从 host 反查 RecyclerView，按可见位置粗略匹配 feed（匹配不到则返回第一个） */
