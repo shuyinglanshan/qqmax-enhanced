@@ -254,6 +254,76 @@ public final class Config {
         markDirtyAndPersist(context);
     }
 
+    /* ================= 多自定义后缀（每条独立白名单） =================
+     * 存储格式（每行一条规则）：
+     *   后缀文本 \t peerUid|chatType|昵称 \u001F peerUid|chatType|昵称 ...
+     * 空白名单 = 对所有会话生效
+     */
+    private static final java.lang.String KEY_SUFFIX_RULES = "catgirl_suffix_rules";
+
+    public static java.lang.String catgirlSuffixRules(android.content.Context context) {
+        try {
+            return context.getSharedPreferences(PREFS, 0).getString(KEY_SUFFIX_RULES, "");
+        } catch (java.lang.Throwable t) {
+            return "";
+        }
+    }
+
+    public static void setCatgirlSuffixRules(android.content.Context context, java.lang.String raw) {
+        try {
+            context.getSharedPreferences(PREFS, 0).edit()
+                    .putString(KEY_SUFFIX_RULES, raw == null ? "" : raw).apply();
+        } catch (java.lang.Throwable ignored) {
+        }
+    }
+
+    /** 解析后的规则：[后缀, 白名单(可为空)] */
+    public static java.util.List<java.lang.String[]> parseSuffixRules(android.content.Context context) {
+        java.util.ArrayList<java.lang.String[]> out = new java.util.ArrayList<>();
+        java.lang.String raw = catgirlSuffixRules(context);
+        if (raw == null || raw.isEmpty()) {
+            return out;
+        }
+        for (java.lang.String line : raw.split("\n")) {
+            if (line == null || line.trim().isEmpty()) {
+                continue;
+            }
+            int tab = line.indexOf('\t');
+            java.lang.String sfx;
+            java.lang.String peers;
+            if (tab < 0) {
+                sfx = line;
+                peers = "";
+            } else {
+                sfx = line.substring(0, tab);
+                peers = line.substring(tab + 1);
+            }
+            if (sfx == null || sfx.isEmpty()) {
+                continue;
+            }
+            out.add(new java.lang.String[]{sfx, peers});
+        }
+        return out;
+    }
+
+    /** peerUid 是否在给定白名单串里（空白名单 = 全部允许） */
+    public static boolean suffixPeerAllowed(java.lang.String peers, java.lang.String peerUid) {
+        if (peers == null || peers.trim().isEmpty()) {
+            return true;
+        }
+        if (peerUid == null) {
+            return false;
+        }
+        for (java.lang.String one : peers.split("\u001F")) {
+            if (one == null || one.trim().isEmpty()) continue;
+            java.lang.String[] parts = one.split("\\|", 3);
+            if (parts.length > 0 && peerUid.equals(parts[0].trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static boolean nativePickerEnabled(android.content.Context context) {
         if (!fastHit()) {
             reload(context);
