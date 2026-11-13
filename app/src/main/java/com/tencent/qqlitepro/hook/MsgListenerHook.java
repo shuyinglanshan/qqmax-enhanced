@@ -247,7 +247,11 @@ public final class MsgListenerHook {
                         sb.append(strFieldString);
                     }
                 }
-                com.tencent.qqlitepro.hook.MsgListenerHook.applyCatgirlSuffix(list, sb.toString());
+                /* 取本次发送的目标会话 peerUid（用于按白名单匹配多后缀规则） */
+                java.lang.String peerUidArg = com.tencent.qqlitepro.hook.MsgListenerHook
+                        .extractPeerUid(methodHookParam.args);
+                com.tencent.qqlitepro.hook.MsgListenerHook
+                        .applyCatgirlSuffix(list, sb.toString(), peerUidArg);
             } catch (java.lang.Throwable th) {
                 com.tencent.qqlitepro.util.Log.w("发送拦截处理异常: " + th);
             }
@@ -278,11 +282,71 @@ public final class MsgListenerHook {
 
     /* JADX INFO: Access modifiers changed from: private */
     public static void applyCatgirlSuffix(java.util.List<java.lang.Object> list, java.lang.String str) {
+        applyCatgirlSuffix(list, str, null);
+    }
+
+    /** 从发送参数里提取目标会话 peerUid */
+    public static java.lang.String extractPeerUid(java.lang.Object[] args) {
+        if (args == null) {
+            return null;
+        }
+        for (java.lang.Object a : args) {
+            if (a == null) {
+                continue;
+            }
+            String cn = a.getClass().getName();
+            if (!cn.contains("Contact") && !cn.contains("Peer")) {
+                continue;
+            }
+            try {
+                java.lang.Object uid = getFieldValue(a, "peerUid");
+                if (uid != null && !String.valueOf(uid).isEmpty()) {
+                    return String.valueOf(uid);
+                }
+            } catch (Throwable ignored) {}
+            try {
+                java.lang.Object chatType = getFieldValue(a, "chatType");
+                java.lang.Object peerUin = getFieldValue(a, "peerUin");
+                if (chatType != null && peerUin != null) {
+                    return String.valueOf(peerUin);
+                }
+            } catch (Throwable ignored) {}
+        }
+        return null;
+    }
+
+    /**
+     * 自定义后缀（支持多条规则，每条规则独立白名单）。
+     * 命中规则：白名单为空=全部会话；否则只有 peerUid 在白名单内才追加。
+     */
+    public static void applyCatgirlSuffix(java.util.List<java.lang.Object> list, java.lang.String str,
+                                         java.lang.String peerUid) {
         java.lang.String strCatgirlSuffix;
         java.lang.Object fieldValue;
         try {
             android.content.Context contextAppContext = appContext();
-            if (contextAppContext != null && com.tencent.qqlitepro.util.Config.catgirlEnabled(contextAppContext) && str != null && !str.isEmpty() && (strCatgirlSuffix = com.tencent.qqlitepro.util.Config.catgirlSuffix(contextAppContext)) != null && !strCatgirlSuffix.isEmpty()) {
+            if (contextAppContext == null
+                    || !com.tencent.qqlitepro.util.Config.catgirlEnabled(contextAppContext)
+                    || str == null || str.isEmpty()) {
+                return;
+            }
+            /* 1) 优先用多规则配置（按白名单匹配） */
+            java.util.List<java.lang.String[]> rules =
+                    com.tencent.qqlitepro.util.Config.parseSuffixRules(contextAppContext);
+            java.lang.StringBuilder sbSuffix = new java.lang.StringBuilder();
+            for (java.lang.String[] rule : rules) {
+                if (rule == null || rule.length < 2) continue;
+                if (com.tencent.qqlitepro.util.Config.suffixPeerAllowed(rule[1], peerUid)) {
+                    sbSuffix.append(rule[0]);
+                }
+            }
+            strCatgirlSuffix = sbSuffix.length() > 0
+                    ? sbSuffix.toString()
+                    : com.tencent.qqlitepro.util.Config.catgirlSuffix(contextAppContext);
+            if (strCatgirlSuffix == null || strCatgirlSuffix.isEmpty()) {
+                return;
+            }
+            if (true) {
                 java.lang.Object obj = null;
                 for (java.lang.Object obj2 : list) {
                     if (obj2 != null && (fieldValue = getFieldValue(obj2, "textElement")) != null) {
