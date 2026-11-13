@@ -4429,6 +4429,7 @@ public final class QqKernel {
         try {
             /* 登记目标 uid + 标记为 temp 菜单（与邮箱卡/正常会话完全隔离） */
             sMenuTargetUid = normPeerUid(peerUid);
+            /* 关键：这里必须用 temp 专用入口，绝不能走 showNativeMailMenu（它会把 kind 改成 mail） */
             com.tencent.qqlitepro.hook.ChatCardInjector.showTempKindMenu(context);
         } catch (java.lang.Throwable th) {
             com.tencent.qqlitepro.util.Log.w("临时会话: 弹出宿主菜单失败 " + chain(th));
