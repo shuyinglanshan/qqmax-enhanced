@@ -7045,14 +7045,21 @@ public final class QqKernel {
         java.util.ArrayList<java.lang.Object[]> out = new java.util.ArrayList<>();
         try {
             java.util.ArrayList<java.util.Map.Entry> list = new java.util.ArrayList<>(sTempChatKnown.entrySet());
+            /* 去重：同一 uid 只保留最新一条，避免卡片重复出现 */
+            java.util.HashSet<java.lang.String> seenUid = new java.util.HashSet<>();
             for (java.util.Map.Entry e : list) {
                 java.lang.String uid = (java.lang.String) e.getKey();
                 java.lang.Object[] v = (java.lang.Object[]) e.getValue();
                 if (uid == null || uid.isEmpty() || v == null) {
                     continue;
                 }
-                out.add(new java.lang.Object[]{uid, strOf(v[1]), previewOf(v),
-                        java.lang.Integer.valueOf(tempChatUnread(uid)), java.lang.Long.valueOf(longOf(v[2]))});
+                java.lang.String norm = uid.trim();
+                if (!seenUid.add(norm)) {
+                    continue;
+                }
+                out.add(new java.lang.Object[]{norm, strOf(v[1]), previewOf(v),
+                        java.lang.Integer.valueOf(tempChatUnread(norm)),
+                        java.lang.Long.valueOf(longOf(v[2]))});
             }
             out.sort(new java.util.Comparator<java.lang.Object[]>() {
                 @Override
