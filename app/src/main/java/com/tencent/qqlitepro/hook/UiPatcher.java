@@ -212,6 +212,7 @@ public final class UiPatcher {
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installOperationMoreHookDelayed(classLoader);
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installSelectItemClickHook(classLoader);
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installDialogShowHook();
+        com.tencent.qqlitepro.hook.QzoneDynamicHook.installTouchProbe();
         installMediaSaveDirHook(classLoader);
         installEditProfileSignatureHook(classLoader);
     }
