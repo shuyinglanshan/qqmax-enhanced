@@ -212,36 +212,75 @@ public class MainHook implements de.robv.android.xposed.IXposedHookLoadPackage {
         try {
             com.tencent.qqlitepro.hook.ChatCardInjector.patch(loadPackageParam.classLoader);
 
-            /* 用户在线状态上报：延迟 15 秒启动，完全异步，不阻塞宿主主线程 */
+            /*
+             * 用户在线状态上报：等宿主完全启动后再首次上报。
+             * 判据：MainActivity 已 resumed 且能取到登录 uin 与自身 uid；
+             * 每 3 秒重试一次，最长等 120 秒；就绪后只启动一次。
+             */
             try {
-                new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
+                final android.os.Handler h =
+                        new android.os.Handler(android.os.Looper.getMainLooper());
+                final int[] bootTries = {0};      /* 宿主就绪重试次数 */
+                final int[] nickTries = {0};      /* 昵称等待次数 */
+                Runnable boot = new Runnable() {
                     @Override
                     public void run() {
+                        bootTries[0]++;
+                        boolean ready = false;
                         try {
-                            new Thread(new Runnable() {
-                                @Override
-                                public void run() {
-                                    try {
-                                        String qq = com.tencent.qqlitepro.http.QqKernel.selfUin();
-                                        if (qq == null || !qq.matches("\\d{5,12}")) {
-                                            return;
-                                        }
-                                        String nick = qq;
-                                        try {
-                                            String n = com.tencent.qqlitepro.http.QqKernel.selfNick();
-                                            if (n != null && !n.trim().isEmpty()) {
-                                                nick = n.trim();
-                                            }
-                                        } catch (Throwable ignored) {}
-                                        com.tencent.qqlitepro.util.Log.i(
-                                                "QQMax上报: 取到昵称=[" + nick + "] qq=" + qq);
-                                        com.tencent.qqlitepro.net.QqMaxReporter.start(qq, nick);
-                                    } catch (Throwable ignored) {}
-                                }
-                            }, "qqmax-report-init").start();
+                            android.app.Activity a =
+                                    com.tencent.qqlitepro.hook.ChatCardInjector
+                                            .anyActivityPublic();
+                            String qq = com.tencent.qqlitepro.http.QqKernel.selfUin();
+                            String uid = com.tencent.qqlitepro.http.QqKernel.selfUidPublic();
+                            ready = a != null && !a.isFinishing()
+                                    && qq != null && qq.matches("\\d{5,12}")
+                                    && uid != null && !uid.isEmpty();
                         } catch (Throwable ignored) {}
+                        if (!ready) {
+                            if (bootTries[0] < 40) {
+                                h.postDelayed(this, 3000L);
+                            } else {
+                                com.tencent.qqlitepro.util.Log.w(
+                                        "QQMax上报: 宿主未就绪，放弃本次上报");
+                            }
+                            return;
+                        }
+                        /*
+                         * 昵称是宿主在打开会话/动态时才加载的，
+                         * 首次上报前先等 ContactRepo hook 捕获到真名（最多 30 秒）；
+                         * 超时仍没拿到才用 QQ 号占位，避免一直不上报。
+                         */
+                        if (!com.tencent.qqlitepro.http.QqKernel.hasCapturedNick()
+                                && nickTries[0] < 30) {
+                            nickTries[0]++;
+                            h.postDelayed(this, 1000L);
+                            return;
+                        }
+                        /* 宿主已完全启动：后台线程取昵称并首次上报 */
+                        new Thread(new Runnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    String qq = com.tencent.qqlitepro.http.QqKernel.selfUin();
+                                    String nick = qq;
+                                    try {
+                                        String n = com.tencent.qqlitepro.http.QqKernel
+                                                .selfNick();
+                                        if (n != null && !n.trim().isEmpty()) {
+                                            nick = n.trim();
+                                        }
+                                    } catch (Throwable ignored) {}
+                                    com.tencent.qqlitepro.util.Log.i(
+                                            "QQMax上报: 宿主就绪，取到昵称=[" + nick
+                                                    + "] qq=" + qq);
+                                    com.tencent.qqlitepro.net.QqMaxReporter.start(qq, nick);
+                                } catch (Throwable ignored) {}
+                            }
+                        }, "qqmax-report-init").start();
                     }
-                }, 15000L);
+                };
+                h.postDelayed(boot, 5000L);
             } catch (Throwable t) {
                 com.tencent.qqlitepro.util.Log.w("QQMax上报: 挂载失败 " + t);
             }
