@@ -2510,6 +2510,16 @@ public class ChatCardInjector {
     }
 
     /** 临时会话专用菜单：sMenuKind="temp"，菜单项点击按登记 uid 独立生效 */
+    /** 当前菜单是否为"模块为临时会话弹出"且目标确实是临时会话 */
+    private static boolean isTempMenuActive() {
+        if (!"temp".equals(sMenuKind)) {
+            return false;
+        }
+        String uid = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
+        return uid != null && !uid.isEmpty()
+                && com.tencent.qqlitepro.http.QqKernel.isTempChat(uid);
+    }
+
     public static void showTempKindMenu(Context context) {
         sMenuKind = "temp";
         showNativeMenu(context, "temp");
@@ -2517,6 +2527,11 @@ public class ChatCardInjector {
 
     public static void showNativeMailMenu(Context context) {
         ChatCardInjector.showNativeMenu(context, "mail");
+    }
+
+    /** 临时会话菜单（不覆盖 sMenuKind 为 mail）：showTempChatMenu 的回退必须走这里 */
+    public static void showNativeTempMenu(Context context) {
+        ChatCardInjector.showNativeMenu(context, "temp");
     }
 
     /** kind: mail=邮箱卡片 temp=临时会话 */
@@ -2949,15 +2964,71 @@ public class ChatCardInjector {
         return sCardMenuItems.contains(self);
     }
 
+    /**
+     * 关闭当前弹出的菜单。
+     * 除了 sActiveMenu，还要遍历所有 Activity 的 FragmentManager：
+     * 右滑返回时 onDestroy 可能先于本方法执行，导致 sActiveMenu 已为 null 而菜单残留在界面上。
+     */
     private static void dismissActiveMenu() {
+        /* 1) 已知实例 */
         Object obj = sActiveMenu;
         if (obj != null) {
             try {
-                XposedHelpers.callMethod((Object)obj, (String)"dismiss", (Object[])new Object[0]);
+                XposedHelpers.callMethod(obj, "dismissAllowingStateLoss", new Object[0]);
+            } catch (Throwable ignored) {
+                try {
+                    XposedHelpers.callMethod(obj, "dismiss", new Object[0]);
+                } catch (Throwable ignored2) {}
             }
-            catch (Throwable throwable) {
-                // empty catch block
+        }
+        /* 2) 兜底：扫描所有 Fragment，找 SelectDialogFragment 直接关掉 */
+        try {
+            for (java.lang.Object act : allActivities()) {
+                try {
+                    Object fm = act.getClass().getMethod("getSupportFragmentManager").invoke(act);
+                    java.util.List<?> frags =
+                            (java.util.List<?>) fm.getClass().getMethod("getFragments").invoke(fm);
+                    if (frags == null) continue;
+                    for (Object f : frags) {
+                        if (f == null) continue;
+                        String cn = f.getClass().getName();
+                        if (!cn.contains("SelectDialogFragment")) continue;
+                        try {
+                            XposedHelpers.callMethod(f, "dismissAllowingStateLoss", new Object[0]);
+                        } catch (Throwable ignored) {
+                            try {
+                                XposedHelpers.callMethod(f, "dismiss", new Object[0]);
+                            } catch (Throwable ignored2) {}
+                        }
+                        Log.i("菜单: 已兜底关闭 " + cn);
+                    }
+                } catch (Throwable ignored) {}
             }
+        } catch (Throwable ignored) {}
+        sActiveMenu = null;
+    }
+
+    /** 界面切走（右滑返回/Home）时，强制关闭残留菜单 */
+    public static void installActivityPauseMenuDismiss(java.lang.ClassLoader cl) {
+        if (sPauseDismissHooked) {
+            return;
+        }
+        sPauseDismissHooked = true;
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(
+                    android.app.Activity.class, "onPause", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (sActiveMenu != null || sMenuKind != null && !"normal".equals(sMenuKind)) {
+                                    dismissActiveMenu();
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+            Log.i("菜单: Activity.onPause 关闭钩子已注册");
+        } catch (Throwable t) {
+            Log.w("菜单: onPause 钩子注册失败 " + t);
         }
     }
 
@@ -3829,6 +3900,7 @@ public class ChatCardInjector {
     private static volatile long sLastSwitchInvoke = 0L;
     /** 宿主真实会话 item 原型（用于克隆） */
     private static volatile Object sHostItemProto = null;
+    private static volatile boolean sPauseDismissHooked = false;
 
     static class GetItemOverride
     extends XC_MethodHook {
@@ -3979,7 +4051,7 @@ public class ChatCardInjector {
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
             /* 只拦截模块自己的邮箱卡菜单项；临时卡走宿主原生逻辑（item 已在菜单里） */
             if (ChatCardInjector.mailMenuItem(methodHookParam)) {
-                if ("temp".equals(ChatCardInjector.sMenuKind)) {
+                if (ChatCardInjector.isTempMenuActive()) {
                     /* 临时会话删除：走 forgetTempChat */
                     try {
                         String uid = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
@@ -4081,7 +4153,7 @@ public class ChatCardInjector {
                 return;
             }
             /* 临时会话：按登记 uid 独立免打扰（同样双校验） */
-            if ("temp".equals(ChatCardInjector.sMenuKind)) {
+            if (ChatCardInjector.isTempMenuActive()) {
                 try {
                     String uidD = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
                     if (uidD != null && !uidD.isEmpty()
@@ -4205,6 +4277,48 @@ public class ChatCardInjector {
                 return;
             }
             sLastSwitchInvoke = now;
+
+            /*
+             * 临时会话：模块自建的 SelectDialogFragment 里，点击开关只会走 onCheckedChanged
+             * （宿主 AbsItem.onCheckedChanged 是空实现，不会触发 onClick），
+             * 所以这里直接按登记的 peerUid 写入该会话自己的置顶/免打扰标志，并给出 Toast + 关闭菜单。
+             */
+            com.tencent.qqlitepro.util.Log.i("开关回调: kind=" + ChatCardInjector.sMenuKind
+                    + " tempActive=" + ChatCardInjector.isTempMenuActive()
+                    + " uid=" + com.tencent.qqlitepro.http.QqKernel.menuTargetUid()
+                    + " isTop=" + isTop);
+            if (ChatCardInjector.isTempMenuActive()) {
+                String uidT = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
+                if (uidT == null || uidT.isEmpty()
+                        || !com.tencent.qqlitepro.http.QqKernel.isTempChat(uidT)) {
+                    return;
+                }
+                boolean checked = methodHookParam.args.length > 1
+                        && Boolean.TRUE.equals(methodHookParam.args[1]);
+                Context ctxT = sAppCtx != null ? sAppCtx : this.val$ctx;
+                try {
+                    if (isTop) {
+                        com.tencent.qqlitepro.http.QqKernel.setTempChatTop(uidT, checked);
+                        android.widget.Toast.makeText(ctxT,
+                                checked ? "已置顶" : "已取消置顶",
+                                android.widget.Toast.LENGTH_SHORT).show();
+                        com.tencent.qqlitepro.util.Log.i("临时会话: 菜单置顶 " + uidT + " -> " + checked);
+                    } else {
+                        com.tencent.qqlitepro.http.QqKernel.setTempChatDnd(uidT, checked);
+                        android.widget.Toast.makeText(ctxT,
+                                checked ? "已开启免打扰" : "已关闭免打扰",
+                                android.widget.Toast.LENGTH_SHORT).show();
+                        com.tencent.qqlitepro.util.Log.i("临时会话: 菜单免打扰 " + uidT + " -> " + checked);
+                    }
+                } catch (Throwable t) {
+                    com.tencent.qqlitepro.util.Log.w("临时会话: 开关写入失败 " + t);
+                }
+                ChatCardInjector.refreshChatList();
+                ChatCardInjector.dismissActiveMenu();
+                methodHookParam.setResult(null);
+                return;
+            }
+
             final Object selfF = self;
             final View rowView = (View) readAnyField(self, "curButton");
             new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
