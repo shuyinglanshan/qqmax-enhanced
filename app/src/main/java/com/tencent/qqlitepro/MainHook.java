@@ -103,6 +103,17 @@ public class MainHook implements de.robv.android.xposed.IXposedHookLoadPackage {
             com.tencent.qqlitepro.util.Log.v("跳过非目标包: " + loadPackageParam.packageName);
             return;
         }
+        /*
+         * 崩溃/异常日志：必须最先安装。
+         * 这样即使后面的 hook 出错导致宿主崩溃，也能留下现场。
+         * 完全异步、自带体积上限、不会二次崩溃。
+         */
+        try {
+            com.tencent.qqlitepro.util.CrashLog.install();
+            com.tencent.qqlitepro.util.CrashLog.breadcrumb(
+                    "模块开始注入 process=" + loadPackageParam.processName);
+        } catch (java.lang.Throwable ignored) {
+        }
         java.lang.String str = loadPackageParam.processName;
         if (str != null && str.endsWith(":MSF")) {
             try {
@@ -672,6 +683,7 @@ public class MainHook implements de.robv.android.xposed.IXposedHookLoadPackage {
     private void onGatePassed(de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam loadPackageParam) {
         sGroupPassed = true;
         com.tencent.qqlitepro.util.Log.i("官方群门禁通过：已加入官方群，立即注入全部功能");
+        com.tencent.qqlitepro.util.CrashLog.breadcrumb("官方群门禁通过，开始注入全部功能");
         /*
          * 「已加入官方群聊」提示受开关控制：
          * 用户加入群后通常不需要每次都弹这个提示，可在基础设置里关闭。
