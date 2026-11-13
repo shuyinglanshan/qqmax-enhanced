@@ -209,6 +209,7 @@ public final class UiPatcher {
         installGroupStatEntryHook(classLoader);
         installChatListFragmentHook(classLoader);
         installFeedZanListHook(classLoader);
+        com.tencent.qqlitepro.hook.ChatCardInjector.installBadgeUncapHook(classLoader);
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installOperationMoreHookDelayed(classLoader);
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installSelectItemClickHook(classLoader);
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installDialogShowHook();
