@@ -2882,11 +2882,38 @@ public final class SettingsInjector {
         editTextEdit.setSingleLine(true);
         linearLayout.addView(editTextEdit, inputLp());
 
-        /* ===== 多后缀规则（每条独立白名单） ===== */
-        final android.widget.LinearLayout ruleBox = new android.widget.LinearLayout(context);
-        ruleBox.setOrientation(1);
-        linearLayout.addView(ruleBox, rootLp());
-        rebuildSuffixRules(context, ruleBox, editTextEdit);
+        /* ===== 白名单（单个后缀，可选生效会话） ===== */
+        final android.widget.TextView tvPeerLabel = text(context,
+                suffixPeerLabelText(context), TITLE, 12.0f, 8388611);
+        android.widget.LinearLayout.LayoutParams lblLp =
+                new android.widget.LinearLayout.LayoutParams(-1, -2);
+        lblLp.topMargin = dp(context, 10.0f);
+        linearLayout.addView(tvPeerLabel, lblLp);
+
+        android.widget.TextView btnPeer = text(context, "选择生效会话（白名单）", TITLE, 13.0f, 17);
+        btnPeer.setPadding(dp(context, 12.0f), dp(context, 10.0f), dp(context, 12.0f), dp(context, 10.0f));
+        btnPeer.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override
+            public void onClick(android.view.View v) {
+                restoreReplySelection(com.tencent.qqlitepro.util.Config.catgirlPeers(context));
+                showSessionPicker(context, new Runnable() {
+                    @Override
+                    public void run() {
+                        String picked = collectSelectedPeers();
+                        com.tencent.qqlitepro.util.Config.setCatgirlPeers(context, picked);
+                        tvPeerLabel.setText(suffixPeerLabelText(context));
+                        toast(context, picked.isEmpty()
+                                ? "已清空白名单：全部会话生效"
+                                : "白名单已保存");
+                    }
+                });
+            }
+        });
+        android.widget.LinearLayout.LayoutParams btnLp =
+                new android.widget.LinearLayout.LayoutParams(-1, -2);
+        btnLp.topMargin = dp(context, 6.0f);
+        linearLayout.addView(btnPeer, btnLp);
+
         viewGroup.addView(linearLayout);
         makeGroupGap(viewGroup);
         android.view.View viewSaveButton = saveButton(context, "保存后缀", new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda83(editTextEdit, context));
@@ -2912,148 +2939,17 @@ public final class SettingsInjector {
         viewGroup.addView(switchRow(context, "QQ邮箱功能", "开启后主界面显示 QQ 邮箱会话卡片，关闭则不显示", com.tencent.qqlitepro.util.Config.mailEnabled(context), new com.tencent.qqlitepro.hook.SettingsInjector$$ExternalSyntheticLambda86(context)));
     }
 
-    /**
-     * 重建"多后缀规则"列表：每条规则一行（后缀文本 + 白名单会话数 + 选择/删除）。
-     * 白名单复用关键词回复的会话选择框（restoreReplySelection + sSelectedKeys）。
-     */
-    private static void rebuildSuffixRules(final android.content.Context context,
-                                           final android.widget.LinearLayout box,
-                                           final android.widget.EditText mainInput) {
-        box.removeAllViews();
-        final java.util.List<java.lang.String[]> rules =
-                com.tencent.qqlitepro.util.Config.parseSuffixRules(context);
-
-        box.addView(text(context, "多条后缀（每条可单独选白名单，空白名单=全部会话）",
-                TITLE, 13.0f, 8388611));
-
-        for (int i = 0; i < rules.size(); i++) {
-            final int idx = i;
-            final java.lang.String[] rule = rules.get(i);
-            android.widget.LinearLayout row = new android.widget.LinearLayout(context);
-            row.setOrientation(0);
-            row.setGravity(16);
-            row.setPadding(0, dp(context, 6.0f), 0, dp(context, 6.0f));
-
-            android.widget.EditText et = edit(context, rule[0], "后缀", 1);
-            et.setSingleLine(true);
-            row.addView(et, new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f));
-
-            int peerCount = 0;
-            if (rule[1] != null && !rule[1].trim().isEmpty()) {
-                for (java.lang.String one : rule[1].split("\u001F")) {
-                    if (one != null && !one.trim().isEmpty()) peerCount++;
-                }
-            }
-            android.widget.TextView tvCount = text(context,
-                    peerCount == 0 ? "全部" : (peerCount + " 个会话"), TITLE, 12.0f, 8388611);
-            android.widget.LinearLayout.LayoutParams cntLp =
-                    new android.widget.LinearLayout.LayoutParams(-2, -2);
-            cntLp.leftMargin = dp(context, 6.0f);
-            row.addView(tvCount, cntLp);
-
-            android.widget.TextView btnPick = text(context, "白名单", TITLE, 12.0f, 17);
-            btnPick.setPadding(dp(context, 8.0f), dp(context, 4.0f), dp(context, 8.0f), dp(context, 4.0f));
-            row.addView(btnPick);
-
-            android.widget.TextView btnDel = text(context, "删除", TITLE, 12.0f, 17);
-            btnDel.setPadding(dp(context, 8.0f), dp(context, 4.0f), dp(context, 8.0f), dp(context, 4.0f));
-            row.addView(btnDel);
-
-            /* 编辑后缀文本即时保存 */
-            et.setOnFocusChangeListener(new android.view.View.OnFocusChangeListener() {
-                @Override
-                public void onFocusChange(android.view.View v, boolean hasFocus) {
-                    if (!hasFocus) {
-                        saveSuffixRules(context, box, mainInput);
-                    }
-                }
-            });
-            /* 选中白名单会话 */
-            btnPick.setOnClickListener(new android.view.View.OnClickListener() {
-                @Override
-                public void onClick(android.view.View v) {
-                    saveSuffixRules(context, box, mainInput);
-                    restoreReplySelection(rule[1]);
-                    showSessionPicker(context, new Runnable() {
-                        @Override
-                        public void run() {
-                            java.lang.String picked = collectSelectedPeers();
-                            java.util.List<java.lang.String[]> cur =
-                                    com.tencent.qqlitepro.util.Config.parseSuffixRules(context);
-                            if (idx < cur.size()) {
-                                cur.set(idx, new java.lang.String[]{cur.get(idx)[0], picked});
-                                persistSuffixRules(context, cur);
-                            }
-                            rebuildSuffixRules(context, box, mainInput);
-                            toast(context, "白名单已更新");
-                        }
-                    });
-                }
-            });
-            btnDel.setOnClickListener(new android.view.View.OnClickListener() {
-                @Override
-                public void onClick(android.view.View v) {
-                    java.util.List<java.lang.String[]> cur =
-                            com.tencent.qqlitepro.util.Config.parseSuffixRules(context);
-                    if (idx < cur.size()) {
-                        cur.remove(idx);
-                        persistSuffixRules(context, cur);
-                    }
-                    rebuildSuffixRules(context, box, mainInput);
-                }
-            });
-
-            box.addView(row);
+    /** 白名单提示文案 */
+    private static java.lang.String suffixPeerLabelText(android.content.Context context) {
+        java.lang.String peers = com.tencent.qqlitepro.util.Config.catgirlPeers(context);
+        if (peers == null || peers.trim().isEmpty()) {
+            return "生效范围：全部会话";
         }
-
-        android.widget.TextView btnAdd = text(context, "＋ 添加一条后缀", TITLE, 14.0f, 17);
-        btnAdd.setPadding(dp(context, 12.0f), dp(context, 10.0f), dp(context, 12.0f), dp(context, 10.0f));
-        btnAdd.setOnClickListener(new android.view.View.OnClickListener() {
-            @Override
-            public void onClick(android.view.View v) {
-                saveSuffixRules(context, box, mainInput);
-                java.util.List<java.lang.String[]> cur =
-                        com.tencent.qqlitepro.util.Config.parseSuffixRules(context);
-                cur.add(new java.lang.String[]{"喵~", ""});
-                persistSuffixRules(context, cur);
-                rebuildSuffixRules(context, box, mainInput);
-                toast(context, "已添加，可点“白名单”选择生效会话");
-            }
-        });
-        box.addView(btnAdd);
-    }
-
-    /** 把当前编辑框内容写回规则列表 */
-    private static void saveSuffixRules(android.content.Context context,
-                                        android.widget.LinearLayout box,
-                                        android.widget.EditText mainInput) {
-        java.util.List<java.lang.String[]> cur = com.tencent.qqlitepro.util.Config.parseSuffixRules(context);
-        int editCount = 0;
-        for (int i = 0; i < box.getChildCount(); i++) {
-            android.view.View c = box.getChildAt(i);
-            if (!(c instanceof android.widget.LinearLayout)) continue;
-            android.widget.LinearLayout row = (android.widget.LinearLayout) c;
-            if (row.getChildCount() < 4) continue;
-            android.view.View first = row.getChildAt(0);
-            if (!(first instanceof android.widget.EditText)) continue;
-            String txt = ((android.widget.EditText) first).getText().toString().trim();
-            if (editCount < cur.size()) {
-                cur.set(editCount, new java.lang.String[]{txt, cur.get(editCount)[1]});
-            }
-            editCount++;
+        int n = 0;
+        for (String one : peers.split("\u001F")) {
+            if (one != null && !one.trim().isEmpty()) n++;
         }
-        persistSuffixRules(context, cur);
-    }
-
-    private static void persistSuffixRules(android.content.Context context,
-                                           java.util.List<java.lang.String[]> rules) {
-        StringBuilder sb = new StringBuilder();
-        for (java.lang.String[] r : rules) {
-            if (r == null || r.length < 2) continue;
-            if (r[0] == null || r[0].isEmpty()) continue;
-            sb.append(r[0]).append('\t').append(r[1] == null ? "" : r[1]).append('\n');
-        }
-        com.tencent.qqlitepro.util.Config.setCatgirlSuffixRules(context, sb.toString());
+        return "生效范围：" + n + " 个会话（白名单）";
     }
 
     /** 把当前选中的会话拼成白名单串（uid|chatType|昵称，用 \u001F 分隔） */
