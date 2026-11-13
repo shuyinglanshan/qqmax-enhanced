@@ -1171,6 +1171,8 @@ public final class QqKernel {
     public static java.lang.String selfNick() {
         try {
             java.lang.String uin = selfUin();
+            com.tencent.qqlitepro.util.Log.i("selfNick: 进入, uin=" + uin
+                    + " uid=" + selfUidOrUin());
             if (uin == null || uin.isEmpty()) {
                 return "";
             }
@@ -1196,13 +1198,114 @@ public final class QqKernel {
                 }
             } catch (java.lang.Throwable ignored) {
             }
+            com.tencent.qqlitepro.util.Log.i("selfNick: 路径1(联系人服务)未命中，尝试路径2");
             /* 2) 自身资料缓存 */
             try {
                 Object self = sSelfProfile;
                 if (self != null) {
-                    Object v = fieldValue(self, "nick");
-                    if (v != null && !java.lang.String.valueOf(v).trim().isEmpty()) {
-                        return java.lang.String.valueOf(v).trim();
+                    Object v = firstField(self, "nick", "nickName", "name", "remark");
+                    if (v != null && !String.valueOf(v).trim().isEmpty()) {
+                        return String.valueOf(v).trim();
+                    }
+                }
+            } catch (java.lang.Throwable ignored) {
+            }
+            /* 2.5) 内核 ProfileService（宿主自身资料的真实来源：profile.coreInfo.nick） */
+            try {
+                Object ps = profileService();
+                com.tencent.qqlitepro.util.Log.i("selfNick: profileService="
+                        + (ps == null ? "null" : ps.getClass().getName()));
+                if (ps != null) {
+                    for (java.lang.reflect.Method m : ps.getClass().getMethods()) {
+                        String mn = m.getName();
+                        if (!(mn.contains("Profile") || mn.contains("Self")
+                                || mn.contains("CoreInfo") || mn.contains("SimpleInfo"))) {
+                            continue;
+                        }
+                        Class<?>[] ps2 = m.getParameterTypes();
+                        Object r = null;
+                        try {
+                            m.setAccessible(true);
+                            if (ps2.length == 0) {
+                                r = m.invoke(ps);
+                            } else if (ps2.length == 1 && ps2[0] == String.class) {
+                                /* 关键：getCoreInfo(uid) 必须传 uid（u_xxx），不是 uin */
+                                String uid = selfUidOrUin();
+                                if (!uid.isEmpty()) {
+                                    r = m.invoke(ps, uid);
+                                }
+                                /* uid 拿不到结果时再用 uin 试一次 */
+                                if (r == null) {
+                                    String uin2 = selfUin();
+                                    if (uin2 != null && !uin2.isEmpty()
+                                            && !uin2.equals(uid)) {
+                                        r = m.invoke(ps, uin2);
+                                    }
+                                }
+                            } else if (ps2.length == 2 && ps2[0] == String.class
+                                    && ps2[1] == Boolean.TYPE) {
+                                r = m.invoke(ps, selfUidOrUin(), Boolean.TRUE);
+                            }
+                        } catch (java.lang.Throwable ignored) {
+                            continue;
+                        }
+                        com.tencent.qqlitepro.util.Log.i("selfNick: try " + mn
+                                + " -> " + (r == null ? "null" : r.getClass().getSimpleName()));
+                        if (r == null) continue;
+                        Object nickObj = digNick(r);
+                        if (nickObj != null) {
+                            String nv = String.valueOf(nickObj).trim();
+                            if (!nv.isEmpty() && !nv.equals(uin)) {
+                                return nv;
+                            }
+                        }
+                    }
+                }
+            } catch (java.lang.Throwable ignored) {
+            }
+            /* 3) 宿主自身资料接口（不同版本方法名/字段名不同，逐个尝试） */
+            for (String api : new String[]{
+                    "com.tencent.qqnt.watch.contact.api.IContactRuntimeService",
+                    "com.tencent.qqnt.contact.api.IContactService",
+                    "com.tencent.mobileqq.app.QQAppInterface"}) {
+                try {
+                    Object svc = qrouteApi(api);
+                    if (svc == null) continue;
+                    for (java.lang.reflect.Method m : svc.getClass().getMethods()) {
+                        String mn = m.getName();
+                        if (!(mn.contains("Self") || mn.contains("Profile")
+                                || mn.contains("Account") || mn.contains("UserInfo"))) {
+                            continue;
+                        }
+                        if (m.getParameterTypes().length != 0) continue;
+                        try {
+                            m.setAccessible(true);
+                            Object r = m.invoke(svc);
+                            if (r == null) continue;
+                            Object v = firstField(r, "nick", "nickName", "name",
+                                    "selfNick", "displayName");
+                            if (v != null && !String.valueOf(v).trim().isEmpty()) {
+                                String nv = String.valueOf(v).trim();
+                                /* 排除把 uin 当昵称返回的情况 */
+                                if (!nv.equals(uin)) {
+                                    return nv;
+                                }
+                            }
+                        } catch (java.lang.Throwable ignored) {
+                        }
+                    }
+                } catch (java.lang.Throwable ignored) {
+                }
+            }
+            /* 4) 本地缓存的会话/联系人里找自己 */
+            try {
+                for (Object[] one : tempChatSnapshot()) {
+                    if (one == null) continue;
+                    if (uin.equals(String.valueOf(one[1]))) {
+                        String nm = String.valueOf(one[1]);
+                        if (!nm.equals(uin) && !nm.isEmpty()) {
+                            return nm;
+                        }
                     }
                 }
             } catch (java.lang.Throwable ignored) {
@@ -6860,6 +6963,51 @@ public final class QqKernel {
         return null;
     }
 
+    /** 自身 uid（u_xxx）；取不到时退回 uin */
+    private static String selfUidOrUin() {
+        try {
+            String[] arr = selfUidUin();
+            if (arr != null) {
+                if (arr[0] != null && !arr[0].isEmpty()) {
+                    return arr[0];
+                }
+                if (arr[1] != null && !arr[1].isEmpty()) {
+                    return arr[1];
+                }
+            }
+        } catch (Throwable ignored) {}
+        return "";
+    }
+
+    /** 在 profile 对象里逐层找昵称（coreInfo.nick / nick / nickName ...） */
+    private static Object digNick(Object root) {
+        if (root == null) {
+            return null;
+        }
+        try {
+            for (String f : new String[]{"nick", "nickName", "remark", "name"}) {
+                Object v = fieldValue(root, f);
+                if (v != null && !String.valueOf(v).trim().isEmpty()) {
+                    return v;
+                }
+            }
+            /* 常见容器：coreInfo / coreInfoBuddy / simpleInfo */
+            for (String f : new String[]{"coreInfo", "coreInfoBuddy", "simpleInfo",
+                    "profile", "baseInfo"}) {
+                Object v = fieldValue(root, f);
+                if (v == null || v == root) {
+                    continue;
+                }
+                Object n = digNick(v);
+                if (n != null) {
+                    return n;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     /** 今天 0 点向前推 offsetDays 天的 0 点（毫秒） */
     private static long beginOfDayOffset(int offsetDays) {
         java.util.Calendar c = java.util.Calendar.getInstance();
@@ -6875,9 +7023,16 @@ public final class QqKernel {
     private static final java.util.concurrent.ConcurrentHashMap<String, Long> sUidUinCache =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** uid->uin 缓存上限，防止超大群统计后常驻内存 */
+    private static final int UID_UIN_CACHE_MAX = 5000;
+
     public static void cacheUidUin(String uid, long uin) {
         try {
             if (uid != null && !uid.isEmpty() && uin > 10000L) {
+                if (sUidUinCache.size() >= UID_UIN_CACHE_MAX) {
+                    /* 满了直接清空：这是纯优化缓存，丢了下轮会重新填 */
+                    sUidUinCache.clear();
+                }
                 sUidUinCache.put(uid.trim(), Long.valueOf(uin));
             }
         } catch (Throwable ignored) {}
