@@ -1173,6 +1173,11 @@ public final class QqKernel {
             java.lang.String uin = selfUin();
             com.tencent.qqlitepro.util.Log.i("selfNick: 进入, uin=" + uin
                     + " uid=" + selfUidOrUin());
+            /* 0) 已由 ContactRepo hook 捕获到的真名（最可靠） */
+            String cap = sCapturedNick;
+            if (cap != null && !cap.isEmpty()) {
+                return cap;
+            }
             if (uin == null || uin.isEmpty()) {
                 return "";
             }
@@ -1317,6 +1322,64 @@ public final class QqKernel {
     }
 
     private static volatile Object sSelfProfile = null;
+
+    /** 由 hook 写入自身资料对象（ContactRepo.a 里读到的 coreInfo） */
+    /** 由 ContactRepo hook 捕获到的真实昵称（空=尚未捕获） */
+    private static volatile String sCapturedNick = null;
+
+    public static java.lang.String capturedNick() {
+        return sCapturedNick;
+    }
+
+    public static boolean hasCapturedNick() {
+        String n = sCapturedNick;
+        return n != null && !n.isEmpty();
+    }
+
+    public static void setSelfProfile(Object profile) {
+        try {
+            if (profile != null) {
+                sSelfProfile = profile;
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * 从 UserSimpleInfo / ProfileInfo 里取昵称并缓存。
+     * 宿主 ContactRepo.a(UserSimpleInfo) 会读 profile.coreInfo.nick，
+     * 我们 hook 它，顺便把自身资料存下来（这也是唯一真正持有昵称的地方）。
+     */
+    public static java.lang.String extractNickFromSimpleInfo(Object info) {
+        if (info == null) {
+            return "";
+        }
+        try {
+            String selfUin = selfUin();
+            String selfUid = selfUidPublic();
+            /* 判断是否是"自己"：uid 或 uin 匹配 */
+            String uid = safeStr(fieldValue(info, "uid"));
+            String uin = safeStr(fieldValue(info, "uin"));
+            boolean isSelf = (selfUid != null && !selfUid.isEmpty() && selfUid.equals(uid))
+                    || (selfUin != null && !selfUin.isEmpty() && selfUin.equals(uin));
+            if (!isSelf) {
+                return "";
+            }
+            Object nick = digNick(info);
+            if (nick != null) {
+                String nv = String.valueOf(nick).trim();
+                if (!nv.isEmpty() && !nv.equals(selfUin)) {
+                    sCapturedNick = nv;
+                    setSelfProfile(info);
+                    return nv;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return "";
+    }
+
+    private static String safeStr(Object o) {
+        return o == null ? "" : String.valueOf(o);
+    }
 
     public static java.lang.String selfUin() {
         return selfUidUin()[1];
@@ -6961,6 +7024,17 @@ public final class QqKernel {
             }
         } catch (Throwable ignored) {}
         return null;
+    }
+
+    /** 对外暴露自身 uid（u_xxx） */
+    public static java.lang.String selfUidPublic() {
+        try {
+            String[] arr = selfUidUin();
+            if (arr != null && arr[0] != null) {
+                return arr[0];
+            }
+        } catch (Throwable ignored) {}
+        return "";
     }
 
     /** 自身 uid（u_xxx）；取不到时退回 uin */
