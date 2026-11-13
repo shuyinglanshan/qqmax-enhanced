@@ -30,12 +30,13 @@ import java.util.concurrent.TimeUnit;
 public final class QqMaxReporter {
 
     private static final String BASE = "https://qm.xtctoolkit.top/qqmax/api";
-    /** 上报密钥（部署方 .env 中的 QQMAX_REPORT_KEY） */
-    private static final String REPORT_KEY = "3b8b8a91";
+    /** 上报密钥（服务端 .env 的 QQMAX_REPORT_KEY，客户端与之一致即可通过鉴权） */
+    private static final String REPORT_KEY =
+            "bab516299be0e575f710845598eb811c553ffa61441937b4";
 
     private static final long HEARTBEAT_INTERVAL_SEC = 60L;
-    private static final int CONNECT_TIMEOUT_MS = 8000;
-    private static final int READ_TIMEOUT_MS = 8000;
+    private static final int CONNECT_TIMEOUT_MS = 10000;
+    private static final int READ_TIMEOUT_MS = 10000;
 
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final char[] NONCE_ALPHABET =
@@ -133,13 +134,29 @@ public final class QqMaxReporter {
         }
     }
 
-    private static void doReport() {
+    /** 客户端版本号：从 BuildConfig 读取，绝不写死 */
+    private static String clientVersion() {
+        try {
+            return com.tencent.qqlitepro.BuildConfig.VERSION_NAME;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static boolean doReport() {
         String qq = sQq;
         if (qq == null) {
-            return;
+            return false;
         }
-        String body = "{\"qq\":\"" + qq + "\",\"nickname\":\"" + escapeJson(sNickname) + "\"}";
-        post("/users/report", body);
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"qq\":\"").append(qq)
+                .append("\",\"nickname\":\"").append(escapeJson(sNickname)).append("\"");
+        String v = clientVersion();
+        if (v != null && v.matches("[0-9]+(\\.[0-9]+)*")) {
+            sb.append(",\"version\":\"").append(v).append("\"");
+        }
+        sb.append("}");
+        return post("/users/report", sb.toString());
     }
 
     private static void doHeartbeat() {
@@ -147,25 +164,52 @@ public final class QqMaxReporter {
         if (qq == null) {
             return;
         }
-        String body = "{\"qq\":\"" + qq + "\"}";
-        post("/users/heartbeat", body);
+        /* 文档要求：心跳前必须先成功 report 过，否则 404 USER_NOT_FOUND */
+        if (!sUserKnown) {
+            if (!doReport()) {
+                return;   /* 建档失败，等下一轮心跳再试 */
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"qq\":\"").append(qq).append("\"");
+        String v = clientVersion();
+        if (v != null && v.matches("[0-9]+(\\.[0-9]+)*")) {
+            sb.append(",\"version\":\"").append(v).append("\"");
+        }
+        sb.append("}");
+        post("/users/heartbeat", sb.toString());
     }
 
-    /** 统一 POST：带 key / ts / 一次性 nonce，失败静默 */
-    private static void post(String path, String body) {
+    /** 本地时钟与服务器的偏差（毫秒），TS_INVALID 时按响应 Date 校准 */
+    private static volatile long sClockOffsetMs = 0L;
+    /** 服务端是否已确认存在该用户（心跳 404 时置 false，触发重新 report） */
+    private static volatile boolean sUserKnown = false;
+
+    /**
+     * 统一 POST：带 3 个鉴权头（key / 毫秒时间戳 / 一次性 nonce），失败静默。
+     * 返回 true 表示 2xx。
+     */
+    private static boolean post(String path, String body) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE + path);
+            /* 关键：禁止自动重定向——HttpURLConnection 跨协议重定向时会
+             * 丢弃全部自定义请求头（X-QQMax-Key 等），导致 401 UNAUTHORIZED */
             conn = (HttpURLConnection) url.openConnection();
+            conn.setInstanceFollowRedirects(false);
             conn.setRequestMethod("POST");
             conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(READ_TIMEOUT_MS);
             conn.setDoOutput(true);
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            /* X-QQMax-Key: 固定上报密钥，与服务端 .env 一致 */
             conn.setRequestProperty("X-QQMax-Key", REPORT_KEY);
-            conn.setRequestProperty("X-QQMax-Ts", String.valueOf(System.currentTimeMillis()));
+            /* X-QQMax-Ts: 毫秒时间戳（+本地校准偏差），与服务端偏差需在 ±5 分钟内 */
+            conn.setRequestProperty("X-QQMax-Ts",
+                    String.valueOf(System.currentTimeMillis() + sClockOffsetMs));
+            /* X-QQMax-Nonce: 每次现场生成，绝不复用（复用会被判 409 REPLAY） */
             conn.setRequestProperty("X-QQMax-Nonce", newNonce());
-            conn.setRequestProperty("User-Agent", "QQMax-Enhanced");
+            conn.setRequestProperty("User-Agent", "QQMax-Enhanced/" + safeVersion());
 
             OutputStream os = conn.getOutputStream();
             os.write(body.getBytes("UTF-8"));
@@ -173,12 +217,86 @@ public final class QqMaxReporter {
             os.close();
 
             int code = conn.getResponseCode();
-            if (code != 200 && code != 404) {
-                com.tencent.qqlitepro.util.Log.w("QQMax上报: " + path + " -> HTTP " + code);
+            if (code >= 300 && code < 400) {
+                /* 理论上不该出现（BASE 已是 https）；若出现则记录便于排查 */
+                com.tencent.qqlitepro.util.Log.w("QQMax上报: " + path
+                        + " 被重定向 " + code + " -> " + conn.getHeaderField("Location"));
+                return false;
             }
+            String resp = code >= 400 ? readStream(conn.getErrorStream()) : "";
+            if (code >= 200 && code < 300) {
+                if (path.endsWith("/report")) {
+                    sUserKnown = true;
+                }
+                return true;
+            }
+            /* ---- 按文档错误码处理 ---- */
+            if (code == 404 && resp.contains("USER_NOT_FOUND")) {
+                /* 心跳时用户不存在：先 report 建档，下一轮心跳即可 */
+                sUserKnown = false;
+                runAsync(new Runnable() {
+                    @Override
+                    public void run() {
+                        doReport();
+                    }
+                });
+                return false;
+            }
+            if (code == 400 && resp.contains("TS_INVALID")) {
+                /* 时钟超窗：用响应头 Date 校准本地偏差后重试一次 */
+                long serverMs = parseDateHeader(conn);
+                if (serverMs > 0) {
+                    sClockOffsetMs = serverMs - System.currentTimeMillis();
+                    com.tencent.qqlitepro.util.Log.i(
+                            "QQMax上报: 时钟已校准 offset=" + sClockOffsetMs + "ms");
+                    runAsync(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (path.endsWith("/report")) {
+                                doReport();
+                            } else {
+                                doHeartbeat();
+                            }
+                        }
+                    });
+                }
+                return false;
+            }
+            if (code == 409 && resp.contains("REPLAY")) {
+                /* nonce 意外重复：换新 nonce 立即重试一次 */
+                runAsync(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            Thread.sleep(50L);
+                        } catch (Throwable ignored) {
+                        }
+                        if (path.endsWith("/report")) {
+                            doReport();
+                        } else {
+                            doHeartbeat();
+                        }
+                    }
+                });
+                return false;
+            }
+            if (code == 429) {
+                /* 限流：退避 60 秒（由心跳节奏自然消化，这里只记日志） */
+                com.tencent.qqlitepro.util.Log.w("QQMax上报: " + path + " 限流(429)，等待下轮");
+                return false;
+            }
+            if (code == 401 || code == 400 || code == 503) {
+                /* 配置/数据问题：不要自动重试 */
+                com.tencent.qqlitepro.util.Log.w("QQMax上报: " + path
+                        + " HTTP " + code + " " + abbreviate(resp, 120));
+                return false;
+            }
+            com.tencent.qqlitepro.util.Log.w("QQMax上报: " + path + " -> HTTP " + code);
+            return false;
         } catch (Throwable t) {
             /* 网络异常完全静默，绝不能影响宿主 */
             com.tencent.qqlitepro.util.Log.w("QQMax上报: " + path + " 失败 " + t);
+            return false;
         } finally {
             if (conn != null) {
                 try {
@@ -187,6 +305,53 @@ public final class QqMaxReporter {
                 }
             }
         }
+    }
+
+    private static String safeVersion() {
+        try {
+            String v = clientVersion();
+            return v == null ? "?" : v;
+        } catch (Throwable ignored) {
+            return "?";
+        }
+    }
+
+    private static long parseDateHeader(HttpURLConnection conn) {
+        try {
+            long d = conn.getDate();
+            return d;
+        } catch (Throwable ignored) {
+            return -1L;
+        }
+    }
+
+    private static String readStream(java.io.InputStream is) {
+        if (is == null) {
+            return "";
+        }
+        try {
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[1024];
+            int n;
+            while ((n = is.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+                if (bos.size() > 16384) {
+                    break;
+                }
+            }
+            is.close();
+            return new String(bos.toByteArray(), "UTF-8");
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static String abbreviate(String s, int max) {
+        if (s == null) {
+            return "";
+        }
+        String one = s.replace('\n', ' ').trim();
+        return one.length() > max ? one.substring(0, max) + "…" : one;
     }
 
     /** 16-64 位、[A-Za-z0-9_-]、每次都是新的 */
