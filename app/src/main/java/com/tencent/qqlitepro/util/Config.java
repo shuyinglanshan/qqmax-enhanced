@@ -254,6 +254,44 @@ public final class Config {
         markDirtyAndPersist(context);
     }
 
+    /* ---- 自定义后缀白名单（空白名单 = 全部会话生效） ---- */
+    private static final java.lang.String KEY_CATGIRL_PEERS = "catgirl_peers";
+
+    public static java.lang.String catgirlPeers(android.content.Context context) {
+        try {
+            return context.getSharedPreferences(PREFS, 0).getString(KEY_CATGIRL_PEERS, "");
+        } catch (java.lang.Throwable t) {
+            return "";
+        }
+    }
+
+    public static void setCatgirlPeers(android.content.Context context, java.lang.String raw) {
+        try {
+            context.getSharedPreferences(PREFS, 0).edit()
+                    .putString(KEY_CATGIRL_PEERS, raw == null ? "" : raw).apply();
+        } catch (java.lang.Throwable ignored) {
+        }
+    }
+
+    /** 给定 peerUid 是否允许追加后缀（空白名单=允许） */
+    public static boolean catgirlPeerAllowed(android.content.Context context, java.lang.String peerUid) {
+        java.lang.String peers = catgirlPeers(context);
+        if (peers == null || peers.trim().isEmpty()) {
+            return true;
+        }
+        if (peerUid == null) {
+            return false;
+        }
+        for (java.lang.String one : peers.split("\u001F")) {
+            if (one == null || one.trim().isEmpty()) continue;
+            java.lang.String[] parts = one.split("\\|", 3);
+            if (parts.length > 0 && peerUid.equals(parts[0].trim())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /* ================= 多自定义后缀（每条独立白名单） =================
      * 存储格式（每行一条规则）：
      *   后缀文本 \t peerUid|chatType|昵称 \u001F peerUid|chatType|昵称 ...
