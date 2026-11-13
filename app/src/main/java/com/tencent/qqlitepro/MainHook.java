@@ -211,6 +211,40 @@ public class MainHook implements de.robv.android.xposed.IXposedHookLoadPackage {
         }
         try {
             com.tencent.qqlitepro.hook.ChatCardInjector.patch(loadPackageParam.classLoader);
+
+            /* 用户在线状态上报：延迟 15 秒启动，完全异步，不阻塞宿主主线程 */
+            try {
+                new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            new Thread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        String qq = com.tencent.qqlitepro.http.QqKernel.selfUin();
+                                        if (qq == null || !qq.matches("\\d{5,12}")) {
+                                            return;
+                                        }
+                                        String nick = qq;
+                                        try {
+                                            String n = com.tencent.qqlitepro.http.QqKernel.selfNick();
+                                            if (n != null && !n.trim().isEmpty()) {
+                                                nick = n.trim();
+                                            }
+                                        } catch (Throwable ignored) {}
+                                        com.tencent.qqlitepro.util.Log.i(
+                                                "QQMax上报: 取到昵称=[" + nick + "] qq=" + qq);
+                                        com.tencent.qqlitepro.net.QqMaxReporter.start(qq, nick);
+                                    } catch (Throwable ignored) {}
+                                }
+                            }, "qqmax-report-init").start();
+                        } catch (Throwable ignored) {}
+                    }
+                }, 15000L);
+            } catch (Throwable t) {
+                com.tencent.qqlitepro.util.Log.w("QQMax上报: 挂载失败 " + t);
+            }
             com.tencent.qqlitepro.hook.ChatCardInjector.installActivityPauseMenuDismiss(
                     loadPackageParam.classLoader);
         } catch (java.lang.Throwable th16) {
