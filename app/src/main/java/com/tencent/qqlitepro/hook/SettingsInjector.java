@@ -210,6 +210,9 @@ public final class SettingsInjector {
             rankBox.setOrientation(1);
             root.addView(rankBox, withTop(context, 6.0f));
 
+            final java.util.List<String[]> fRankData = new java.util.ArrayList<String[]>();
+            final int[] fTotal = new int[]{0};
+            final int[] fDaysArr = new int[]{7};
             final android.content.Context fCtx = context;
             // 统计按钮
             android.view.View statBtn = saveButton(context, "开始统计", new Runnable() {
@@ -222,12 +225,46 @@ public final class SettingsInjector {
                         } catch (Throwable ignored) {}
                         final int fDays = Math.max(1, Math.min(30, days));
                         com.tencent.qqlitepro.util.Config.setGroupStatDays(fCtx, fDays);
-                        resultView.setText("统计中…");
+                        /* 需求：每次点击开始统计后，先清除已显示的结果 */
+                        rankBox.removeAllViews();
+                        resultView.setText("统计中… 0 条");
                         new Thread(new Runnable() {
                             @Override
                             public void run() {
                                 final com.tencent.qqlitepro.http.QqKernel.GroupMsgStats st =
-                                        com.tencent.qqlitepro.http.QqKernel.groupMsgStats(groupUin, fDays);
+                                        com.tencent.qqlitepro.http.QqKernel.groupMsgStats(groupUin, fDays,
+                                                new com.tencent.qqlitepro.http.QqKernel.StatsProgress() {
+                                                    @Override
+                                                    public void onProgress(final int fetched,
+                                                                           final int hits,
+                                                                           final int estimated,
+                                                                           final long elapsedMs) {
+                                                        new android.os.Handler(
+                                                                android.os.Looper.getMainLooper()).post(new Runnable() {
+                                                            @Override
+                                                            public void run() {
+                                                                try {
+                                                                    /* 预计剩余时间：按已用时间/已拉取条数 推算 */
+                                                                    String eta;
+                                                                    if (fetched <= 0) {
+                                                                        eta = "估算中…";
+                                                                    } else {
+                                                                        double perItem = elapsedMs / (double) fetched;
+                                                                        long remainMs = (long) (perItem * Math.max(0, estimated - fetched));
+                                                                        if (remainMs < 1000) {
+                                                                            eta = "即将完成";
+                                                                        } else {
+                                                                            eta = "预计还需 " + (remainMs / 1000) + " 秒";
+                                                                        }
+                                                                    }
+                                                                    resultView.setText("统计中… 已读取 "
+                                                                            + fetched + " 条，命中 " + hits
+                                                                            + " 条 · " + eta);
+                                                                } catch (Throwable ignored) {}
+                                                            }
+                                                        });
+                                                    }
+                                                });
                                 new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
                                     @Override
                                     public void run() {
@@ -237,6 +274,9 @@ public final class SettingsInjector {
                                         }
                                         StringBuilder sb = new StringBuilder();
                                         sb.append("近 ").append(st.days).append(" 天消息总数：").append(st.total);
+                                        sb.append("\n扫描 ").append(st.fetched).append(" 条");
+                                        sb.append(" · 覆盖 ").append(st.msgTypeCount).append(" 种消息类型");
+                                        sb.append(" · 耗时 ").append(st.costMs / 1000.0).append(" 秒");
                                         resultView.setText(sb.toString());
                                         /* 排行榜：头像 + 昵称(QQ号) + 条数 */
                                         rankBox.removeAllViews();
@@ -249,6 +289,11 @@ public final class SettingsInjector {
                                         if (st.rank.isEmpty()) {
                                             rankBox.addView(text(context, "（无数据）", HINT, 12.5f, 3), rootLp());
                                         }
+                                        /* 供"复制结果"使用 */
+                                        fRankData.clear();
+                                        fRankData.addAll(st.rank);
+                                        fTotal[0] = (int) st.total;
+                                        fDaysArr[0] = st.days;
                                     }
                                 });
                             }
@@ -260,34 +305,50 @@ public final class SettingsInjector {
             });
             root.addView(statBtn, withTop(context, 12.0f));
 
-            /* 生成结果截图：跳到该群聊天，走宿主原生"长按消息→多选→截图"链路
-             * （逆向：momoi.mod.qqpro.hook.screenshot.ChatScreenshot.capture 需在
-             *   聊天多选界面内调用，由宿主消息长按菜单"多选"进入）。 */
-            final android.content.Context fCtxShot = context;
-            final android.widget.LinearLayout fRankBox = rankBox;
-            final android.widget.TextView fResult = resultView;
-            android.view.View shotBtn = saveButton(context, "生成结果截图", new Runnable() {
+            /* 复制结果：按指定格式生成文本并写入剪贴板 */
+            final android.content.Context fCtxCopy = context;
+
+            android.view.View copyBtn = saveButton(context, "复制结果", new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        /* 把统计结果区域画成 Bitmap，交给宿主原生截图预览（发送/保存/取消） */
-                        android.graphics.Bitmap bm = renderStatBitmap(fCtxShot, fResult, fRankBox);
-                        if (bm == null) {
-                            toast(fCtxShot, "暂无可截图内容");
+                        if (fRankData.isEmpty()) {
+                            toast(fCtxCopy, "请先点击「开始统计」");
                             return;
                         }
-                        if (openHostScreenshotPreview(fCtxShot, bm)) {
-                            try { dialog.dismiss(); } catch (Throwable ignored) {}
+                        StringBuilder sb = new StringBuilder();
+                        sb.append("本群(").append(groupUin).append(")近")
+                                .append(fDaysArr[0]).append("发言统计:\n");
+                        sb.append("总数量:").append(fTotal[0]).append("\n");
+                        sb.append("发言排行榜:\n");
+                        int n = Math.min(20, fRankData.size());
+                        for (int i = 0; i < n; i++) {
+                            String[] one = fRankData.get(i);
+                            long qq = resolveQqUin(one[2]);
+                            sb.append(i + 1).append(".")
+                                    .append(one[0] == null || one[0].isEmpty() ? "未知" : one[0])
+                                    .append("(").append(qq > 0 ? String.valueOf(qq)
+                                            : (one[2] == null ? "?" : one[2]))
+                                    .append(") ").append(one[1]).append(" 发言条数\n");
+                        }
+                        sb.append("……\n\n");
+                        sb.append("来源于QQMax增强模块\n");
+                        sb.append("官方群号:801524531");
+                        android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                                fCtxCopy.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                        if (cm != null) {
+                            cm.setPrimaryClip(android.content.ClipData.newPlainText("stats", sb.toString()));
+                            toast(fCtxCopy, "统计结果已复制到剪贴板");
                         } else {
-                            toast(fCtxShot, "宿主截图预览不可用，已保存到本地");
+                            toast(fCtxCopy, "剪贴板不可用");
                         }
                     } catch (Throwable th) {
-                        com.tencent.qqlitepro.util.Log.w("生成结果截图失败: " + th);
-                        toast(fCtxShot, "生成截图失败：" + th.getMessage());
+                        com.tencent.qqlitepro.util.Log.w("复制统计结果失败: " + th);
+                        toast(fCtxCopy, "复制失败：" + th.getMessage());
                     }
                 }
             });
-            root.addView(shotBtn, withTop(context, 8.0f));
+            root.addView(copyBtn, withTop(context, 8.0f));
 
             scroll.addView(root);
             dialog.setContentView(scroll);
@@ -437,7 +498,13 @@ public final class SettingsInjector {
             int wSpec = android.view.View.MeasureSpec.makeMeasureSpec(width, android.view.View.MeasureSpec.EXACTLY);
             int hSpec = android.view.View.MeasureSpec.makeMeasureSpec(0, android.view.View.MeasureSpec.UNSPECIFIED);
             box.measure(wSpec, hSpec);
-            int h = Math.max(box.getMeasuredHeight(), (int) (d * 200));
+            int measured = box.getMeasuredHeight();
+            if (measured <= 0 && (result == null || result.getText().length() == 0)
+                    && (rankBox == null || rankBox.getChildCount() == 0)) {
+                com.tencent.qqlitepro.util.Log.w("renderStatBitmap: 内容为空，无法截图");
+                return null;
+            }
+            int h = Math.max(measured, (int) (d * 200));
             box.layout(0, 0, width, h);
             android.graphics.Bitmap bm = android.graphics.Bitmap.createBitmap(width, h,
                     android.graphics.Bitmap.Config.ARGB_8888);
@@ -470,12 +537,118 @@ public final class SettingsInjector {
             }
             com.tencent.qqlitepro.util.Log.w("ScreenshotPreview 未找到 (Context,Bitmap) 方法");
         } catch (Throwable th) {
-            com.tencent.qqlitepro.util.Log.w("打开宿主截图预览失败: " + th);
+            com.tencent.qqlitepro.util.Log.w("宿主截图预览不可用，改用自建预览: " + th);
         }
-        return false;
+        /* 回退：自建全屏预览（保存到相册 / 关闭） */
+        return showBitmapPreview(context, bm);
+    }
+
+    /** 自建 Bitmap 全屏预览：可保存到相册，避免依赖宿主内部类 */
+    private static boolean showBitmapPreview(final android.content.Context context,
+                                             final android.graphics.Bitmap bm) {
+        try {
+            if (bm == null || context == null) {
+                return false;
+            }
+            android.app.Dialog d = new android.app.Dialog(context);
+            d.requestWindowFeature(1);
+            android.widget.LinearLayout root = new android.widget.LinearLayout(context);
+            root.setOrientation(1);
+            root.setBackgroundColor(-15592942);
+            int pad = dp(context, 10.0f);
+            root.setPadding(pad, pad, pad, pad);
+
+            android.widget.ImageView iv = new android.widget.ImageView(context);
+            iv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+            iv.setImageBitmap(bm);
+            root.addView(iv, new android.widget.LinearLayout.LayoutParams(-1, 0, 1.0f));
+
+            android.widget.LinearLayout btns = new android.widget.LinearLayout(context);
+            btns.setOrientation(0);
+            btns.setGravity(17);
+            android.widget.TextView save = text(context, "保存到相册", TITLE, 14.0f, 17);
+            save.setPadding(dp(context, 16.0f), dp(context, 10.0f),
+                    dp(context, 16.0f), dp(context, 10.0f));
+            save.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try {
+                        String name = "qqmax_stat_" + System.currentTimeMillis() + ".png";
+                        android.content.ContentValues cv = new android.content.ContentValues();
+                        cv.put("_display_name", name);
+                        cv.put("mime_type", "image/png");
+                        cv.put("relative_path", "DCIM/QQMax");
+                        android.net.Uri uri = context.getContentResolver()
+                                .insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+                        if (uri != null) {
+                            java.io.OutputStream os = context.getContentResolver().openOutputStream(uri);
+                            bm.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, os);
+                            if (os != null) {
+                                os.flush();
+                                os.close();
+                            }
+                            toast(context, "已保存到相册");
+                            return;
+                        }
+                    } catch (Throwable th) {
+                        com.tencent.qqlitepro.util.Log.w("保存截图失败: " + th);
+                    }
+                    toast(context, "保存失败");
+                }
+            });
+            btns.addView(save);
+
+            android.widget.TextView close = text(context, "关闭", ACCENT, 14.0f, 17);
+            close.setPadding(dp(context, 16.0f), dp(context, 10.0f),
+                    dp(context, 16.0f), dp(context, 10.0f));
+            android.widget.LinearLayout.LayoutParams clp =
+                    new android.widget.LinearLayout.LayoutParams(-2, -2);
+            clp.leftMargin = dp(context, 16.0f);
+            close.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try { d.dismiss(); } catch (Throwable ignored) {}
+                }
+            });
+            btns.addView(close, clp);
+
+            root.addView(btns);
+            d.setContentView(root);
+            if (d.getWindow() != null) {
+                android.view.WindowManager.LayoutParams attrs = d.getWindow().getAttributes();
+                attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                d.getWindow().setAttributes(attrs);
+            }
+            d.show();
+            return true;
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("自建预览失败: " + t);
+            return false;
+        }
     }
 
     /** 排行榜单行：头像(qlogo) + "i. 昵称(QQ号)" + "N 条" */
+    /** 把 senderUid（u_xxx）转换成真实 QQ 号；转换失败返回 0 */
+    private static long resolveQqUin(String uidOrUin) {
+        if (uidOrUin == null || uidOrUin.isEmpty()) {
+            return 0L;
+        }
+        /* 本身是纯数字：直接当 QQ 号 */
+        if (uidOrUin.matches("\\d+")) {
+            try {
+                return Long.parseLong(uidOrUin);
+            } catch (Throwable ignored) {
+                return 0L;
+            }
+        }
+        try {
+            return com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(uidOrUin);
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
     private static android.view.View renderRankRow(android.content.Context context, int idx,
                                                    String nick, String count, String uin) {
         android.widget.LinearLayout row = new android.widget.LinearLayout(context);
@@ -502,13 +675,18 @@ public final class SettingsInjector {
         mid.setLayoutParams(midLp);
         mid.addView(text(context, idx + ". " + (nick == null || nick.isEmpty() ? "未知" : nick), TITLE, 13.5f, 3),
                 rootLp());
-        mid.addView(text(context, "QQ:" + (uin == null || uin.isEmpty() ? "?" : uin), HINT, 11.5f, 3),
+        final long rowQq = resolveQqUin(uin);
+        mid.addView(text(context, "QQ:" + (rowQq > 0 ? String.valueOf(rowQq)
+                        : (uin == null || uin.isEmpty() ? "?" : uin)), HINT, 11.5f, 3),
                 rootLp());
         row.addView(mid);
 
         row.addView(text(context, (count == null ? "0" : count) + " 条", ACCENT, 12.5f, 17));
         try {
-            final long u = Long.parseLong(uin);
+            final long u = rowQq;
+            if (u <= 0) {
+                return row;
+            }
             final android.widget.ImageView fav = avatar;
             new Thread(new Runnable() {
                 @Override
