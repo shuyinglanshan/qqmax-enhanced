@@ -1922,20 +1922,49 @@ public class ChatCardInjector {
      * 优先从 adapter 的 getCurrentList() 里拿第一个 RecentContactChatItem。
      */
     /** 供 QqKernel 调用：取宿主真实 ChatItem 原型 */
-    public static Object hostChatItemPrototypePublic() {
+    /** 取 adapter 当前列表中第 index 项（不经我们的 getItem hook） */
+    public static Object currentListItemAt(Object adapter, int index) {
         try {
-            /* 直接用缓存的 adapter（getItem 期间一定有效） */
+            Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
+            if (cur instanceof List) {
+                List list = (List) cur;
+                if (index >= 0 && index < list.size()) {
+                    return list.get(index);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    public static Object hostChatItemPrototypePublic() {
+        if (sHostItemProto != null) {
+            return sHostItemProto;
+        }
+        try {
             Object adapter = sTempChatAdapter;
             if (adapter == null && sAppCtx != null) {
                 adapter = tempChatAdapter(sAppCtx);
             }
-            if (adapter == null) return null;
+            if (adapter == null && sListAdapter != null) {
+                adapter = sListAdapter;
+            }
+            if (adapter == null) {
+                return null;
+            }
+            /* 1) 先试 adapter 自己的 getItem(int) */
+            try {
+                Object one = XposedHelpers.callMethod(adapter, "getItem", Integer.valueOf(0));
+                if (one != null && one.getClass().getName().endsWith("RecentContactChatItem")) {
+                    return one;
+                }
+            } catch (Throwable ignored) {}
+            /* 2) 再试 getCurrentList() */
             Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
-            if (!(cur instanceof List)) return null;
-            for (Object it : (List) cur) {
-                if (it == null) continue;
-                if (it.getClass().getName().endsWith("RecentContactChatItem")) {
-                    return it;
+            if (cur instanceof List) {
+                for (Object it : (List) cur) {
+                    if (it != null && it.getClass().getName().endsWith("RecentContactChatItem")) {
+                        return it;
+                    }
                 }
             }
         } catch (Throwable ignored) {}
@@ -2014,7 +2043,11 @@ public class ChatCardInjector {
             String preview = item[2] == null ? "" : String.valueOf(item[2]);
             int unread = item[3] instanceof Integer ? (Integer) item[3] : 0;
             long msgTime = com.tencent.qqlitepro.http.QqKernel.longOf(item[4]);
-            long uin = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(uid);
+            long uinCalc = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(uid);
+            if (uinCalc <= 0) {
+                uinCalc = com.tencent.qqlitepro.http.QqKernel.tempChatUinOf(uid);
+            }
+            final long uin = uinCalc;
             boolean top = com.tencent.qqlitepro.http.QqKernel.isTempChatTop(uid);
 
             Object binding = null;
@@ -2036,37 +2069,25 @@ public class ChatCardInjector {
              * 换成宿主 binding 渲染后这些残留会让临时卡底色与正常会话不一致。
              * 这里还原为宿主原生外观（宿主正常卡没有自定义背景，padding/外边距由布局自身决定）。
              */
+            /*
+             * 底色：保留宿主 ItemRecentContactBinding 自带的卡片背景（normal 会话就是这个）。
+             * 旧实现在这里把 background 置 null，导致临时卡变"透明"，与正常卡不一致。
+             * 这里只清掉我们早期自绘留下的"纯色"污染（ColorDrawable），
+             * 宿主自带的 StateListDrawable / 圆角 Drawable 一律保留。
+             */
             try {
-                if (itemView != null) {
-                    if (sBgProbe++ < 3) {
-                        Object bg1 = null;
-                        try { bg1 = XposedHelpers.callMethod(itemView, "getBackground"); } catch (Throwable ignored) {}
-                        Log.i("临时卡诊断: itemView=" + itemView.getClass().getSimpleName()
-                                + " bg=" + (bg1 == null ? "null" : bg1.getClass().getSimpleName())
-                                + " pad=" + itemView.getPaddingLeft() + "," + itemView.getPaddingTop()
-                                + " layoutParams=" + (itemView.getLayoutParams() == null
-                                        ? "null" : itemView.getLayoutParams().getClass().getSimpleName())
-                                + " holder=" + (holder == null ? "null" : holder.getClass().getSimpleName())
-                                + " binding=" + (binding == null ? "null" : binding.getClass().getSimpleName()));
+                Object[] targets = new Object[]{itemView, readAnyField(binding, "a")};
+                for (Object t : targets) {
+                    if (!(t instanceof View)) continue;
+                    View v0 = (View) t;
+                    android.graphics.drawable.Drawable bgd = v0.getBackground();
+                    if (bgd instanceof android.graphics.drawable.ColorDrawable) {
+                        /* 自绘残留纯色（如 -14013129）才重置 */
+                        v0.setBackground(null);
                     }
-                    itemView.setBackground(null);
-                    itemView.setPadding(0, 0, 0, 0);
-                    ViewGroup.LayoutParams lp0 = itemView.getLayoutParams();
-                    if (lp0 instanceof ViewGroup.MarginLayoutParams) {
-                        ViewGroup.MarginLayoutParams mlp0 = (ViewGroup.MarginLayoutParams) lp0;
-                        mlp0.leftMargin = 0;
-                        mlp0.rightMargin = 0;
-                        mlp0.topMargin = 0;
-                        mlp0.bottomMargin = 0;
-                        itemView.setLayoutParams(mlp0);
-                    }
-                }
-                /* 内层根容器（ConstraintLayout a）也清一次，避免自绘残留 */
-                Object rootA = readAnyField(binding, "a");
-                if (rootA instanceof View) {
-                    View rv = (View) rootA;
-                    rv.setBackground(null);
-                    rv.setPadding(0, 0, 0, 0);
+                    v0.setSelected(false);
+                    v0.setPressed(false);
+                    v0.setActivated(false);
                 }
             } catch (Throwable ignored) {}
 
@@ -2096,39 +2117,55 @@ public class ChatCardInjector {
                             Integer.valueOf(unread > 0 ? View.VISIBLE : View.GONE));
                 } catch (Throwable ignored) {}
             }
-            if (vAvatar instanceof android.widget.ImageView && uin > 0) {
-                final android.widget.ImageView iv = (android.widget.ImageView) vAvatar;
+            if (vAvatar != null && uin > 0) {
+                final View avV = vAvatar;
+                final long fUin = uin;
                 new Thread(new Runnable() {
                     @Override
                     public void run() {
                         try {
                             java.net.URL u = new java.net.URL(
-                                    "https://q1.qlogo.cn/g?b=qq&nk=" + uin + "&s=140");
+                                    "https://q1.qlogo.cn/g?b=qq&nk=" + fUin + "&s=140");
                             java.net.HttpURLConnection c = (java.net.HttpURLConnection) u.openConnection();
-                            c.setConnectTimeout(6000);
-                            c.setReadTimeout(6000);
+                            c.setConnectTimeout(8000);
+                            c.setReadTimeout(8000);
+                            c.setDoInput(true);
+                            c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android)");
                             final android.graphics.Bitmap bm =
                                     android.graphics.BitmapFactory.decodeStream(c.getInputStream());
                             if (bm != null) {
                                 new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
                                     @Override
                                     public void run() {
-                                        try { iv.setImageBitmap(bm); } catch (Throwable ignored) {}
+                                        /* WatchAvatarView 只认 setBitmap(Bitmap)，ImageView#setImageBitmap 无效 */
+                                        try {
+                                            ChatCardInjector.setBitmapIntoAvatar(avV, bm);
+                                        } catch (Throwable ignored) {}
                                     }
                                 });
                             }
                         } catch (Throwable ignored) {}
                     }
-                }, "temp-av").start();
+                }, "temp-av-" + fUin).start();
             }
 
             /* 点击进会话 / 长按原生菜单 */
+            final Object bindingF = binding;
             if (itemView != null) {
                 itemView.setOnClickListener(new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
                         try {
                             com.tencent.qqlitepro.http.QqKernel.setTempChatUnread(uid, 0);
+                            /* 立即隐藏当前卡片上的未读徽章，避免进会话后仍显示 */
+                            try {
+                                Object unreadV = readAnyField(bindingF, "g");
+                                if (unreadV != null) {
+                                    XposedHelpers.callMethod(unreadV, "setRedNum", Integer.valueOf(0));
+                                    XposedHelpers.callMethod(unreadV, "setVisibility",
+                                            Integer.valueOf(View.GONE));
+                                }
+                            } catch (Throwable ignored) {}
                             com.tencent.qqlitepro.http.QqKernel.openTempChatSession(v.getContext(), uid);
                         } catch (Throwable ignored) {}
                     }
@@ -2472,6 +2509,12 @@ public class ChatCardInjector {
         }
     }
 
+    /** 临时会话专用菜单：sMenuKind="temp"，菜单项点击按登记 uid 独立生效 */
+    public static void showTempKindMenu(Context context) {
+        sMenuKind = "temp";
+        showNativeMenu(context, "temp");
+    }
+
     public static void showNativeMailMenu(Context context) {
         ChatCardInjector.showNativeMenu(context, "mail");
     }
@@ -2619,19 +2662,16 @@ public class ChatCardInjector {
             Class<?> deleteCls = Class.forName("com.tencent.qqnt.watch.chat.list.longclick.DeleteItem", false, cl);
             Class<?> topCls = Class.forName("com.tencent.qqnt.watch.chat.list.longclick.SetTopItem", false, cl);
             Class<?> disturbCls = Class.forName("com.tencent.qqnt.watch.chat.list.longclick.SetDisturbItem", false, cl);
-            Class<?> absCls = Class.forName("com.tencent.qqnt.watch.ui.componet.AbsItem", false, cl);
             java.util.ArrayList<Object> items = new java.util.ArrayList<Object>();
-            items.add(deleteCls.getConstructor(chatItem.getClass().getInterfaces().length > 0
-                    ? chatItem.getClass().getInterfaces()[0] : chatItem.getClass()).newInstance(chatItem));
-            items.add(topCls.getConstructor(chatItem.getClass().getInterfaces().length > 0
-                    ? chatItem.getClass().getInterfaces()[0] : chatItem.getClass()).newInstance(chatItem));
-            items.add(disturbCls.getConstructor(chatItem.getClass().getInterfaces().length > 0
-                    ? chatItem.getClass().getInterfaces()[0] : chatItem.getClass()).newInstance(chatItem));
+            /* 宿主构造器签名就是 <init>(RecentContactChatItem)，必须传具体类而不是接口 */
+            Class<?> itemType = chatItem.getClass();
+            items.add(deleteCls.getConstructor(itemType).newInstance(chatItem));
+            items.add(topCls.getConstructor(itemType).newInstance(chatItem));
+            items.add(disturbCls.getConstructor(itemType).newInstance(chatItem));
             /* 模块自带的"清空消息" */
             try {
                 Class<?> clearCls = Class.forName("momoi.mod.qqpro.hook.ClearMsgListItem", false, cl);
-                items.add(clearCls.getConstructor(chatItem.getClass().getInterfaces().length > 0
-                        ? chatItem.getClass().getInterfaces()[0] : chatItem.getClass()).newInstance(chatItem));
+                items.add(clearCls.getConstructor(itemType).newInstance(chatItem));
             } catch (Throwable ignored) {}
             Class<?> selectCls = Class.forName("com.tencent.qqnt.watch.ui.componet.select.SelectDialogFragment", false, cl);
             Class<?> fn0 = Class.forName("kotlin.jvm.functions.Function0", false, cl);
@@ -2961,10 +3001,18 @@ public class ChatCardInjector {
                 XposedHelpers.findAndHookMethod(cls4, (String)"onClick", (Object[])new Object[]{View.class, new AnonymousClass20()});
                 XposedHelpers.findAndHookMethod(cls4, (String)"getText", (Object[])new Object[]{anonymousClass19});
                 XposedHelpers.findAndHookMethod(cls6, (String)"needSwitch", (Object[])new Object[]{new AnonymousClass21(cls3, cls4)});
+                /* updateSwitchStatus：只对"模块邮箱卡"生效（mailMenuItem 判定），
+                 * 宿主原生会话（含临时会话）完全放行，由宿主写入各自真实状态。 */
                 if (cls5 != null) {
-                    XposedHelpers.findAndHookMethod(cls6, (String)"updateSwitchStatus", (Object[])new Object[]{cls5, new AnonymousClass22(cls3, cls4, context)});
+                    XposedHelpers.findAndHookMethod(cls6, (String)"updateSwitchStatus",
+                            (Object[]) new Object[]{cls5, new AnonymousClass22(cls3, cls4, context)});
                 }
-                XposedHelpers.findAndHookMethod(cls6, (String)"onCheckedChanged", (Object[])new Object[]{CompoundButton.class, Boolean.TYPE, new AnonymousClass23(cls3, cls4, context)});
+                /* onCheckedChanged：只对"模块邮箱卡"生效（mailMenuItem 判定）。
+                 * 逆向：宿主 AbsItem.onCheckedChanged 是空实现，SetTopItem 未重写；
+                 * 真正置顶逻辑在 SetTopItem.onClick -> setTop() -> TipsUtils。
+                 * 因此原生会话必须放行，绝不能 setResult。 */
+                XposedHelpers.findAndHookMethod(cls6, (String)"onCheckedChanged",
+                        (Object[]) new Object[]{CompoundButton.class, Boolean.TYPE, new AnonymousClass23(cls3, cls4, context)});
                 if (cls != null) {
                     XposedHelpers.findAndHookMethod(cls, (String)"onClick", (Object[])new Object[]{View.class, new AnonymousClass24(context)});
                 }
@@ -3606,6 +3654,15 @@ public class ChatCardInjector {
                     if (isTempCard) {
                         ChatCardInjector.bindTempChatByHostBinding(methodHookParam.args[0], tempIdx);
                     } else {
+                        /* 顺手缓存一个宿主真实 item 作为克隆原型（供临时卡构建用） */
+                        try {
+                            Object it0 = ChatCardInjector.currentListItemAt(
+                                    methodHookParam.thisObject, numLastIntArg.intValue());
+                            if (it0 != null
+                                    && it0.getClass().getName().endsWith("RecentContactChatItem")) {
+                                sHostItemProto = it0;
+                            }
+                        } catch (Throwable ignored) {}
                         ChatCardInjector.bindCard(itemView);
                     }
                 }
@@ -3768,6 +3825,10 @@ public class ChatCardInjector {
     private static volatile int sBindProbe = 0;
     private static volatile int sTimeProbe = 0;
     private static volatile int sBgProbe = 0;
+    /** 开关转调原生 onClick 的防抖时间戳 */
+    private static volatile long sLastSwitchInvoke = 0L;
+    /** 宿主真实会话 item 原型（用于克隆） */
+    private static volatile Object sHostItemProto = null;
 
     static class GetItemOverride
     extends XC_MethodHook {
@@ -3913,26 +3974,7 @@ public class ChatCardInjector {
         }
 
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
-            /* 临时会话删除：优先走独立 temp 分支（原生菜单不经我们的 showNativeMenu） */
-            if (ChatCardInjector.menuTargetIsTempChat()) {
-                try {
-                    String uid = ChatCardInjector.menuTargetPeerUid();
-                    if (uid == null || uid.isEmpty()) {
-                        uid = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
-                    }
-                    if (uid != null && !uid.isEmpty()) {
-                        com.tencent.qqlitepro.http.QqKernel.forgetTempChat(uid);
-                        Log.i("临时会话: 菜单删除 " + uid);
-                    }
-                }
-                catch (Throwable throwable) {
-                    Log.w("临时会话: 菜单删除失败 " + throwable);
-                }
-                ChatCardInjector.refreshChatList();
-                ChatCardInjector.dismissActiveMenu();
-                methodHookParam.setResult(null);
-                return;
-            }
+            /* 只拦截模块自己的邮箱卡菜单项；临时卡走宿主原生逻辑（item 已在菜单里） */
             if (ChatCardInjector.mailMenuItem(methodHookParam)) {
                 if ("temp".equals(ChatCardInjector.sMenuKind)) {
                     /* 临时会话删除：走 forgetTempChat */
@@ -3972,16 +4014,6 @@ public class ChatCardInjector {
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
             Context context;
             int identifier;
-            if (ChatCardInjector.menuTargetIsTempChat()) {
-                Context cT = sAppCtx != null ? sAppCtx : this.val$ctx;
-                String uidT = ChatCardInjector.menuTargetPeerUid();
-                boolean topT = com.tencent.qqlitepro.http.QqKernel.isTempChatTop(uidT);
-                int idT = cT.getResources().getIdentifier(topT ? "chat_cancel_top" : "chat_set_top", "string", cT.getPackageName());
-                if (idT != 0) {
-                    methodHookParam.setResult((Object)idT);
-                }
-                return;
-            }
             if (ChatCardInjector.mailMenuItem(methodHookParam) && (identifier = (context = sAppCtx != null ? sAppCtx : this.val$ctx).getResources().getIdentifier(Config.mailPinned((Context)context) ? "chat_cancel_top" : "chat_set_top", "string", context.getPackageName())) != 0) {
                 methodHookParam.setResult((Object)identifier);
             }
@@ -3994,22 +4026,6 @@ public class ChatCardInjector {
         }
 
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
-            /* 临时会话置顶：直接写临时会话标志 */
-            if (ChatCardInjector.menuTargetIsTempChat()) {
-                try {
-                    String uid = ChatCardInjector.menuTargetPeerUid();
-                    boolean now = !com.tencent.qqlitepro.http.QqKernel.isTempChatTop(uid);
-                    com.tencent.qqlitepro.http.QqKernel.setTempChatTop(uid, now);
-                    Log.i("临时会话: 菜单置顶 " + uid + " -> " + now);
-                }
-                catch (Throwable throwable) {
-                    Log.w("临时会话: 菜单置顶失败 " + throwable);
-                }
-                ChatCardInjector.refreshChatList();
-                ChatCardInjector.dismissActiveMenu();
-                methodHookParam.setResult(null);
-                return;
-            }
             if (ChatCardInjector.mailMenuItem(methodHookParam)) {
                 try {
                     Object objCallMethod = XposedHelpers.callMethod((Object)methodHookParam.thisObject, (String)"getSwitch", (Object[])new Object[0]);
@@ -4036,16 +4052,6 @@ public class ChatCardInjector {
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
             Context context;
             int identifier;
-            if (ChatCardInjector.menuTargetIsTempChat()) {
-                Context c19 = sAppCtx != null ? sAppCtx : this.val$ctx;
-                String uid19 = ChatCardInjector.menuTargetPeerUid();
-                boolean dnd19 = com.tencent.qqlitepro.http.QqKernel.isTempChatDnd(uid19);
-                int id19 = c19.getResources().getIdentifier(dnd19 ? "disable_disturb" : "enable_disturb", "string", c19.getPackageName());
-                if (id19 != 0) {
-                    methodHookParam.setResult((Object)id19);
-                }
-                return;
-            }
             if (ChatCardInjector.mailMenuItem(methodHookParam) && (identifier = (context = sAppCtx != null ? sAppCtx : this.val$ctx).getResources().getIdentifier(Config.mailDnd((Context)context) ? "disable_disturb" : "enable_disturb", "string", context.getPackageName())) != 0) {
                 methodHookParam.setResult((Object)identifier);
             }
@@ -4058,22 +4064,6 @@ public class ChatCardInjector {
         }
 
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
-            /* 临时会话免打扰：直接写临时会话标志 */
-            if (ChatCardInjector.menuTargetIsTempChat()) {
-                try {
-                    String uid = ChatCardInjector.menuTargetPeerUid();
-                    boolean now = !com.tencent.qqlitepro.http.QqKernel.isTempChatDnd(uid);
-                    com.tencent.qqlitepro.http.QqKernel.setTempChatDnd(uid, now);
-                    Log.i("临时会话: 菜单免打扰 " + uid + " -> " + now);
-                }
-                catch (Throwable throwable) {
-                    Log.w("临时会话: 菜单免打扰失败 " + throwable);
-                }
-                ChatCardInjector.refreshChatList();
-                ChatCardInjector.dismissActiveMenu();
-                methodHookParam.setResult(null);
-                return;
-            }
             if (ChatCardInjector.mailMenuItem(methodHookParam)) {
                 try {
                     Object objCallMethod = XposedHelpers.callMethod((Object)methodHookParam.thisObject, (String)"getSwitch", (Object[])new Object[0]);
@@ -4084,6 +4074,24 @@ public class ChatCardInjector {
                 catch (Throwable throwable) {
                     // empty catch block
                 }
+                methodHookParam.setResult(null);
+                return;
+            }
+            /* 临时会话：按登记 uid 独立免打扰 + Toast 提示 */
+            if ("temp".equals(ChatCardInjector.sMenuKind)) {
+                try {
+                    String uidD = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
+                    if (uidD != null && !uidD.isEmpty()) {
+                        boolean nowD = !com.tencent.qqlitepro.http.QqKernel.isTempChatDnd(uidD);
+                        com.tencent.qqlitepro.http.QqKernel.setTempChatDnd(uidD, nowD);
+                        android.widget.Toast.makeText(sAppCtx, nowD ? "已开启免打扰" : "已关闭免打扰",
+                                android.widget.Toast.LENGTH_SHORT).show();
+                        ChatCardInjector.refreshChatList();
+                    }
+                } catch (Throwable t) {
+                    Log.w("临时会话: 免打扰失败 " + t);
+                }
+                ChatCardInjector.dismissActiveMenu();
                 methodHookParam.setResult(null);
             }
         }
@@ -4101,8 +4109,10 @@ public class ChatCardInjector {
 
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
             Object obj;
-            if (ChatCardInjector.mailMenuItem(methodHookParam) && (obj = methodHookParam.thisObject) != null && (this.val$topCls.isInstance(obj) || this.val$disturbCls.isInstance(obj))) {
-                methodHookParam.setResult((Object)true);
+            /* 仅模块邮箱卡需要强制显示开关；宿主原生会话（含临时会话）走原生判定 */
+            if (ChatCardInjector.mailMenuItem(methodHookParam) && (obj = methodHookParam.thisObject) != null
+                    && (this.val$topCls.isInstance(obj) || this.val$disturbCls.isInstance(obj))) {
+                methodHookParam.setResult((Object) true);
             }
         }
     }
@@ -4121,26 +4131,7 @@ public class ChatCardInjector {
 
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
             Object obj;
-            if (ChatCardInjector.menuTargetIsTempChat() && (obj = methodHookParam.thisObject) != null && (this.val$topCls.isInstance(obj) || this.val$disturbCls.isInstance(obj))) {
-                /* 临时会话：开关初始状态 = 该会话自己的置顶/免打扰标志 */
-                String uid22 = ChatCardInjector.menuTargetPeerUid();
-                boolean zMailPinned = this.val$topCls.isInstance(obj)
-                        ? com.tencent.qqlitepro.http.QqKernel.isTempChatTop(uid22)
-                        : com.tencent.qqlitepro.http.QqKernel.isTempChatDnd(uid22);
-                Object obj2 = methodHookParam.args[0];
-                if (obj2 != null) {
-                    try {
-                        XposedHelpers.callMethod((Object)obj2, (String)"setOnCheckedChangeListener", (Object[])new Object[]{null});
-                        XposedHelpers.callMethod((Object)obj2, (String)"setChecked", (Object[])new Object[]{zMailPinned});
-                        XposedHelpers.callMethod((Object)obj2, (String)"setOnCheckedChangeListener", (Object[])new Object[]{obj});
-                    }
-                    catch (Throwable throwable) {
-                        // empty catch block
-                    }
-                }
-                methodHookParam.setResult(null);
-                return;
-            }
+            /* 仅模块邮箱卡：用模块配置驱动开关初值；宿主原生会话（含临时会话）完全放行 */
             if (ChatCardInjector.mailMenuItem(methodHookParam) && (obj = methodHookParam.thisObject) != null && (this.val$topCls.isInstance(obj) || this.val$disturbCls.isInstance(obj))) {
                 Context context = sAppCtx != null ? sAppCtx : this.val$ctx;
                 boolean zMailPinned = this.val$topCls.isInstance(obj) ? Config.mailPinned((Context)context) : Config.mailDnd((Context)context);
@@ -4174,33 +4165,61 @@ public class ChatCardInjector {
 
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
             Object obj;
-            if (ChatCardInjector.menuTargetIsTempChat() && (obj = methodHookParam.thisObject) != null && (this.val$topCls.isInstance(obj) || this.val$disturbCls.isInstance(obj))) {
-                /* 临时会话：写该会话自己的标志（互不影响） */
-                boolean zT = methodHookParam.args.length > 1 && Boolean.TRUE.equals(methodHookParam.args[1]);
-                String uid23 = ChatCardInjector.menuTargetPeerUid();
-                if (this.val$topCls.isInstance(obj)) {
-                    com.tencent.qqlitepro.http.QqKernel.setTempChatTop(uid23, zT);
-                    Log.i("临时会话: 开关置顶 " + uid23 + " -> " + zT);
+            Object self = methodHookParam.thisObject;
+            if (self == null) {
+                return;
+            }
+            boolean isTop = this.val$topCls.isInstance(self);
+            boolean isDisturb = this.val$disturbCls.isInstance(self);
+            if (!isTop && !isDisturb) {
+                return;
+            }
+            /* 模块邮箱卡：走模块自己的全局配置 */
+            if (ChatCardInjector.mailMenuItem(methodHookParam)) {
+                boolean z = methodHookParam.args.length > 1 && Boolean.TRUE.equals(methodHookParam.args[1]);
+                Context context = sAppCtx != null ? sAppCtx : this.val$ctx;
+                if (isTop) {
+                    Config.setMailPinned(context, z);
                 } else {
-                    com.tencent.qqlitepro.http.QqKernel.setTempChatDnd(uid23, zT);
-                    Log.i("临时会话: 开关免打扰 " + uid23 + " -> " + zT);
+                    Config.setMailDnd(context, z);
                 }
                 ChatCardInjector.refreshChatList();
                 methodHookParam.setResult(null);
                 return;
             }
-            if (ChatCardInjector.mailMenuItem(methodHookParam) && (obj = methodHookParam.thisObject) != null && (this.val$topCls.isInstance(obj) || this.val$disturbCls.isInstance(obj))) {
-                boolean z;
-                Context context = sAppCtx != null ? sAppCtx : this.val$ctx;
-                boolean bl = z = methodHookParam.args.length > 1 && Boolean.TRUE.equals(methodHookParam.args[1]);
-                if (this.val$topCls.isInstance(obj)) {
-                    Config.setMailPinned((Context)context, (boolean)z);
-                } else {
-                    Config.setMailDnd((Context)context, (boolean)z);
-                }
-                ChatCardInjector.refreshChatList();
-                methodHookParam.setResult(null);
+            /*
+             * 宿主原生会话 / 临时会话：
+             * 逆向 AbsItem.createView -> switch.setOnCheckedChangeListener(this)，
+             * 而 AbsItem.onCheckedChanged 是空实现（SetTopItem/SetDisturbItem 也未重写）。
+             * 真正生效逻辑在 onClick(View)：NetworkUtils -> setTop()/setDisturb() -> TipsUtils 提示。
+             * 所以这里主动转调 onClick，让"设置中/设置成功/设置失败"提示与真实设置全部走宿主原生链路，
+             * 同时保证每个会话用自己菜单里的 item（互不影响）。
+             */
+            /* 防抖 + 只在用户真实点击后触发（避免 updateSwitchStatus 程序化设置误触发） */
+            long now = java.lang.System.currentTimeMillis();
+            if (now - sLastSwitchInvoke < 600L) {
+                return;
             }
+            sLastSwitchInvoke = now;
+            final Object selfF = self;
+            final View rowView = (View) readAnyField(self, "curButton");
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        java.lang.reflect.Method onClick = selfF.getClass()
+                                .getMethod("onClick", View.class);
+                        onClick.setAccessible(true);
+                        onClick.invoke(selfF, rowView);
+                        com.tencent.qqlitepro.util.Log.i("菜单: 已转调宿主原生 onClick（"
+                                + selfF.getClass().getSimpleName() + "）");
+                    } catch (Throwable t) {
+                        com.tencent.qqlitepro.util.Log.w("菜单: 转调 onClick 失败 " + t);
+                    }
+                }
+            });
+            /* 不 setResult：保留开关自身的视觉切换 */
+            
         }
     }
 
@@ -4213,22 +4232,6 @@ public class ChatCardInjector {
         }
 
         protected void beforeHookedMethod(XC_MethodHook.MethodHookParam methodHookParam) {
-            /* 临时会话清空消息：清未读 + 移除预览 */
-            if (ChatCardInjector.menuTargetIsTempChat()) {
-                try {
-                    String uid = ChatCardInjector.menuTargetPeerUid();
-                    com.tencent.qqlitepro.http.QqKernel.setTempChatUnread(uid, 0);
-                    com.tencent.qqlitepro.http.QqKernel.clearTempChatPreview(uid);
-                    Log.i("临时会话: 菜单清空消息 " + uid);
-                }
-                catch (Throwable throwable) {
-                    Log.w("临时会话: 菜单清空失败 " + throwable);
-                }
-                ChatCardInjector.refreshChatList();
-                ChatCardInjector.dismissActiveMenu();
-                methodHookParam.setResult(null);
-                return;
-            }
             if (ChatCardInjector.mailMenuItem(methodHookParam)) {
                 try {
                     Config.setMailInbox((Context)(sAppCtx != null ? sAppCtx : this.val$ctx), (String)"", (int)0, (String)"");
