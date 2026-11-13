@@ -713,6 +713,11 @@ public final class QqDynamicScheduler {
         return hostAlive(objLastUiHost) ? objLastUiHost : proxyHost();
     }
 
+    /** 供点赞弹层反查动态宿主（QZoneMainFrame） */
+    public static java.lang.Object lastUiHostPublic() {
+        return lastUiHost();
+    }
+
     private static java.lang.Object lastUiHost() {
         java.lang.ref.WeakReference<java.lang.Object> weakReference = sLastUiHost;
         if (weakReference == null) {
