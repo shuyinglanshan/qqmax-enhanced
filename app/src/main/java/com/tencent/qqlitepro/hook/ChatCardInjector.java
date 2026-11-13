@@ -3190,6 +3190,21 @@ public class ChatCardInjector {
         }
     }
 
+    /** 供其它 hook 取任意一个存活 Activity */
+    public static android.app.Activity anyActivityPublic() {
+        try {
+            java.util.List<android.app.Activity> list = allActivities();
+            if (list != null) {
+                for (android.app.Activity a : list) {
+                    if (a != null && !a.isFinishing()) {
+                        return a;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
     private static List<Activity> allActivities() {
         ArrayList<Activity> arrayList = new ArrayList<Activity>();
         try {
