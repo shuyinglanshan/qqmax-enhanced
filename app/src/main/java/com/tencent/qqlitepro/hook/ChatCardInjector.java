@@ -2170,18 +2170,10 @@ public class ChatCardInjector {
                         } catch (Throwable ignored) {}
                     }
                 });
+                /* 需求：临时会话卡片长按不再弹出任何菜单（直接消费事件） */
                 itemView.setOnLongClickListener(new View.OnLongClickListener() {
                     @Override
                     public boolean onLongClick(View v) {
-                        try {
-                            Object chatItem = com.tencent.qqlitepro.http.QqKernel.tempChatItemFor(uid);
-                            Object frag = ChatCardInjector.topAndroidXFragmentOf(v.getContext());
-                            if (chatItem != null
-                                    && ChatCardInjector.showHostSessionMenu(v.getContext(), chatItem, frag)) {
-                                return true;
-                            }
-                            com.tencent.qqlitepro.http.QqKernel.showTempChatMenu(v.getContext(), uid);
-                        } catch (Throwable ignored) {}
                         return true;
                     }
                 });
