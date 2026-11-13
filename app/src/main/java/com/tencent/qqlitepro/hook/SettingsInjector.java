@@ -9787,6 +9787,30 @@ public final class SettingsInjector {
         textViewText.setPadding(0, dp(context, 18.0f), 0, dp(context, 4.0f));
         linearLayout.addView(textViewText, rootLp());
         linearLayout.addView(infoLine(context, "版本", "v1.2.3"));
+        /* 崩溃日志：显示路径 + 可点击复制，方便用户反馈时附上 */
+        try {
+            final String crashPath = com.tencent.qqlitepro.util.CrashLog.crashFilePath();
+            android.view.View crashRow = infoLine(context, "崩溃日志", crashPath);
+            crashRow.setClickable(true);
+            crashRow.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try {
+                        android.content.ClipboardManager cm =
+                                (android.content.ClipboardManager) v.getContext()
+                                        .getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                        if (cm != null) {
+                            cm.setPrimaryClip(android.content.ClipData.newPlainText(
+                                    "crashPath", crashPath));
+                            toast(v.getContext(), "崩溃日志路径已复制");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            linearLayout.addView(crashRow);
+        } catch (Throwable ignored) {
+        }
         linearLayout.addView(infoLine(context, "作者", "疏影阑珊"));
         linearLayout.addView(infoLine(context, "官方群聊", "801524531"));
         linearLayout.addView(infoLine(context, "开源许可", "GPL-3.0"));
