@@ -223,11 +223,40 @@ public final class SettingsInjector {
                         try {
                             days = Integer.parseInt(sStatDays.getText().toString().trim());
                         } catch (Throwable ignored) {}
-                        final int fDays = Math.max(1, Math.min(30, days));
+                        final int fDays = Math.max(1, Math.min(7, days));
                         com.tencent.qqlitepro.util.Config.setGroupStatDays(fCtx, fDays);
                         /* 需求：每次点击开始统计后，先清除已显示的结果 */
                         rankBox.removeAllViews();
-                        resultView.setText("统计中… 0 条");
+                        resultView.setText("已加载:0 条\n预计完成时间: 正在计算…");
+
+                        resultView.setText("已加载:0 条\n命中:0 条\n预计完成: 计算中…");
+
+                        /*
+                         * 唯一的 UI 刷新源：每 300ms 读一次全局计数。
+                         * 数据侧按"逐条"更新 sStatsFetched / sStatsHits，
+                         * 所以数字会快速跳动而不是每秒 +1。
+                         */
+                        final android.os.Handler uiTick =
+                                new android.os.Handler(android.os.Looper.getMainLooper());
+                        final long uiStart = System.currentTimeMillis();
+                        final Runnable uiTask = new Runnable() {
+                            @Override
+                            public void run() {
+                                try {
+                                    if (!com.tencent.qqlitepro.http.QqKernel.sStatsRunning) {
+                                        return;
+                                    }
+                                    int f = com.tencent.qqlitepro.http.QqKernel.sStatsFetched;
+                                    int h = com.tencent.qqlitepro.http.QqKernel.sStatsHits;
+                                    long el = System.currentTimeMillis() - uiStart;
+                                    resultView.setText("已加载:" + f + " 条"
+                                            + "\n命中:" + h + " 条"
+                                            + "\n预计完成: " + computeEta(f, el));
+                                } catch (Throwable ignored) {}
+                                uiTick.postDelayed(this, 300L);
+                            }
+                        };
+                        uiTick.postDelayed(uiTask, 300L);
                         new Thread(new Runnable() {
                             @Override
                             public void run() {
@@ -239,30 +268,13 @@ public final class SettingsInjector {
                                                                            final int hits,
                                                                            final int estimated,
                                                                            final long elapsedMs) {
-                                                        new android.os.Handler(
-                                                                android.os.Looper.getMainLooper()).post(new Runnable() {
-                                                            @Override
-                                                            public void run() {
-                                                                try {
-                                                                    /* 预计剩余时间：按已用时间/已拉取条数 推算 */
-                                                                    String eta;
-                                                                    if (fetched <= 0) {
-                                                                        eta = "估算中…";
-                                                                    } else {
-                                                                        double perItem = elapsedMs / (double) fetched;
-                                                                        long remainMs = (long) (perItem * Math.max(0, estimated - fetched));
-                                                                        if (remainMs < 1000) {
-                                                                            eta = "即将完成";
-                                                                        } else {
-                                                                            eta = "预计还需 " + (remainMs / 1000) + " 秒";
-                                                                        }
-                                                                    }
-                                                                    resultView.setText("统计中… 已读取 "
-                                                                            + fetched + " 条，命中 " + hits
-                                                                            + " 条 · " + eta);
-                                                                } catch (Throwable ignored) {}
-                                                            }
-                                                        });
+                                                        /* UI 由 ticker 统一刷新，这里只更新全局计数 */
+                                                        try {
+                                                            com.tencent.qqlitepro.http.QqKernel
+                                                                    .sStatsFetched = fetched;
+                                                            com.tencent.qqlitepro.http.QqKernel
+                                                                    .sStatsHits = hits;
+                                                        } catch (Throwable ignored) {}
                                                     }
                                                 });
                                 new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
@@ -629,24 +641,69 @@ public final class SettingsInjector {
     }
 
     /** 排行榜单行：头像(qlogo) + "i. 昵称(QQ号)" + "N 条" */
+    /** 按"已用时间 / 已加载条数"推算完成时间点（HH:mm:ss） */
+    private static String computeEta(int fetched, long elapsedMs) {
+        try {
+            if (fetched <= 0 || elapsedMs <= 0) {
+                return "正在计算…";
+            }
+            long newest = com.tencent.qqlitepro.http.QqKernel.sStatsNewestMs;
+            long oldest = com.tencent.qqlitepro.http.QqKernel.sStatsOldestMs;
+            long cutoff = com.tencent.qqlitepro.http.QqKernel.sStatsCutoffMs;
+            if (newest <= 0 || oldest <= 0 || cutoff <= 0 || newest <= cutoff) {
+                return "正在计算…";
+            }
+            long totalSpan = newest - cutoff;          /* 需要覆盖的总时间跨度 */
+            long doneSpan = newest - oldest;           /* 已覆盖的跨度 */
+            if (doneSpan <= 0) {
+                return "正在计算…";
+            }
+            double msPerSpan = elapsedMs / (double) doneSpan;
+            long remain = (long) (msPerSpan * Math.max(0L, totalSpan - doneSpan));
+            if (remain < 1000L) {
+                return "即将完成";
+            }
+            /* 需求：显示秒数 */
+            return (remain / 1000L) + " 秒";
+        } catch (Throwable ignored) {
+            return "正在计算…";
+        }
+    }
+
     /** 把 senderUid（u_xxx）转换成真实 QQ 号；转换失败返回 0 */
     private static long resolveQqUin(String uidOrUin) {
         if (uidOrUin == null || uidOrUin.isEmpty()) {
             return 0L;
         }
-        /* 本身是纯数字：直接当 QQ 号 */
-        if (uidOrUin.matches("\\d+")) {
+        String raw = uidOrUin.trim();
+        /* 1) 纯数字：本身就是 QQ 号 */
+        if (raw.matches("\\d+")) {
             try {
-                return Long.parseLong(uidOrUin);
+                long v = Long.parseLong(raw);
+                return v > 10000L ? v : 0L;
             } catch (Throwable ignored) {
                 return 0L;
             }
         }
-        try {
-            return com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(uidOrUin);
-        } catch (Throwable ignored) {
-            return 0L;
+        /* 2) "u_xxx|nick" 之类的混合 key，先截断 */
+        if (raw.contains("|")) {
+            raw = raw.substring(0, raw.indexOf('|')).trim();
         }
+        /* 3) 走宿主映射 */
+        try {
+            long v = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(raw);
+            if (v > 10000L) {
+                return v;
+            }
+        } catch (Throwable ignored) {}
+        /* 4) 本地缓存：统计时顺带记录 uid -> uin（从消息的 senderUin 字段拿） */
+        try {
+            Long cached = com.tencent.qqlitepro.http.QqKernel.cachedUinOf(raw);
+            if (cached != null && cached.longValue() > 10000L) {
+                return cached.longValue();
+            }
+        } catch (Throwable ignored) {}
+        return 0L;
     }
 
     private static android.view.View renderRankRow(android.content.Context context, int idx,
@@ -673,15 +730,15 @@ public final class SettingsInjector {
                 0, -2, 1.0f);
         midLp.leftMargin = dp(context, 10.0f);
         mid.setLayoutParams(midLp);
-        mid.addView(text(context, idx + ". " + (nick == null || nick.isEmpty() ? "未知" : nick), TITLE, 13.5f, 3),
-                rootLp());
         final long rowQq = resolveQqUin(uin);
-        mid.addView(text(context, "QQ:" + (rowQq > 0 ? String.valueOf(rowQq)
-                        : (uin == null || uin.isEmpty() ? "?" : uin)), HINT, 11.5f, 3),
+        /* 需求格式：1.昵称(QQ号) 15条 */
+        String qqText = rowQq > 0 ? String.valueOf(rowQq)
+                : (uin == null || uin.isEmpty() ? "?" : uin);
+        mid.addView(text(context, idx + "." + (nick == null || nick.isEmpty() ? "未知" : nick)
+                        + "(" + qqText + ")", TITLE, 13.5f, 3), rootLp());
+        mid.addView(text(context, (count == null ? "0" : count) + "条", ACCENT, 12.5f, 3),
                 rootLp());
         row.addView(mid);
-
-        row.addView(text(context, (count == null ? "0" : count) + " 条", ACCENT, 12.5f, 17));
         try {
             final long u = rowQq;
             if (u <= 0) {
