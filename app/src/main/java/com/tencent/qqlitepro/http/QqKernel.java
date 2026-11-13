@@ -6313,10 +6313,11 @@ public final class QqKernel {
             getMsgs.setAccessible(true);
 
             /*
-             * 统计区间：从"今天 0 点"开始，向前推 (days-1) 天的那一天 0 点。
-             * 例：days=1 → 今天 0 点；days=7 → 6 天前 0 点。
+             * 统计区间截止：当前时间 - days 天，再取那一天的零点。
+             * 例：今天是 11-13，days=7 → 11-13 减 7 天 = 11-06 → 截止 11-06 00:00。
+             * （包含 11-06 全天，共 7 个自然日）
              */
-            final long cutoffMs = beginOfDayOffset(days - 1);
+            final long cutoffMs = beginOfDayOffset(days);
             java.util.HashMap<String, Integer> bySender = new java.util.HashMap<String, Integer>();
             java.util.HashMap<String, String> nameBySender = new java.util.HashMap<String, String>();
             java.util.HashSet<String> seen = new java.util.HashSet<String>();
@@ -6342,8 +6343,13 @@ public final class QqKernel {
             }
 
             /* 每页条数刻意取小，让 UI 每秒都能看到"已加载"增长 */
-            final int PAGE = 100;
-            final int MAX_PAGES = 200;         /* 安全上限：最多 40000 条 */
+            /*
+             * 每组 200 条：消息量大（上千上万）时组数可控，
+             * 加载到"首次越过统计截止零点"的那一组为止，
+             * 组内逐条判断时间（越过零点的仍计入之前天数），保证命中数精确。
+             */
+            final int PAGE = 200;
+            final int MAX_PAGES = 250;         /* 安全上限：最多 50000 条 */
             sStatsFetched = 0;
             sStatsHits = 0;
             sStatsStartAt = java.lang.System.currentTimeMillis();
@@ -6365,6 +6371,7 @@ public final class QqKernel {
              * 统一走 getMsgs 逐页推进（每页 100 条，UI 每秒可见增长）。 */
 
 
+            boolean crossedCutoff = false;
             while (page < MAX_PAGES && !reachEnd) {
                 page++;
                 final java.util.List<?>[] box = new java.util.List<?>[1];
@@ -6513,13 +6520,22 @@ public final class QqKernel {
                     } catch (Throwable ignored) {}
                 }
 
-                /* 判断是否已越过统计起点 */
+                /*
+                 * 本组最老消息已越过截止零点：
+                 * 组内消息仍要逐条统计（早于 cutoff 的丢弃），
+                 * 但下一组不再拉取 —— 这就是"首次超过统计范围时停止加载"。
+                 */
                 if (oldestThisPage != Long.MAX_VALUE && oldestThisPage < cutoffMs) {
                     reachEnd = true;
-                    break;
+                    crossedCutoff = true;
                 }
                 /* 本页没有新增（说明到底或重复） */
                 if (added == 0 || msgs.size() < PAGE) {
+                    reachEnd = true;
+                    break;
+                }
+                /* 已越过截止零点：本组统计完毕，不再拉取下一组 */
+                if (crossedCutoff) {
                     reachEnd = true;
                     break;
                 }
