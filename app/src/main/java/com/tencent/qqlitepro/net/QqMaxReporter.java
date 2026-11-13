@@ -149,8 +149,16 @@ public final class QqMaxReporter {
             return false;
         }
         StringBuilder sb = new StringBuilder();
-        sb.append("{\"qq\":\"").append(qq)
-                .append("\",\"nickname\":\"").append(escapeJson(sNickname)).append("\"");
+        sb.append("{\"qq\":\"").append(qq).append("\"");
+        /*
+         * 服务端 nickname 为必填（缺失会 400 BAD_NICKNAME）。
+         * 优先用真实昵称；真拿不到时才用 QQ 号占位，避免整个上报被拒。
+         */
+        String nick = sNickname;
+        if (nick == null || nick.isEmpty()) {
+            nick = qq;
+        }
+        sb.append(",\"nickname\":\"").append(escapeJson(nick)).append("\"");
         String v = clientVersion();
         if (v != null && v.matches("[0-9]+(\\.[0-9]+)*")) {
             sb.append(",\"version\":\"").append(v).append("\"");
@@ -364,16 +372,22 @@ public final class QqMaxReporter {
         return new String(buf);
     }
 
-    private static String sanitizeNickname(String nick, String fallback) {
+    /**
+     * 昵称清洗。注意：**绝不把 QQ 号当昵称上报**。
+     * 若拿不到真实昵称则返回空串，由调用方跳过 nickname 字段
+     * （服务端约定：不传则保留原值）。
+     */
+    private static String sanitizeNickname(String nick, String uin) {
         if (nick == null) {
-            return fallback;
+            return "";
         }
         /* 去掉 HTML 标签与控制字符，截断到 32 字符 */
         String s = nick.replaceAll("<[^>]*>", "")
                 .replaceAll("[\\p{Cntrl}]", "")
                 .trim();
-        if (s.isEmpty()) {
-            s = fallback;
+        /* 若与 QQ 号相同说明没拿到真昵称，视为空 */
+        if (s.isEmpty() || s.equals(uin)) {
+            return "";
         }
         if (s.length() > 32) {
             s = s.substring(0, 32);
