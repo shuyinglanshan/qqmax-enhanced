@@ -330,20 +330,20 @@ public final class SettingsInjector {
                         }
                         StringBuilder sb = new StringBuilder();
                         sb.append("本群(").append(groupUin).append(")近")
-                                .append(fDaysArr[0]).append("发言统计:\n");
+                                .append(fDaysArr[0]).append("天发言统计:\n");
                         sb.append("总数量:").append(fTotal[0]).append("\n");
                         sb.append("发言排行榜:\n");
                         int n = Math.min(20, fRankData.size());
                         for (int i = 0; i < n; i++) {
                             String[] one = fRankData.get(i);
                             long qq = resolveQqUin(one[2]);
+                            /* 模板格式：1.昵称(QQ号) 15条 */
                             sb.append(i + 1).append(".")
                                     .append(one[0] == null || one[0].isEmpty() ? "未知" : one[0])
                                     .append("(").append(qq > 0 ? String.valueOf(qq)
                                             : (one[2] == null ? "?" : one[2]))
-                                    .append(") ").append(one[1]).append(" 发言条数\n");
+                                    .append(") ").append(one[1]).append(" 条\n");
                         }
-                        sb.append("……\n\n");
                         sb.append("来源于QQMax增强模块\n");
                         sb.append("官方群号:801524531");
                         android.content.ClipboardManager cm = (android.content.ClipboardManager)
