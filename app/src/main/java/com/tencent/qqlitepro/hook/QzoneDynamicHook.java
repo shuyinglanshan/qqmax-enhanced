@@ -218,6 +218,1014 @@ public final class QzoneDynamicHook {
         }
     }
 
+    /* ================= 自建：点赞用户全屏列表 =================
+     * 需求：全屏、点赞用户标蓝、实时刷新、点击跳到该用户 QQ 动态（走宿主跳转逻辑）。
+     * 宿主跳转（逆向自 QZoneFeedViewHolderKtKt$handleOperationMore$1$1.invokeSuspend）：
+     *   Bundle b = new Bundle();
+     *   b.putString("uin", 当前登录uin);
+     *   b.putString("report_uin", 目标用户uin);
+     *   b.putString("report_ext_data", json);
+     *   NavController nc = NavHostFragment.S(fragment);
+     *   nc.f(2114521173, b, null);
+     */
+    private static android.app.Dialog sZanDialog = null;
+    private static Object sZanDialogData = null;
+
+    /** 打开点赞用户全屏列表 */
+    public static void showZanUsersDialog(android.content.Context ctx, Object feedData, Object host) {
+        try {
+            if (ctx == null || feedData == null) {
+                return;
+            }
+            dismissZanDialog();
+            sZanDialogData = feedData;
+
+            final android.app.Dialog dialog = new android.app.Dialog(ctx);
+            dialog.requestWindowFeature(1);
+            sZanDialog = dialog;
+
+            android.widget.LinearLayout root = new android.widget.LinearLayout(ctx);
+            root.setOrientation(1);
+            root.setBackgroundColor(-15657960);
+            int pad = (int) (ctx.getResources().getDisplayMetrics().density * 14);
+            root.setPadding(pad, pad, pad, pad);
+
+            /* 标题栏 */
+            android.widget.LinearLayout header = new android.widget.LinearLayout(ctx);
+            header.setOrientation(0);
+            header.setGravity(16);
+            android.widget.TextView title = new android.widget.TextView(ctx);
+            title.setText("点赞用户");
+            title.setTextSize(17f);
+            title.setTextColor(-1);
+            header.addView(title, new android.widget.LinearLayout.LayoutParams(0, -2, 1f));
+            android.widget.TextView close = new android.widget.TextView(ctx);
+            close.setText("关闭");
+            close.setTextSize(13f);
+            close.setTextColor(-16737793);
+            close.setPadding(pad, 4, 0, 4);
+            close.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    dismissZanDialog();
+                }
+            });
+            header.addView(close);
+            root.addView(header);
+
+            /* 列表容器（滚动） */
+            final android.widget.LinearLayout listBox = new android.widget.LinearLayout(ctx);
+            listBox.setOrientation(1);
+            android.widget.ScrollView sv = new android.widget.ScrollView(ctx);
+            sv.addView(listBox);
+            root.addView(sv, new android.widget.LinearLayout.LayoutParams(-1, 0, 1f));
+
+            dialog.setContentView(root);
+            if (dialog.getWindow() != null) {
+                android.view.WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
+                attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+                dialog.getWindow().setAttributes(attrs);
+                dialog.getWindow().setBackgroundDrawable(
+                        new android.graphics.drawable.ColorDrawable(-15592942));
+            }
+            dialog.show();
+
+            fillZanUserList(ctx, listBox, dialog);
+            /* 实时刷新：每 2 秒重读一次 */
+            startZanAutoRefresh(ctx, listBox, dialog);
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("点赞用户页打开失败: " + t);
+        }
+    }
+
+    private static android.os.Handler sZanHandler = null;
+    private static Runnable sZanTask = null;
+
+    private static void startZanAutoRefresh(final android.content.Context ctx,
+                                            final android.widget.LinearLayout box,
+                                            final android.app.Dialog dialog) {
+        stopZanAutoRefresh();
+        sZanHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+        sZanTask = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (dialog == null || !dialog.isShowing()) {
+                        stopZanAutoRefresh();
+                        return;
+                    }
+                    fillZanUserList(ctx, box, dialog);
+                } catch (Throwable ignored) {}
+                if (sZanHandler != null) {
+                    sZanHandler.postDelayed(this, 2000L);
+                }
+            }
+        };
+        sZanHandler.postDelayed(sZanTask, 2000L);
+    }
+
+    private static void stopZanAutoRefresh() {
+        try {
+            if (sZanHandler != null && sZanTask != null) {
+                sZanHandler.removeCallbacks(sZanTask);
+            }
+        } catch (Throwable ignored) {}
+        sZanHandler = null;
+        sZanTask = null;
+    }
+
+    private static void dismissZanDialog() {
+        stopZanAutoRefresh();
+        try {
+            if (sZanDialog != null) {
+                sZanDialog.dismiss();
+            }
+        } catch (Throwable ignored) {}
+        sZanDialog = null;
+        sZanDialogData = null;
+    }
+
+    /** 重新填充点赞用户列表（每项：头像 + 昵称 + QQ号，全部标蓝可点击） */
+    private static void fillZanUserList(final android.content.Context ctx,
+                                        final android.widget.LinearLayout box,
+                                        final android.app.Dialog dialog) {
+        try {
+            Object data = sZanDialogData;
+            if (data == null || box == null) {
+                return;
+            }
+            Object cellLike = null;
+            try {
+                cellLike = de.robv.android.xposed.XposedHelpers.getObjectField(data, "cellLikeInfo");
+            } catch (Throwable ignored) {}
+            if (cellLike == null) {
+                try {
+                    cellLike = de.robv.android.xposed.XposedHelpers
+                            .callMethod(data, "getCellLikeInfo", new Object[0]);
+                } catch (Throwable ignored) {}
+            }
+            java.util.List<Object[]> users = new java.util.ArrayList<>();
+            if (cellLike != null) {
+                Object mans = null;
+                try {
+                    mans = de.robv.android.xposed.XposedHelpers.getObjectField(cellLike, "likeMans");
+                } catch (Throwable ignored) {}
+                if (mans instanceof java.util.List) {
+                    for (Object man : (java.util.List) mans) {
+                        if (man == null) continue;
+                        try {
+                            Object user = de.robv.android.xposed.XposedHelpers
+                                    .getObjectField(man, "user");
+                            if (user == null) continue;
+                            String nick = "";
+                            for (String nf : new String[]{"nickName", "nameSeperate", "nick"}) {
+                                try {
+                                    Object n = de.robv.android.xposed.XposedHelpers
+                                            .getObjectField(user, nf);
+                                    if (n != null && !String.valueOf(n).trim().isEmpty()) {
+                                        nick = String.valueOf(n).trim();
+                                        break;
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                            long uin = 0L;
+                            try {
+                                Object u = de.robv.android.xposed.XposedHelpers
+                                        .getObjectField(user, "uin");
+                                uin = u == null ? 0L : Long.parseLong(String.valueOf(u));
+                            } catch (Throwable ignored) {}
+                            if (nick.isEmpty() && uin == 0L) continue;
+                            users.add(new Object[]{nick, Long.valueOf(uin)});
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            }
+
+            box.removeAllViews();
+            if (users.isEmpty()) {
+                android.widget.TextView empty = new android.widget.TextView(ctx);
+                empty.setText("暂无点赞用户");
+                empty.setTextSize(13f);
+                empty.setTextColor(-8355712);
+                empty.setPadding(0, 20, 0, 20);
+                box.addView(empty);
+                return;
+            }
+            android.widget.TextView countTv = new android.widget.TextView(ctx);
+            countTv.setText("共 " + users.size() + " 人");
+            countTv.setTextSize(12.5f);
+            countTv.setTextColor(-8355712);
+            countTv.setPadding(0, 4, 0, 10);
+            box.addView(countTv);
+
+            for (Object[] one : users) {
+                final String nick = (String) one[0];
+                final long uin = ((Long) one[1]).longValue();
+                android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
+                row.setOrientation(0);
+                row.setGravity(16);
+                row.setPadding(0, 10, 0, 10);
+                row.setClickable(true);
+
+                android.widget.ImageView av = new android.widget.ImageView(ctx);
+                android.widget.LinearLayout.LayoutParams avLp =
+                        new android.widget.LinearLayout.LayoutParams(
+                                (int) (ctx.getResources().getDisplayMetrics().density * 34),
+                                (int) (ctx.getResources().getDisplayMetrics().density * 34));
+                av.setLayoutParams(avLp);
+                android.graphics.drawable.GradientDrawable bg =
+                        new android.graphics.drawable.GradientDrawable();
+                bg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+                bg.setColor(-10785013);
+                av.setBackground(bg);
+                row.addView(av);
+
+                android.widget.TextView tv = new android.widget.TextView(ctx);
+                /* 需求：点赞用户标蓝 */
+                tv.setText((nick.isEmpty() ? String.valueOf(uin) : nick)
+                        + (uin > 0 ? "(" + uin + ")" : ""));
+                tv.setTextSize(14f);
+                tv.setTextColor(-16737793);
+                tv.setSingleLine(true);
+                tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                android.widget.LinearLayout.LayoutParams tvLp =
+                        new android.widget.LinearLayout.LayoutParams(0, -2, 1f);
+                tvLp.leftMargin = 12;
+                row.addView(tv, tvLp);
+
+                /* 点击 -> 跳到该用户 QQ 动态（宿主原生跳转） */
+                row.setOnClickListener(new android.view.View.OnClickListener() {
+                    @Override
+                    public void onClick(android.view.View v) {
+                        jumpToUserZone(v.getContext(), uin);
+                    }
+                });
+                box.addView(row);
+
+                /* 头像异步加载 */
+                if (uin > 0) {
+                    final android.widget.ImageView fAv = av;
+                    final long fUin = uin;
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                java.net.URL u = new java.net.URL(
+                                        "https://q1.qlogo.cn/g?b=qq&nk=" + fUin + "&s=100");
+                                java.net.HttpURLConnection conn =
+                                        (java.net.HttpURLConnection) u.openConnection();
+                                conn.setConnectTimeout(8000);
+                                conn.setReadTimeout(8000);
+                                final android.graphics.Bitmap bm =
+                                        android.graphics.BitmapFactory.decodeStream(conn.getInputStream());
+                                if (bm != null) {
+                                    new android.os.Handler(android.os.Looper.getMainLooper())
+                                            .post(new Runnable() {
+                                                @Override
+                                                public void run() {
+                                                    try { fAv.setImageBitmap(bm); }
+                                                    catch (Throwable ignored) {}
+                                                }
+                                            });
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }, "zan-avatar").start();
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** 跳到指定用户的 QQ 动态（复用宿主 NavController 跳转） */
+    public static void jumpToUserZone(final android.content.Context ctx, final long targetUin) {
+        try {
+            Object frag = null;
+            if (frag == null) {
+                /* 从 Activity 拿当前 Fragment */
+                android.app.Activity act = null;
+                android.content.Context c = ctx;
+                while (c instanceof android.content.ContextWrapper) {
+                    if (c instanceof android.app.Activity) {
+                        act = (android.app.Activity) c;
+                        break;
+                    }
+                    c = ((android.content.ContextWrapper) c).getBaseContext();
+                }
+                if (act != null) {
+                    try {
+                        Object fm = act.getClass().getMethod("getSupportFragmentManager").invoke(act);
+                        java.util.List<?> frags = (java.util.List<?>)
+                                fm.getClass().getMethod("getFragments").invoke(fm);
+                        if (frags != null && !frags.isEmpty()) {
+                            frag = frags.get(frags.size() - 1);
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            if (frag == null) {
+                com.tencent.qqlitepro.util.Log.w("跳转用户动态: 未找到 Fragment");
+                return;
+            }
+            /* NavHostFragment.S(fragment) */
+            Class<?> nhf = Class.forName("androidx.navigation.fragment.NavHostFragment");
+            Object nav = null;
+            for (java.lang.reflect.Method m : nhf.getDeclaredMethods()) {
+                if (m.getParameterTypes().length == 1
+                        && android.app.Fragment.class.isAssignableFrom(m.getParameterTypes()[0])) {
+                    m.setAccessible(true);
+                    nav = m.invoke(null, frag);
+                    break;
+                }
+            }
+            if (nav == null) {
+                com.tencent.qqlitepro.util.Log.w("跳转用户动态: NavController 获取失败");
+                return;
+            }
+            String myUin = "";
+            try {
+                Class<?> mqq = Class.forName("mqq.app.MobileQQ");
+                Object app = mqq.getField("sMobileQQ").get(null);
+                myUin = String.valueOf(app.getClass()
+                        .getMethod("getCurrentUin").invoke(app));
+            } catch (Throwable ignored) {}
+            android.os.Bundle b = new android.os.Bundle();
+            b.putString("uin", myUin);
+            b.putString("report_uin", String.valueOf(targetUin));
+            b.putString("report_ext_data", "{}");
+            /* NavController.f(int, Bundle, NavOptions) */
+            java.lang.reflect.Method f = null;
+            for (java.lang.reflect.Method m : nav.getClass().getMethods()) {
+                Class<?>[] ps = m.getParameterTypes();
+                if (m.getName().equals("f") && ps.length == 3 && ps[0] == Integer.TYPE
+                        && ps[1] == android.os.Bundle.class) {
+                    f = m;
+                    break;
+                }
+            }
+            if (f == null) {
+                com.tencent.qqlitepro.util.Log.w("跳转用户动态: NavController.f 未找到");
+                return;
+            }
+            f.setAccessible(true);
+            f.invoke(nav, Integer.valueOf(0x7E0C3D15), b, null);
+            com.tencent.qqlitepro.util.Log.i("跳转用户动态: -> " + targetUin);
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("跳转用户动态失败: " + t);
+        }
+    }
+
+    /* ================= 更多操作菜单：注入"查看点赞用户" =================
+     * 逆向：
+     *   WatchPicElementExtKt.f1(Fragment, ArrayList<SelectFragmentItem>, String requestKey, Continuation)
+     *   是宿主的"更多操作"菜单弹出入口。
+     *   SelectFragmentItem(int iconRes, int actionId, int arg, Bundle extra, String eventId)
+     * 这里 hook 它，往 items 里塞一个我们自己的项；点击后开自建全屏页。
+     */
+    private static final int OUR_ACTION_ID = 0x7F0E9001;   /* 自定义 actionId，避免与宿主冲突 */
+    private static volatile int sMenuInjected = 0;
+    private static volatile boolean sOperationMoreHooked = false;
+    private static volatile int sInjectProbe = 0;
+
+    /** 延迟重试安装（WatchPicElementExtKt 在别的 dex，早期解析会失败） */
+    public static void installOperationMoreHookDelayed(final java.lang.ClassLoader cl) {
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        final int[] tries = {0};
+        Runnable r = new Runnable() {
+            @Override
+            public void run() {
+                tries[0]++;
+                boolean ok = installOperationMoreHookOnce(cl);
+                if (!ok && tries[0] < 12) {
+                    h.postDelayed(this, 5000L);
+                }
+            }
+        };
+        h.postDelayed(r, 3000L);
+    }
+
+    private static boolean installOperationMoreHookOnce(java.lang.ClassLoader cl) {
+        if (sOperationMoreHooked) {
+            return true;
+        }
+        try {
+            /*
+             * 关键：不能 Class.forName("WatchPicElementExtKt")。
+             * 那个 dex 里有 SingleLineTextView 等类，跨 dex 解析会抛
+             * NoClassDefFoundError。改用 XposedHelpers.findClass + 只取方法签名，
+             * 并跳过参数类型解析（用 findMethodExact 的名称+参数个数匹配）。
+             */
+            /*
+             * 该类的静态验证会拉入 SingleLineTextView（在别的 dex），
+             * 直接 findClass 会 NoClassDefFoundError。
+             * 先尝试加载 SingleLineTextView 补齐依赖，再加载目标类。
+             */
+            try {
+                de.robv.android.xposed.XposedHelpers.findClass(
+                        "com.tencent.qqnt.classadapter.SingleLineTextView", cl);
+            } catch (Throwable ignored) {}
+            try {
+                de.robv.android.xposed.XposedHelpers.findClass(
+                        "com.tencent.qqnt.watch.ui.componet.SingleLineTextView", cl);
+            } catch (Throwable ignored) {}
+            Class<?> extKt = de.robv.android.xposed.XposedHelpers.findClass(
+                    "WatchPicElementExtKt", cl);
+            java.lang.reflect.Method target = null;
+            for (java.lang.reflect.Method m : extKt.getDeclaredMethods()) {
+                if (m.getName().equals("f1") && m.getParameterCount() == 4) {
+                    target = m;
+                    break;
+                }
+            }
+            if (target == null) {
+                com.tencent.qqlitepro.util.Log.w("动态点赞: WatchPicElementExtKt.f1 未找到");
+                return false;
+            }
+            de.robv.android.xposed.XposedBridge.hookMethod(target,
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                Object r = param.getResult();
+                                if (r == null) {
+                                    return;
+                                }
+                                int actionId = -1;
+                                try {
+                                    Object c = de.robv.android.xposed.XposedHelpers
+                                            .getObjectField(r, "c");
+                                    actionId = c == null ? -1 : ((Integer) c).intValue();
+                                } catch (Throwable ignored) {}
+                                if (actionId == OUR_ACTION_ID) {
+                                    Object feed = sPendingFeed;
+                                    android.content.Context ctx = null;
+                                    try {
+                                        Object frag = param.args[0];
+                                        java.lang.Object v = frag.getClass()
+                                                .getMethod("getContext").invoke(frag);
+                                        if (v instanceof android.content.Context) {
+                                            ctx = (android.content.Context) v;
+                                        }
+                                    } catch (Throwable ignored) {}
+                                    if (ctx == null) {
+                                        try {
+                                            android.app.Activity a =
+                                                    com.tencent.qqlitepro.hook.ChatCardInjector
+                                                            .anyActivityPublic();
+                                            if (a != null) {
+                                                ctx = a;
+                                            }
+                                        } catch (Throwable ignored) {}
+                                    }
+                                    showZanUsersDialog(ctx, feed, null);
+                                    com.tencent.qqlitepro.util.Log.i(
+                                            "动态点赞: 打开自建点赞用户页");
+                                }
+                            } catch (Throwable t) {
+                                com.tencent.qqlitepro.util.Log.w("动态点赞: 菜单结果处理失败 " + t);
+                            }
+                        }
+
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Object listObj = param.args[1];
+                                if (!(listObj instanceof java.util.ArrayList)) {
+                                    return;
+                                }
+                                java.util.ArrayList list = (java.util.ArrayList) listObj;
+                                Class<?> itemCls = null;
+                                for (Object it : list) {
+                                    if (it != null) {
+                                        itemCls = it.getClass();
+                                        break;
+                                    }
+                                }
+                                if (itemCls == null) {
+                                    return;
+                                }
+                                /* 用已有项的构造器创建我们自己的项 */
+                                Object newItem = null;
+                                for (java.lang.reflect.Constructor<?> c : itemCls.getDeclaredConstructors()) {
+                                    Class<?>[] ps = c.getParameterTypes();
+                                    if (ps.length == 5 && ps[0] == Integer.TYPE
+                                            && ps[1] == Integer.TYPE && ps[2] == Integer.TYPE
+                                            && ps[3] == android.os.Bundle.class && ps[4] == String.class) {
+                                        c.setAccessible(true);
+                                        newItem = c.newInstance(Integer.valueOf(0),
+                                                Integer.valueOf(OUR_ACTION_ID), Integer.valueOf(0),
+                                                new android.os.Bundle(), "em_watch_report");
+                                        break;
+                                    }
+                                }
+                                if (newItem == null) {
+                                    return;
+                                }
+                                list.add(newItem);
+                                /* 用 requestKey 关联当前 feed（f1 的调用方随后会拿着它判断） */
+                                try {
+                                    Object feed = sLastFeedForMenu;
+                                    if (feed != null) {
+                                        sFeedByRequestKey.put(String.valueOf(param.args[2]), feed);
+                                        sPendingFeed = feed;
+                                    }
+                                } catch (Throwable ignored) {}
+                                if (sMenuInjected++ < 3) {
+                                    com.tencent.qqlitepro.util.Log.i("动态点赞: 已注入查看点赞用户菜单项");
+                                }
+                            } catch (Throwable t) {
+                                com.tencent.qqlitepro.util.Log.w("动态点赞: 注入菜单项失败 " + t);
+                            }
+                        }
+                    });
+            sOperationMoreHooked = true;
+            com.tencent.qqlitepro.util.Log.i("动态点赞: 更多操作菜单 hook 已安装");
+            return true;
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: 更多操作菜单 hook 安装失败(将重试) " + t);
+            return false;
+        }
+    }
+
+    /**
+     * 在每张动态卡片上追加一个"查看点赞用户"入口（小按钮，紧贴三点按钮）。
+     * 走 QZoneFeedViewHolder 的公开字段：
+     *   h = BusinessFeedData（该卡片的数据）
+     *   g = ViewGroup（卡片内容容器）
+     * 点击后打开自建全屏点赞用户页，点用户跳其动态。
+     */
+    public static void attachZanButton(Object holder) {
+        try {
+            if (holder == null) return;
+            Object feed = null;
+            Object content = null;
+            try { feed = de.robv.android.xposed.XposedHelpers.getObjectField(holder, "h"); } catch (Throwable ignored) {}
+            try { content = de.robv.android.xposed.XposedHelpers.getObjectField(holder, "g"); } catch (Throwable ignored) {}
+            if (!(content instanceof android.view.ViewGroup)) return;
+            final android.view.ViewGroup box = (android.view.ViewGroup) content;
+            if (box.findViewWithTag("qqmax_zan_entry") != null) {
+                /* 已有则只更新 feed 引用 */
+                box.findViewWithTag("qqmax_zan_entry").setTag(-0x7f0e0003, feed);
+                return;
+            }
+            if (feed == null) return;
+            /* 只有确实有人点赞才显示入口 */
+            Object cellLike = null;
+            try { cellLike = de.robv.android.xposed.XposedHelpers.getObjectField(feed, "cellLikeInfo"); } catch (Throwable ignored) {}
+            if (cellLike == null) return;
+            Object mans = null;
+            try { mans = de.robv.android.xposed.XposedHelpers.getObjectField(cellLike, "likeMans"); } catch (Throwable ignored) {}
+            if (!(mans instanceof java.util.List) || ((java.util.List) mans).isEmpty()) return;
+
+            android.content.Context ctx = box.getContext();
+            if (ctx == null) return;
+            android.widget.TextView btn = new android.widget.TextView(ctx);
+            btn.setTag("qqmax_zan_entry");
+            btn.setTag(-0x7f0e0003, feed);
+            btn.setText("查看点赞 (" + ((java.util.List) mans).size() + ")");
+            btn.setTextSize(10.5f);
+            btn.setTextColor(-16737793);
+            int p = (int) (ctx.getResources().getDisplayMetrics().density * 6);
+            btn.setPadding(p, 2, p, 2);
+            btn.setClickable(true);
+            btn.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    Object f = v.getTag(-0x7f0e0003);
+                    showZanUsersDialog(v.getContext(), f, null);
+                }
+            });
+            android.widget.LinearLayout.LayoutParams lp =
+                    new android.widget.LinearLayout.LayoutParams(-2, -2);
+            lp.leftMargin = (int) (ctx.getResources().getDisplayMetrics().density * 4);
+            box.addView(btn, lp);
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: 添加入口失败 " + t);
+        }
+    }
+
+    /**
+     * 拦截"选择菜单项"的点击回调，识别我们注入的 actionId。
+     * 宿主在 f1(...) 返回后，会用 SelectFragmentItem.c（actionId）做分支判断，
+     * 这里 hook 一个通用的"拿 item 后判断 actionId"的位置不便，改为直接 hook
+     * 菜单 Fragment 的 onItemClick / 或对 SelectFragmentItem 做标记后由
+     * QZoneFeedViewHolderKtKt.handleOperationMore 的返回值处拦截。
+     *
+     * 实现：hook WatchPicElementExtKt.f1 的返回值为我们自己构造的 item（当用户点了我们项时无法拿到），
+     * 因此改用"注册一个监听：hook 菜单关闭后判断是否选中了我们的 actionId"。
+     */
+    public static void installSelectItemClickHook(java.lang.ClassLoader cl) {
+        /* 首先无条件安装菜单注入（不依赖 WatchPicElementExtKt） */
+        try {
+            installMenuResultHook(cl);
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: installMenuResultHook 异常 " + t);
+        }
+        try {
+            Class<?> cls = de.robv.android.xposed.XposedHelpers.findClass(
+                    "com.tencent.qqnt.watch.ui.componet.select.SelectFragmentItem", cl);
+            /* 记录 item 实例 -> 来源 feed，点击时用 */
+            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                if (f.getType() == android.os.Bundle.class) {
+                    f.setAccessible(true);
+                }
+            }
+            com.tencent.qqlitepro.util.Log.i("动态点赞: SelectFragmentItem 已就绪");
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: SelectFragmentItem hook 失败 " + t);
+        }
+    }
+
+    /**
+     * 最可靠的注入方式：hook Dialog.show()，在窗口显示后扫描它的内容容器，
+     * 若是一个竖排按钮列表（"更多操作"），就在末尾追加我们的按钮。
+     * 不依赖任何宿主内部类名。
+     */
+    private static volatile boolean sDialogShowHooked = false;
+
+    public static void installDialogShowHook() {
+        if (sDialogShowHooked) {
+            return;
+        }
+        sDialogShowHooked = true;
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(
+                    android.app.Dialog.class, "show",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                final android.app.Dialog d = (android.app.Dialog) param.thisObject;
+                                if (d == null || d.getWindow() == null) {
+                                    return;
+                                }
+                                android.view.View decor = d.getWindow().getDecorView();
+                                if (decor == null) {
+                                    return;
+                                }
+                                decor.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            injectIntoDialog(d);
+                                        } catch (Throwable ignored) {}
+                                    }
+                                }, 60L);
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+            com.tencent.qqlitepro.util.Log.i("动态点赞: Dialog.show hook 已安装");
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: Dialog.show hook 失败 " + t);
+        }
+    }
+
+    /** 最近一次 onUiFeedList 的 feed 列表（按顺序） */
+    private static volatile java.util.List<?> sLastFeedList = null;
+
+    /** 记录最近一次 onUiFeedList（由 QqDynamicScheduler 调用） */
+    public static void rememberFeedList(java.util.List<?> list) {
+        sLastFeedList = list;
+    }
+
+    /** 从最近的 feed 列表里挑一个有赞的作为目标 */
+    private static Object findFeedForMenu(android.content.Context ctx) {
+        try {
+            java.util.List<?> list = sLastFeedList;
+            if (list == null || list.isEmpty()) {
+                return null;
+            }
+            for (Object one : list) {
+                if (one == null) continue;
+                Object cl = null;
+                try {
+                    cl = de.robv.android.xposed.XposedHelpers.getObjectField(one, "cellLikeInfo");
+                } catch (Throwable ignored) {}
+                if (cl == null) continue;
+                Object mans = null;
+                try {
+                    mans = de.robv.android.xposed.XposedHelpers.getObjectField(cl, "likeMans");
+                } catch (Throwable ignored) {}
+                if (mans instanceof java.util.List && !((java.util.List) mans).isEmpty()) {
+                    return one;
+                }
+            }
+            return list.get(0);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** 在弹层里找"竖排按钮列表"，追加"查看点赞用户"按钮 */
+    private static void injectIntoDialog(android.app.Dialog d) {
+        try {
+            android.view.View decor = d.getWindow().getDecorView();
+            if (decor == null) {
+                return;
+            }
+            java.util.ArrayList<android.view.View> all = new java.util.ArrayList<>();
+            collectAll(decor, all, 0);
+            /* 找标题为"更多操作"的 TextView，确认是目标弹层 */
+            boolean isTarget = false;
+            for (android.view.View v : all) {
+                if (v instanceof android.widget.TextView) {
+                    String t = String.valueOf(((android.widget.TextView) v).getText()).trim();
+                    if (t.contains("更多操作")) {
+                        isTarget = true;
+                        break;
+                    }
+                }
+            }
+            if (!isTarget) {
+                return;
+            }
+            if (decor.findViewWithTag("qqmax_zan_menu_item") != null) {
+                return;
+            }
+            /* 找最深的竖排容器（按钮列表的父级） */
+            android.view.ViewGroup best = null;
+            int bestDepth = -1;
+            for (android.view.View v : all) {
+                if (!(v instanceof android.view.ViewGroup)) continue;
+                android.view.ViewGroup g = (android.view.ViewGroup) v;
+                if (g.getChildCount() < 2) continue;
+                boolean vert = !(g instanceof android.widget.LinearLayout)
+                        || ((android.widget.LinearLayout) g).getOrientation()
+                        == android.widget.LinearLayout.VERTICAL;
+                if (!vert) continue;
+                int dep = depthOf(decor, v);
+                if (dep > bestDepth) {
+                    bestDepth = dep;
+                    best = g;
+                }
+            }
+            if (best == null) {
+                return;
+            }
+            android.content.Context ctx = decor.getContext();
+            android.widget.TextView btn = new android.widget.TextView(ctx);
+            btn.setTag("qqmax_zan_menu_item");
+            btn.setText("查看点赞用户");
+            btn.setTextSize(15f);
+            btn.setTextColor(-16737793);
+            btn.setGravity(17);
+            int p = (int) (ctx.getResources().getDisplayMetrics().density * 14);
+            btn.setPadding(p, p, p, p);
+            android.graphics.drawable.GradientDrawable bg =
+                    new android.graphics.drawable.GradientDrawable();
+            bg.setColor(-13948117);
+            bg.setCornerRadius(p);
+            btn.setBackground(bg);
+            btn.setClickable(true);
+            btn.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    try { d.dismiss(); } catch (Throwable ignored) {}
+                    Object feed = sPendingFeed;
+                    if (feed == null) {
+                        feed = findFeedForMenu(v.getContext());
+                    }
+                    if (feed == null) {
+                        com.tencent.qqlitepro.util.Log.w("动态点赞: 未找到对应动态数据");
+                        return;
+                    }
+                    showZanUsersDialog(v.getContext(), feed, null);
+                }
+            });
+            android.view.ViewGroup.LayoutParams lp = null;
+            for (android.view.View c : new android.view.View[]{best.getChildAt(0)}) {
+                if (c != null && c.getLayoutParams() != null) {
+                    try {
+                        lp = c.getLayoutParams().getClass()
+                                .getConstructor(Integer.TYPE, Integer.TYPE)
+                                .newInstance(Integer.valueOf(c.getLayoutParams().width),
+                                        Integer.valueOf(c.getLayoutParams().height));
+                    } catch (Throwable ignored) {}
+                    break;
+                }
+            }
+            if (lp == null) {
+                lp = new android.widget.LinearLayout.LayoutParams(-1, -2);
+            }
+            best.addView(btn, lp);
+            com.tencent.qqlitepro.util.Log.i("动态点赞: 已在更多操作弹层追加查看点赞用户");
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: 追加按钮失败 " + t);
+        }
+    }
+
+    private static int depthOf(android.view.View root, android.view.View target) {
+        int d = 0;
+        android.view.ViewParent p = target.getParent();
+        while (p != null && p != root) {
+            d++;
+            p = p.getParent();
+        }
+        return d;
+    }
+
+    /** 把"查看点赞用户"项注入宿主的 SelectDialogFragment 列表 */
+    private static void injectOurItem(Object frag) {
+        try {
+            if (frag == null) return;
+            if (sInjectProbe++ < 6) {
+                com.tencent.qqlitepro.util.Log.i("动态点赞: injectOurItem 进入 frag="
+                        + frag.getClass().getSimpleName());
+            }
+            Object items = null;
+            for (String fld : new String[]{"b", "items"}) {
+                try {
+                    Object v = de.robv.android.xposed.XposedHelpers.getObjectField(frag, fld);
+                    if (v instanceof java.util.List) {
+                        items = v;
+                        break;
+                    }
+                } catch (Throwable ignored) {}
+            }
+            if (!(items instanceof java.util.List)) {
+                if (sInjectProbe < 6) {
+                    com.tencent.qqlitepro.util.Log.w("动态点赞: b 字段不是 List，实际="
+                            + (items == null ? "null" : items.getClass().getSimpleName()));
+                }
+                return;
+            }
+            java.util.List list = (java.util.List) items;
+            Class<?> itemCls = null;
+            for (Object it : list) {
+                if (it != null) { itemCls = it.getClass(); break; }
+            }
+            if (itemCls == null) return;
+            for (Object it : list) {
+                try {
+                    Object c = de.robv.android.xposed.XposedHelpers.getObjectField(it, "c");
+                    if (c != null && ((Integer) c).intValue() == OUR_ACTION_ID) {
+                        return;
+                    }
+                } catch (Throwable ignored) {}
+            }
+            Object newItem = null;
+            for (java.lang.reflect.Constructor<?> ct : itemCls.getDeclaredConstructors()) {
+                Class<?>[] ps = ct.getParameterTypes();
+                if (ps.length == 5 && ps[0] == Integer.TYPE && ps[1] == Integer.TYPE
+                        && ps[2] == Integer.TYPE && ps[3] == android.os.Bundle.class
+                        && ps[4] == String.class) {
+                    ct.setAccessible(true);
+                    newItem = ct.newInstance(Integer.valueOf(0),
+                            Integer.valueOf(OUR_ACTION_ID), Integer.valueOf(0),
+                            new android.os.Bundle(), "em_watch_report");
+                    break;
+                }
+            }
+            if (newItem != null) {
+                list.add(newItem);
+                com.tencent.qqlitepro.util.Log.i("动态点赞: 已注入查看点赞用户 size=" + list.size());
+            }
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: 注入异常 " + t);
+        }
+    }
+
+    /** 记录菜单弹出时携带的 feed，供后续点击使用 */
+    private static volatile Object sPendingFeed = null;
+    private static final java.util.Map<String, Object> sFeedByRequestKey = new java.util.HashMap<>();
+    /** 最近一次触发"更多操作"的 feed（由 renderZanNamesFromHost 记录） */
+    private static volatile Object sLastFeedForMenu = null;
+
+    private static void installMenuResultHook(java.lang.ClassLoader cl) {
+        try {
+            Class<?> fragCls = null;
+            for (String cn : new String[]{
+                    "com.tencent.qqnt.watch.ui.componet.select.SelectDialogFragment",
+                    "com.tencent.qqnt.watch.ui.componet.select.SelectFragment"}) {
+                try {
+                    fragCls = de.robv.android.xposed.XposedHelpers.findClass(cn, cl);
+                    break;
+                } catch (Throwable ignored) {}
+            }
+            if (fragCls == null) {
+                com.tencent.qqlitepro.util.Log.w("动态点赞: SelectFragment 类未找到");
+                return;
+            }
+            com.tencent.qqlitepro.util.Log.i("动态点赞: SelectDialogFragment 注入 hook 已安装");
+
+            /* 探测：hook Fragment.onCreateView 全局，打印实际打开的对话框类名 */
+            try {
+                Class<?> fragBase = de.robv.android.xposed.XposedHelpers.findClass(
+                        "androidx.fragment.app.Fragment", cl);
+                de.robv.android.xposed.XposedBridge.hookAllMethods(fragBase, "onCreateView",
+                        new de.robv.android.xposed.XC_MethodHook() {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                try {
+                                    Object self = param.thisObject;
+                                    if (self == null) return;
+                                    String cn = self.getClass().getName();
+                                    if (cn.contains("Select") || cn.contains("Dialog")) {
+                                        if (sInjectProbe++ < 10) {
+                                            com.tencent.qqlitepro.util.Log.i(
+                                                    "动态点赞: 检测到对话框 Fragment = " + cn);
+                                        }
+                                        injectOurItem(self);
+                                    }
+                                } catch (Throwable ignored) {}
+                            }
+                        });
+                com.tencent.qqlitepro.util.Log.i("动态点赞: Fragment.onCreateView 探测已安装");
+            } catch (Throwable t) {
+                com.tencent.qqlitepro.util.Log.w("动态点赞: Fragment 探测安装失败 " + t);
+            }
+            /* 兜底：onCreateView 时再尝试一次注入（此时 b 一定已就绪） */
+            de.robv.android.xposed.XposedBridge.hookAllMethods(fragCls, "onCreateView",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                com.tencent.qqlitepro.util.Log.i(
+                                        "动态点赞: onCreateView 命中，准备注入");
+                                injectOurItem(param.thisObject);
+                            } catch (Throwable t) {
+                                com.tencent.qqlitepro.util.Log.w("动态点赞: onCreateView 注入失败 " + t);
+                            }
+                        }
+                    });
+            de.robv.android.xposed.XposedBridge.hookAllMethods(fragCls, "onResume",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                injectOurItem(param.thisObject);
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+            de.robv.android.xposed.XposedBridge.hookAllConstructors(fragCls,
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                injectOurItem(param.thisObject);
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+
+            /*
+             * 点击我们的菜单项时：宿主 AbsItem.onClick 会调用 SelectDialogFragment.f() 关闭。
+             * 因此 hook AbsItem.onClick，若 thisObject 是我们注入的项（actionId 匹配），
+             * 则打开自建点赞用户页并吞掉原逻辑。
+             */
+            try {
+                Class<?> absCls = de.robv.android.xposed.XposedHelpers.findClass(
+                        "com.tencent.qqnt.watch.ui.componet.AbsItem", cl);
+                de.robv.android.xposed.XposedBridge.hookAllMethods(absCls, "onClick",
+                        new de.robv.android.xposed.XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    Object self = param.thisObject;
+                                    if (self == null) {
+                                        return;
+                                    }
+                                    Object c = de.robv.android.xposed.XposedHelpers
+                                            .getObjectField(self, "c");
+                                    if (c == null || ((Integer) c).intValue() != OUR_ACTION_ID) {
+                                        return;
+                                    }
+                                    Object feed = sPendingFeed;
+                                    android.content.Context ctx = null;
+                                    if (param.args != null && param.args.length > 0
+                                            && param.args[0] instanceof android.view.View) {
+                                        ctx = ((android.view.View) param.args[0]).getContext();
+                                    }
+                                    if (ctx == null) {
+                                        android.app.Activity a =
+                                                com.tencent.qqlitepro.hook.ChatCardInjector
+                                                        .anyActivityPublic();
+                                        if (a != null) {
+                                            ctx = a;
+                                        }
+                                    }
+                                    showZanUsersDialog(ctx, feed, null);
+                                    /* 关闭菜单 */
+                                    try {
+                                        de.robv.android.xposed.XposedHelpers
+                                                .callMethod(self, "f", new Object[0]);
+                                    } catch (Throwable ignored) {}
+                                    param.setResult(null);
+                                    com.tencent.qqlitepro.util.Log.i("动态点赞: 打开自建点赞用户页");
+                                } catch (Throwable t) {
+                                    com.tencent.qqlitepro.util.Log.w("动态点赞: 菜单点击处理失败 " + t);
+                                }
+                            }
+                        });
+                com.tencent.qqlitepro.util.Log.i("动态点赞: AbsItem.onClick hook 已安装");
+            } catch (Throwable t) {
+                com.tencent.qqlitepro.util.Log.w("动态点赞: AbsItem hook 失败 " + t);
+            }
+
+            com.tencent.qqlitepro.util.Log.i("动态点赞: SelectFragment hook 已安装");
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: SelectFragment hook 失败 " + t);
+        }
+    }
+
     /* ================= Overlay 方案：点赞列表独立一行 =================
      * 卡片内部容器高度被约束，addView 会被裁掉；替换 RecyclerView child 又会 NPE。
      * 因此在 RecyclerView 的父容器上盖一层透明 FrameLayout，自己按每个 child 的位置
@@ -229,7 +1237,8 @@ public final class QzoneDynamicHook {
     private static final class OverlayHolder {
         android.view.ViewOverlay overlay;
         Object rv;
-        java.util.List<String> texts = new java.util.ArrayList<>();
+        /* 每条：[赞数(int), 赞列表文本] —— 用赞数做配对键，避免顺序错位 */
+        java.util.List<Object[]> entries = new java.util.ArrayList<>();
         boolean scrollHooked;
     }
 
@@ -310,21 +1319,7 @@ public final class QzoneDynamicHook {
             for (android.view.View v : all) {
                 if (isZanRow(v)) rows.add(v);
             }
-            /* 关键：只保留"赞数>0"的赞行，与 texts 一一对应，避免错位重叠 */
-            java.util.List<android.view.View> rowsWithLike = new java.util.ArrayList<>();
-            for (android.view.View r : rows) {
-                android.view.View numTv = findDigitTv(r);
-                if (numTv == null) continue;
-                String numTxt = String.valueOf(((android.widget.TextView) numTv).getText()).trim();
-                int cnt = 0;
-                try {
-                    cnt = Integer.parseInt(numTxt);
-                } catch (Throwable ignored) {}
-                if (cnt > 0) {
-                    rowsWithLike.add(r);
-                }
-            }
-            rows = rowsWithLike;
+            /* 不过滤：保持 rows 与 entries 顺序一一对应（宿主的 num 字段常常为 0） */
             java.util.Collections.sort(rows, new java.util.Comparator<android.view.View>() {
                 @Override
                 public int compare(android.view.View a, android.view.View b) {
@@ -335,28 +1330,38 @@ public final class QzoneDynamicHook {
                     return Integer.compare(la[1], lb[1]);
                 }
             });
-            java.util.List<String> texts = new java.util.ArrayList<>(oh.texts);
-            int n = Math.min(rows.size(), texts.size());
-            for (int i = 0; i < n; i++) {
+            if (sZanProbe < 14) {
+                StringBuilder dbg = new StringBuilder("动态点赞overlay: 配对 rows=" + rows.size()
+                        + " entries=" + oh.entries.size() + " rvH=" + rv.getHeight() + " [");
+                for (int k = 0; k < oh.entries.size() && k < 8; k++) {
+                    dbg.append(oh.entries.get(k)[0]).append(",");
+                }
+                dbg.append("] rowsCnt=[");
+                for (int k = 0; k < rows.size() && k < 8; k++) {
+                    android.view.View t = findDigitTv(rows.get(k));
+                    dbg.append(t == null ? "?" :
+                            String.valueOf(((android.widget.TextView) t).getText())).append(",");
+                }
+                dbg.append("]");
+                com.tencent.qqlitepro.util.Log.i(dbg.toString());
+            }
+            /* 顺序配对：rows（按屏幕 Y 排序）与 entries（按 onUiFeedList 顺序）一一对应 */
+            int n2 = Math.min(rows.size(), oh.entries.size());
+            for (int i = 0; i < n2; i++) {
                 android.view.View zanRow = rows.get(i);
-                String text = texts.get(i);
+                String text = (String) oh.entries.get(i)[1];
                 if (text == null || text.isEmpty()) continue;
-                /* 用该行里"赞数 TextView"的底部作为基线，避免容器过高导致下移 */
                 android.view.View numTv = findDigitTv(zanRow);
                 android.view.View baseV = (numTv != null) ? numTv : zanRow;
                 int[] locAn = new int[2];
                 baseV.getLocationOnScreen(locAn);
                 /* ViewOverlay 坐标原点 = RecyclerView 自身左上角 */
                 int top = (locAn[1] - rvScreenY) + baseV.getHeight() + 6;
-                if (top < 0 || top > rv.getHeight() - 10) continue;
+                if (top < -50 || top > rv.getHeight() + 50) continue;
                 ZanDrawable d = new ZanDrawable(text, rv.getWidth());
                 d.setBounds(0, top, rv.getWidth(), top + d.getHeight());
                 oh.overlay.add(d);
                 added++;
-            }
-            if (sZanProbe < 12) {
-                com.tencent.qqlitepro.util.Log.i("动态点赞overlay: 重绘 added=" + added
-                        + " childCount=" + vg.getChildCount() + " texts=" + oh.texts.size());
             }
         } catch (Throwable ignored) {}
     }
@@ -375,13 +1380,13 @@ public final class QzoneDynamicHook {
         ZanDrawable(String text, int width) {
             paint.setAntiAlias(true);
             paint.setColor(-6643546);
-            paint.setTextSize(30f);
+            paint.setTextSize(26f);
             /* 半透明底板，避免与卡片内其它文字视觉重叠 */
             bgPaint.setAntiAlias(true);
             bgPaint.setColor(android.graphics.Color.argb(230, 32, 32, 34));
             bgPaint.setStyle(android.graphics.Paint.Style.FILL);
-            padH = 24f;
-            padV = 10f;
+            padH = 20f;
+            padV = 8f;
             w = width;
             /* 简单按宽度折行 */
             StringBuilder cur = new StringBuilder();
@@ -443,8 +1448,8 @@ public final class QzoneDynamicHook {
         try {
             for (java.util.Map.Entry<Object, OverlayHolder> e : sOverlays.entrySet()) {
                 OverlayHolder oh = e.getValue();
-                if (oh != null && oh.texts != null) {
-                    oh.texts.clear();
+                if (oh != null && oh.entries != null) {
+                    oh.entries.clear();
                 }
             }
         } catch (Throwable ignored) {}
@@ -452,15 +1457,19 @@ public final class QzoneDynamicHook {
 
     /** 把某张卡片的赞列表文本登记到 overlay 并重绘 */
     private static void putOverlayText(android.view.View rv, android.view.View card, String text) {
+        putOverlayText(rv, card, text, -1);
+    }
+
+    /** 记录赞列表文本，同时记录该动态的赞数（用于与视图里的赞行精确配对） */
+    private static void putOverlayText(android.view.View rv, android.view.View card, String text,
+                                       int likeCount) {
         try {
-            android.view.View v = rv;
-            OverlayHolder oh = ensureOverlay(v);
+            OverlayHolder oh = ensureOverlay(rv);
             if (oh == null) {
                 return;
             }
-            /* 每次 onUiFeedList 会先清空，这里顺序追加即可 */
-            oh.texts.add(text);
-            redrawOverlay(oh, v);
+            oh.entries.add(new Object[]{Integer.valueOf(likeCount), text});
+            redrawOverlay(oh, rv);
         } catch (Throwable ignored) {}
     }
 
@@ -473,6 +1482,7 @@ public final class QzoneDynamicHook {
             if (host == null || data == null) {
                 return;
             }
+            sLastFeedForMenu = data;
             android.view.View itemView = findItemViewForFeed(host, data);
             if (itemView == null) {
                 return;
@@ -506,7 +1516,13 @@ public final class QzoneDynamicHook {
                 com.tencent.qqlitepro.util.Log.i("动态点赞诊断(view): cellLike="
                         + (cellLike == null ? "null" : "ok") + " zanText=[" + zanText + "]");
             }
-            /* Overlay 方案：登记文本，由 overlay 按卡片位置绘制 */
+            /*
+             * 已按需求彻底移除"点赞按钮下方显示列表"。
+             * 这里只保留数据缓存（供更多操作菜单里的"查看点赞用户"使用），
+             * 不再向 RecyclerView 的 Overlay 绘制任何内容。
+             */
+            sLastFeedForMenu = data;
+            if (false) {
             android.view.View rv = findRecyclerView(itemView);
             if (rv == null) {
                 /* 从 itemView 向上找 RecyclerView */
@@ -519,12 +1535,64 @@ public final class QzoneDynamicHook {
                     vp = vp.getParent();
                 }
             }
+            /* 给所有可见卡片的 holder 追加"查看点赞"入口 */
+            try {
+                android.view.View rv0 = findRecyclerView(itemView);
+                if (rv0 == null) {
+                    android.view.ViewParent vpp = itemView.getParent();
+                    while (vpp instanceof android.view.View && rv0 == null) {
+                        if (isRv(vpp)) { rv0 = (android.view.View) vpp; break; }
+                        vpp = vpp.getParent();
+                    }
+                }
+                if (rv0 instanceof android.view.ViewGroup) {
+                    Object rvp = rv0.getParent();
+                    while (rvp != null && !isRv(rvp)) {
+                        rvp = (rvp instanceof android.view.View) ? ((android.view.View) rvp).getParent() : null;
+                    }
+                    Object adapter = null;
+                    try {
+                        adapter = de.robv.android.xposed.XposedHelpers
+                                .callMethod(rv0, "getAdapter", new Object[0]);
+                    } catch (Throwable ignored) {}
+                    if (adapter != null) {
+                        android.view.View vie = rv0;
+                        java.lang.reflect.Method gvh = null;
+                        for (java.lang.reflect.Method mm : vie.getClass().getMethods()) {
+                            if (mm.getName().equals("getChildViewHolder")
+                                    && mm.getParameterTypes().length == 1
+                                    && mm.getParameterTypes()[0] == android.view.View.class) {
+                                gvh = mm;
+                                break;
+                            }
+                        }
+                        if (gvh != null) {
+                            android.view.ViewGroup vg0 = (android.view.ViewGroup) rv0;
+                            for (int ci = 0; ci < vg0.getChildCount(); ci++) {
+                                android.view.View ch = vg0.getChildAt(ci);
+                                if (ch == null) continue;
+                                try {
+                                    Object vh = gvh.invoke(vie, ch);
+                                    attachZanButton(vh);
+                                } catch (Throwable ignored) {}
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+
             if (rv != null && zanText != null && !zanText.isEmpty()) {
-                putOverlayText(rv, itemView, "赞：" + zanText);
+                int likeCnt = 0;
+                try {
+                    Object num = de.robv.android.xposed.XposedHelpers.getObjectField(cellLike, "num");
+                    likeCnt = num == null ? 0 : ((Number) num).intValue();
+                } catch (Throwable ignored) {}
+                putOverlayText(rv, itemView, "赞：" + zanText, likeCnt);
                 if (sZanProbe < 20) {
                     com.tencent.qqlitepro.util.Log.i("动态点赞诊断: overlay 登记成功 len="
                             + zanText.length());
                 }
+            }
             }
         } catch (Throwable t) {
             if (sZanErr++ < 5) {
