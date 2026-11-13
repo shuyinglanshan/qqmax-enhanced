@@ -34,7 +34,8 @@ public final class QqMaxReporter {
     private static final String REPORT_KEY =
             "bab516299be0e575f710845598eb811c553ffa61441937b4";
 
-    private static final long HEARTBEAT_INTERVAL_SEC = 60L;
+    /** 心跳间隔：3 分钟（首次上报用户信息后开始计时） */
+    private static final long HEARTBEAT_INTERVAL_SEC = 180L;
     private static final int CONNECT_TIMEOUT_MS = 10000;
     private static final int READ_TIMEOUT_MS = 10000;
 
@@ -89,7 +90,7 @@ public final class QqMaxReporter {
                 }
             });
 
-            /* 定时心跳：60 秒一次，启动延迟 5 秒避免与上报撞车 */
+            /* 定时心跳：每 3 分钟一次，首次在 report 成功后开始计时 */
             sScheduler.scheduleWithFixedDelay(new Runnable() {
                 @Override
                 public void run() {
@@ -98,7 +99,7 @@ public final class QqMaxReporter {
                     } catch (Throwable ignored) {
                     }
                 }
-            }, 5L, HEARTBEAT_INTERVAL_SEC, TimeUnit.SECONDS);
+            }, HEARTBEAT_INTERVAL_SEC, HEARTBEAT_INTERVAL_SEC, TimeUnit.SECONDS);
 
             com.tencent.qqlitepro.util.Log.i("QQMax上报: 已启动 qq=" + sQq);
         } catch (Throwable t) {
