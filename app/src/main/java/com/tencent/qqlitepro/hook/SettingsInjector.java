@@ -9759,7 +9759,7 @@ public final class SettingsInjector {
         android.widget.TextView textViewText = text(context, "QQMax 增强模块", TITLE, 18.0f, 17);
         textViewText.setPadding(0, dp(context, 18.0f), 0, dp(context, 4.0f));
         linearLayout.addView(textViewText, rootLp());
-        linearLayout.addView(infoLine(context, "版本", "v1.2.1"));
+        linearLayout.addView(infoLine(context, "版本", "v1.2.3"));
         linearLayout.addView(infoLine(context, "作者", "疏影阑珊"));
         linearLayout.addView(infoLine(context, "官方群聊", "801524531"));
         linearLayout.addView(infoLine(context, "开源许可", "GPL-3.0"));
