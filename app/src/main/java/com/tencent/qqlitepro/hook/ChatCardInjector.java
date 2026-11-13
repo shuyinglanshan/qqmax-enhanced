@@ -3960,8 +3960,11 @@ public class ChatCardInjector {
             if (sActiveMenu == methodHookParam.thisObject) {
                 sActiveMenu = null;
             }
-            /* 菜单关闭即清空登记目标，避免下一个菜单沿用旧 uid（互不影响的关键） */
+            /* 菜单关闭即清空登记目标 + 复位菜单类型，
+             * 避免下一次正常会话/邮箱卡菜单沿用 "temp" 标记（这是"设置牵连其它会话"的根因） */
             com.tencent.qqlitepro.http.QqKernel.clearMenuTarget();
+            ChatCardInjector.sMenuKind = "normal";
+            ChatCardInjector.sCardMenuItems.clear();
         }
     }
 
@@ -4077,11 +4080,12 @@ public class ChatCardInjector {
                 methodHookParam.setResult(null);
                 return;
             }
-            /* 临时会话：按登记 uid 独立免打扰 + Toast 提示 */
+            /* 临时会话：按登记 uid 独立免打扰（同样双校验） */
             if ("temp".equals(ChatCardInjector.sMenuKind)) {
                 try {
                     String uidD = com.tencent.qqlitepro.http.QqKernel.menuTargetUid();
-                    if (uidD != null && !uidD.isEmpty()) {
+                    if (uidD != null && !uidD.isEmpty()
+                            && com.tencent.qqlitepro.http.QqKernel.isTempChat(uidD)) {
                         boolean nowD = !com.tencent.qqlitepro.http.QqKernel.isTempChatDnd(uidD);
                         com.tencent.qqlitepro.http.QqKernel.setTempChatDnd(uidD, nowD);
                         android.widget.Toast.makeText(sAppCtx, nowD ? "已开启免打扰" : "已关闭免打扰",
