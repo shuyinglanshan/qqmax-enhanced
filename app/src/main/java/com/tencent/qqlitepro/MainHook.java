@@ -211,6 +211,8 @@ public class MainHook implements de.robv.android.xposed.IXposedHookLoadPackage {
         }
         try {
             com.tencent.qqlitepro.hook.ChatCardInjector.patch(loadPackageParam.classLoader);
+            com.tencent.qqlitepro.hook.ChatCardInjector.installActivityPauseMenuDismiss(
+                    loadPackageParam.classLoader);
         } catch (java.lang.Throwable th16) {
             com.tencent.qqlitepro.util.Log.e("QQ 邮箱会话卡片注入失败: " + th16);
         }
