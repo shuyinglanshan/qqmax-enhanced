@@ -454,13 +454,7 @@ public final class QzoneDynamicHook {
                 tvLp.leftMargin = 12;
                 row.addView(tv, tvLp);
 
-                /* 点击 -> 跳到该用户 QQ 动态（宿主原生跳转） */
-                row.setOnClickListener(new android.view.View.OnClickListener() {
-                    @Override
-                    public void onClick(android.view.View v) {
-                        jumpToUserZone(v.getContext(), uin);
-                    }
-                });
+                row.setClickable(false);
                 box.addView(row);
 
                 /* 头像异步加载 */
@@ -879,8 +873,86 @@ public final class QzoneDynamicHook {
         }
     }
 
+    /**
+     * 给每张卡片的"三点按钮"挂一个轻量点击监听（不拦截原逻辑，只记录当前卡片）。
+     * 宿主三点按钮 id 通常含 more/menu，这里用容器遍历找。
+     */
+    public static void hookMoreButtonOfHolder(Object holder) {
+        try {
+            if (holder == null) return;
+            Object feed = null;
+            Object content = null;
+            try { feed = de.robv.android.xposed.XposedHelpers.getObjectField(holder, "h"); } catch (Throwable ignored) {}
+            try { content = de.robv.android.xposed.XposedHelpers.getObjectField(holder, "g"); } catch (Throwable ignored) {}
+            if (feed == null || !(content instanceof android.view.ViewGroup)) return;
+            final android.view.ViewGroup box = (android.view.ViewGroup) content;
+            if (box.findViewWithTag("qqmax_more_probe") != null) {
+                box.findViewWithTag("qqmax_more_probe").setTag(-0x7f0e0004, feed);
+                return;
+            }
+            android.view.View more = findMoreButton(box);
+            if (more == null) return;
+            more.setTag("qqmax_more_probe");
+            more.setTag(-0x7f0e0004, feed);
+            /* 用 OnTouchListener 记录，不消费事件，保证宿主原逻辑不受影响 */
+            more.setOnTouchListener(new android.view.View.OnTouchListener() {
+                @Override
+                public boolean onTouch(android.view.View v, android.view.MotionEvent e) {
+                    try {
+                        if (e.getAction() == android.view.MotionEvent.ACTION_DOWN) {
+                            Object f = v.getTag(-0x7f0e0004);
+                            if (f != null) {
+                                sLastClickedFeed = f;
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                    return false;   /* 不消费 */
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    /** 找卡片里的"三点/更多"按钮：ImageView 且无文字、位于右上角，或 id 名含 more */
+    private static android.view.View findMoreButton(android.view.ViewGroup box) {
+        try {
+            java.util.ArrayList<android.view.View> all = new java.util.ArrayList<>();
+            collectAll(box, all, 0);
+            android.view.View best = null;
+            for (android.view.View v : all) {
+                if (!(v instanceof android.widget.ImageView)) continue;
+                int id = v.getId();
+                if (id != android.view.View.NO_ID) {
+                    try {
+                        String nm = v.getContext().getResources().getResourceEntryName(id);
+                        if (nm != null && (nm.contains("more") || nm.contains("menu"))) {
+                            return v;
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            /* 兜底：最靠右上的 ImageView */
+            int bestScore = Integer.MIN_VALUE;
+            for (android.view.View v : all) {
+                if (!(v instanceof android.widget.ImageView)) continue;
+                if (v.getWidth() <= 0) continue;
+                int[] loc = new int[2];
+                v.getLocationOnScreen(loc);
+                int score = loc[0] - loc[1];
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = v;
+                }
+            }
+            return best;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     /** 最近一次 onUiFeedList 的 feed 列表（按顺序） */
     private static volatile java.util.List<?> sLastFeedList = null;
+    /** 最近一次点击"更多操作"的那张卡片对应的 feed */
+    private static volatile Object sLastClickedFeed = null;
 
     /** 记录最近一次 onUiFeedList（由 QqDynamicScheduler 调用） */
     public static void rememberFeedList(java.util.List<?> list) {
@@ -915,6 +987,10 @@ public final class QzoneDynamicHook {
         }
     }
 
+    /** 记录当前弹层对应的 feed（每次弹层独立，避免串到别的动态） */
+    private static final java.util.Map<Object, Object> sDialogFeed =
+            new java.util.WeakHashMap<>();
+
     /** 在弹层里找"竖排按钮列表"，追加"查看点赞用户"按钮 */
     private static void injectIntoDialog(android.app.Dialog d) {
         try {
@@ -939,6 +1015,16 @@ public final class QzoneDynamicHook {
                 return;
             }
             if (decor.findViewWithTag("qqmax_zan_menu_item") != null) {
+                return;
+            }
+            /* 确定本弹层作用于哪条动态：优先用最近一次被"更多操作"点击的卡片 */
+            Object feed = sLastClickedFeed;
+            if (feed == null) {
+                feed = findFeedForMenu(decor.getContext());
+            }
+            sDialogFeed.put(d, feed);
+            if (feed == null) {
+                com.tencent.qqlitepro.util.Log.w("动态点赞: 弹层未关联到动态，跳过注入");
                 return;
             }
             /* 找最深的竖排容器（按钮列表的父级） */
@@ -979,13 +1065,10 @@ public final class QzoneDynamicHook {
             btn.setOnClickListener(new android.view.View.OnClickListener() {
                 @Override
                 public void onClick(android.view.View v) {
+                    Object feed = sDialogFeed.get(d);
                     try { d.dismiss(); } catch (Throwable ignored) {}
-                    Object feed = sPendingFeed;
                     if (feed == null) {
-                        feed = findFeedForMenu(v.getContext());
-                    }
-                    if (feed == null) {
-                        com.tencent.qqlitepro.util.Log.w("动态点赞: 未找到对应动态数据");
+                        com.tencent.qqlitepro.util.Log.w("动态点赞: 该弹层未绑定动态数据");
                         return;
                     }
                     showZanUsersDialog(v.getContext(), feed, null);
@@ -1006,6 +1089,18 @@ public final class QzoneDynamicHook {
             if (lp == null) {
                 lp = new android.widget.LinearLayout.LayoutParams(-1, -2);
             }
+            /* 避免与上方按钮粘连：加外边距 */
+            try {
+                if (lp instanceof android.view.ViewGroup.MarginLayoutParams) {
+                    android.view.ViewGroup.MarginLayoutParams mlp =
+                            (android.view.ViewGroup.MarginLayoutParams) lp;
+                    int gap = (int) (ctx.getResources().getDisplayMetrics().density * 10);
+                    mlp.topMargin = gap;
+                    mlp.leftMargin = gap / 2;
+                    mlp.rightMargin = gap / 2;
+                    mlp.bottomMargin = gap / 2;
+                }
+            } catch (Throwable ignored) {}
             best.addView(btn, lp);
             com.tencent.qqlitepro.util.Log.i("动态点赞: 已在更多操作弹层追加查看点赞用户");
         } catch (Throwable t) {
@@ -1573,7 +1668,7 @@ public final class QzoneDynamicHook {
                                 if (ch == null) continue;
                                 try {
                                     Object vh = gvh.invoke(vie, ch);
-                                    attachZanButton(vh);
+                                    hookMoreButtonOfHolder(vh);
                                 } catch (Throwable ignored) {}
                             }
                         }
