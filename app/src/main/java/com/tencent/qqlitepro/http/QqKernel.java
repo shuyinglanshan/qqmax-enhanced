@@ -1167,6 +1167,54 @@ public final class QqKernel {
         return selfUidUin()[0];
     }
 
+    /** 当前登录账号昵称（取不到则返回 QQ 号） */
+    public static java.lang.String selfNick() {
+        try {
+            java.lang.String uin = selfUin();
+            if (uin == null || uin.isEmpty()) {
+                return "";
+            }
+            /* 1) 联系人服务 */
+            try {
+                Object svc = qrouteApi("com.tencent.qqnt.watch.contact.api.IContactRuntimeService");
+                if (svc != null) {
+                    for (java.lang.reflect.Method m : svc.getClass().getMethods()) {
+                        if (!m.getName().equals("getBuddyInfo")) continue;
+                        Class<?>[] ps = m.getParameterTypes();
+                        if (ps.length != 1 || ps[0] != String.class) continue;
+                        m.setAccessible(true);
+                        Object r = m.invoke(svc, uin);
+                        if (r != null) {
+                            for (java.lang.String f : new java.lang.String[]{"nick", "nickName", "remark"}) {
+                                Object v = fieldValue(r, f);
+                                if (v != null && !java.lang.String.valueOf(v).trim().isEmpty()) {
+                                    return java.lang.String.valueOf(v).trim();
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (java.lang.Throwable ignored) {
+            }
+            /* 2) 自身资料缓存 */
+            try {
+                Object self = sSelfProfile;
+                if (self != null) {
+                    Object v = fieldValue(self, "nick");
+                    if (v != null && !java.lang.String.valueOf(v).trim().isEmpty()) {
+                        return java.lang.String.valueOf(v).trim();
+                    }
+                }
+            } catch (java.lang.Throwable ignored) {
+            }
+            return uin;
+        } catch (java.lang.Throwable t) {
+            return "";
+        }
+    }
+
+    private static volatile Object sSelfProfile = null;
+
     public static java.lang.String selfUin() {
         return selfUidUin()[1];
     }
@@ -6264,7 +6312,11 @@ public final class QqKernel {
             }
             getMsgs.setAccessible(true);
 
-            final long cutoffMs = java.lang.System.currentTimeMillis() - (long) days * 86400000L;
+            /*
+             * 统计区间：从"今天 0 点"开始，向前推 (days-1) 天的那一天 0 点。
+             * 例：days=1 → 今天 0 点；days=7 → 6 天前 0 点。
+             */
+            final long cutoffMs = beginOfDayOffset(days - 1);
             java.util.HashMap<String, Integer> bySender = new java.util.HashMap<String, Integer>();
             java.util.HashMap<String, String> nameBySender = new java.util.HashMap<String, String>();
             java.util.HashSet<String> seen = new java.util.HashSet<String>();
@@ -6289,8 +6341,17 @@ public final class QqKernel {
                 }
             }
 
-            final int PAGE = 800;
-            final int MAX_PAGES = 40;          /* 安全上限：最多 32000 条 */
+            /* 每页条数刻意取小，让 UI 每秒都能看到"已加载"增长 */
+            final int PAGE = 100;
+            final int MAX_PAGES = 200;         /* 安全上限：最多 40000 条 */
+            sStatsFetched = 0;
+            sStatsHits = 0;
+            sStatsStartAt = java.lang.System.currentTimeMillis();
+            sStatsDoneAt = 0L;
+            sStatsCutoffMs = cutoffMs;
+            sStatsOldestMs = java.lang.System.currentTimeMillis();
+            sStatsNewestMs = 0L;
+            sStatsRunning = true;
             long anchorMsgId = 0L;             /* 0 = 从最新开始 */
             long lastOldestTime = 0L;
             int page = 0;
@@ -6298,150 +6359,11 @@ public final class QqKernel {
 
             /* 估算：近 N 天，按每小时 120 条粗估，给用户一个"预计加载时间" */
             int estimated = Math.max(PAGE, Math.min(MAX_PAGES * PAGE, days * 24 * 120));
+            sStatsEstimated = estimated;
 
-            /* 先尝试一次性大范围拉取（若宿主提供 getMsgsBySeqRange） */
-            if (byRange != null) {
-                try {
-                    byRange.setAccessible(true);
-                    final java.util.List<?>[] rbox = new java.util.List<?>[1];
-                    final java.util.concurrent.CountDownLatch rlatch =
-                            new java.util.concurrent.CountDownLatch(1);
-                    Object rcb = java.lang.reflect.Proxy.newProxyInstance(
-                            cbCls.getClassLoader(), new Class<?>[]{cbCls},
-                            new java.lang.reflect.InvocationHandler() {
-                                @Override
-                                public Object invoke(Object proxy,
-                                                     java.lang.reflect.Method m, Object[] args) {
-                                    try {
-                                        if (args != null) {
-                                            for (Object a : args) {
-                                                if (a instanceof java.util.List) {
-                                                    rbox[0] = (java.util.List<?>) a;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    } catch (Throwable ignored) {}
-                                    rlatch.countDown();
-                                    Class<?> rt = m.getReturnType();
-                                    if (rt == Boolean.TYPE) return Boolean.FALSE;
-                                    if (rt == Integer.TYPE) return Integer.valueOf(0);
-                                    if (rt == Long.TYPE) return Long.valueOf(0L);
-                                    return null;
-                                }
-                            });
-                    /*
-                     * 先取最新一条消息拿到当前 msgSeq 上界，再按 [seq-跨度, seq] 区间拉取。
-                     * 直接用 0 ~ Long.MAX/4 会被内核拒绝或返回空。
-                     */
-                    long maxSeq = 0L;
-                    try {
-                        java.lang.reflect.Method latest = null;
-                        for (java.lang.reflect.Method m : svc.getClass().getDeclaredMethods()) {
-                            if (m.getName().equals("getLatestDbMsgs")
-                                    && m.getParameterTypes().length == 3) {
-                                latest = m;
-                                break;
-                            }
-                        }
-                        if (latest != null) {
-                            latest.setAccessible(true);
-                            final java.util.List<?>[] lb = new java.util.List<?>[1];
-                            final java.util.concurrent.CountDownLatch ll =
-                                    new java.util.concurrent.CountDownLatch(1);
-                            Object lcb = java.lang.reflect.Proxy.newProxyInstance(
-                                    cbCls.getClassLoader(), new Class<?>[]{cbCls},
-                                    new java.lang.reflect.InvocationHandler() {
-                                        @Override
-                                        public Object invoke(Object proxy,
-                                                             java.lang.reflect.Method m, Object[] args) {
-                                            try {
-                                                if (args != null) {
-                                                    for (Object a : args) {
-                                                        if (a instanceof java.util.List) {
-                                                            lb[0] = (java.util.List<?>) a;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            } catch (Throwable ignored) {}
-                                            ll.countDown();
-                                            Class<?> rt = m.getReturnType();
-                                            if (rt == Boolean.TYPE) return Boolean.FALSE;
-                                            if (rt == Integer.TYPE) return Integer.valueOf(0);
-                                            if (rt == Long.TYPE) return Long.valueOf(0L);
-                                            return null;
-                                        }
-                                    });
-                            latest.invoke(svc, contact, Integer.valueOf(1), lcb);
-                            ll.await(8, java.util.concurrent.TimeUnit.SECONDS);
-                            if (lb[0] != null && !lb[0].isEmpty()) {
-                                Object m0 = lb[0].get(0);
-                                try {
-                                    maxSeq = de.robv.android.xposed.XposedHelpers
-                                            .getLongField(m0, "msgSeq");
-                                } catch (Throwable ignored) {}
-                            }
-                        }
-                    } catch (Throwable t) {
-                        com.tencent.qqlitepro.util.Log.w("群统计: 取最新 msgSeq 失败 " + t);
-                    }
-                    if (maxSeq <= 0L) {
-                        maxSeq = 1000000L;
-                    }
-                    /* 按天估算需要覆盖的 seq 跨度，逐段拉取 */
-                    long perDaySeq = 3000L;
-                    long span = Math.max(3000L, (long) days * perDaySeq);
-                    long from = Math.max(1L, maxSeq - span);
-                    byRange.invoke(svc, contact, Long.valueOf(from), Long.valueOf(maxSeq), rcb);
-                    rlatch.await(30, java.util.concurrent.TimeUnit.SECONDS);
-                    java.util.List<?> bulk = rbox[0];
-                    if (bulk != null && !bulk.isEmpty()) {
-                        for (Object msg : bulk) {
-                            if (msg == null) continue;
-                            try {
-                                long msgTime = 0;
-                                try { msgTime = de.robv.android.xposed.XposedHelpers.getLongField(msg, "msgTime"); } catch (Throwable ignored) {}
-                                if (msgTime <= 0) {
-                                    try { msgTime = de.robv.android.xposed.XposedHelpers.getLongField(msg, "time"); } catch (Throwable ignored) {}
-                                }
-                                if (msgTime <= 0) continue;
-                                long ms = msgTime < 100000000000L ? msgTime * 1000L : msgTime;
-                                try {
-                                    int mt = de.robv.android.xposed.XposedHelpers.getIntField(msg, "msgType");
-                                    msgTypes.add(Integer.valueOf(mt));
-                                } catch (Throwable ignored) {}
-                                if (ms < cutoffMs) continue;
-                                if (ms > java.lang.System.currentTimeMillis() + 86400000L) continue;
-                                String key = null;
-                                String nm = null;
-                                try { key = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "senderUid"); } catch (Throwable ignored) {}
-                                try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendMemberName"); } catch (Throwable ignored) {}
-                                if (nm == null || nm.isEmpty()) {
-                                    try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendNickName"); } catch (Throwable ignored) {}
-                                }
-                                if (key == null || key.isEmpty()) {
-                                    try { key = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "senderUin")); } catch (Throwable ignored) {}
-                                }
-                                if (key == null || key.isEmpty() || "0".equals(key)) continue;
-                                String uniq = key + "|" + msgTime;
-                                if (!seen.add(uniq)) continue;
-                                Integer c = bySender.get(key);
-                                bySender.put(key, Integer.valueOf(c == null ? 1 : c.intValue() + 1));
-                                if (!nameBySender.containsKey(key)) {
-                                    nameBySender.put(key, nm == null || nm.isEmpty() ? key : nm);
-                                }
-                                st.total++;
-                            } catch (Throwable ignored) {}
-                        }
-                        st.fetched = bulk.size();
-                        com.tencent.qqlitepro.util.Log.i("群统计: getMsgsBySeqRange 一次拉取 "
-                                + bulk.size() + " 条，命中 " + st.total + " 条");
-                    }
-                } catch (Throwable t) {
-                    com.tencent.qqlitepro.util.Log.w("群统计: getMsgsBySeqRange 不可用 " + t);
-                }
-            }
+            /* 说明：getMsgsBySeqRange 在部分机型返回空，已移除；
+             * 统一走 getMsgs 逐页推进（每页 100 条，UI 每秒可见增长）。 */
+
 
             while (page < MAX_PAGES && !reachEnd) {
                 page++;
@@ -6533,15 +6455,26 @@ public final class QqKernel {
                         if (ms < cutoffMs) continue;
                         if (ms > java.lang.System.currentTimeMillis() + 86400000L) continue;
 
+                        /* 优先取数字 senderUin（可直接当 QQ 号用，头像也能加载） */
                         String key = null;
+                        try {
+                            long su = de.robv.android.xposed.XposedHelpers.getLongField(msg, "senderUin");
+                            if (su > 0L) {
+                                key = String.valueOf(su);
+                            }
+                        } catch (Throwable ignored) {}
+                        if (key == null || key.isEmpty()) {
+                            try {
+                                Object uidObj = de.robv.android.xposed.XposedHelpers.getObjectField(msg, "senderUid");
+                                if (uidObj != null) {
+                                    key = String.valueOf(uidObj);
+                                }
+                            } catch (Throwable ignored) {}
+                        }
                         String nm = null;
-                        try { key = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "senderUid"); } catch (Throwable ignored) {}
                         try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendMemberName"); } catch (Throwable ignored) {}
                         if (nm == null || nm.isEmpty()) {
                             try { nm = (String) de.robv.android.xposed.XposedHelpers.getObjectField(msg, "sendNickName"); } catch (Throwable ignored) {}
-                        }
-                        if (key == null || key.isEmpty()) {
-                            try { key = String.valueOf(de.robv.android.xposed.XposedHelpers.getLongField(msg, "senderUin")); } catch (Throwable ignored) {}
                         }
                         if (key == null || key.isEmpty() || "0".equals(key)) continue;
                         String uniq = key + "|" + msgTime;
@@ -6558,6 +6491,19 @@ public final class QqKernel {
                 }
 
                 st.fetched += msgs.size();
+                sStatsFetched = st.fetched;
+                try {
+                    if (oldestThisPage != Long.MAX_VALUE) {
+                        if (sStatsOldestMs <= 0 || oldestThisPage < sStatsOldestMs) {
+                            sStatsOldestMs = oldestThisPage;
+                        }
+                        if (sStatsNewestMs <= 0 || oldestThisPage > sStatsNewestMs) {
+                            sStatsNewestMs = oldestThisPage;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+                sStatsFetched = st.fetched;
+                sStatsHits = (int) st.total;
 
                 /* 进度回报 */
                 if (progress != null) {
@@ -6590,6 +6536,8 @@ public final class QqKernel {
                 lastOldestTime = oldestThisPage;
             }
 
+            sStatsRunning = false;
+            sStatsDoneAt = java.lang.System.currentTimeMillis();
             st.estimatedTotal = st.fetched;
             st.msgTypeCount = msgTypes.size();
             st.costMs = java.lang.System.currentTimeMillis() - t0;
@@ -6896,6 +6844,36 @@ public final class QqKernel {
         return null;
     }
 
+    /** 今天 0 点向前推 offsetDays 天的 0 点（毫秒） */
+    private static long beginOfDayOffset(int offsetDays) {
+        java.util.Calendar c = java.util.Calendar.getInstance();
+        c.set(java.util.Calendar.HOUR_OF_DAY, 0);
+        c.set(java.util.Calendar.MINUTE, 0);
+        c.set(java.util.Calendar.SECOND, 0);
+        c.set(java.util.Calendar.MILLISECOND, 0);
+        c.add(java.util.Calendar.DAY_OF_YEAR, -Math.max(0, offsetDays));
+        return c.getTimeInMillis();
+    }
+
+    /** uid -> uin 本地缓存（统计消息时顺带填充，供排行榜头像/QQ号使用） */
+    private static final java.util.concurrent.ConcurrentHashMap<String, Long> sUidUinCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    public static void cacheUidUin(String uid, long uin) {
+        try {
+            if (uid != null && !uid.isEmpty() && uin > 10000L) {
+                sUidUinCache.put(uid.trim(), Long.valueOf(uin));
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    public static Long cachedUinOf(String uid) {
+        if (uid == null || uid.isEmpty()) {
+            return null;
+        }
+        return sUidUinCache.get(uid.trim());
+    }
+
     /** 群消息统计结果 */
     public static class GroupMsgStats {
         public int days;
@@ -6911,6 +6889,21 @@ public final class QqKernel {
         /** 覆盖到的消息类型数量 */
         public int msgTypeCount;
     }
+
+    /** 当前统计任务的实时计数（供 UI 每秒轮询） */
+    public static volatile int sStatsFetched = 0;
+    public static volatile int sStatsHits = 0;
+    public static volatile int sStatsEstimated = 0;
+    public static volatile long sStatsStartAt = 0L;
+    /** 统计完成时间（0=进行中） */
+    public static volatile long sStatsDoneAt = 0L;
+    /** 统计时间下界（毫秒） */
+    public static volatile long sStatsCutoffMs = 0L;
+    /** 已扫描到的最老消息时间（毫秒） */
+    public static volatile long sStatsOldestMs = 0L;
+    /** 最新一条消息时间（毫秒） */
+    public static volatile long sStatsNewestMs = 0L;
+    public static volatile boolean sStatsRunning = false;
 
     /** 统计进度回调 */
     public interface StatsProgress {
