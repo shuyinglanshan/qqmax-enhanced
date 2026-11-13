@@ -1258,11 +1258,38 @@ public class ChatCardInjector {
                 XposedHelpers.callMethod(adapter, "submitList", new Object[]{chatItems, null});
             } catch (Throwable ignored) {}
         }
-        /* diff 提交等待：高频短轮询（10ms×最多 100 次=1s），尽快进入逐卡渲染 */
-        for (int wait = 0; wait < 100; ++wait) {
+        /*
+         * 等待 diff 提交生效。
+         * 重要：绝不能在主线程 sleep —— 那会直接卡住 UI（最多 1 秒）。
+         * 主线程只做一次"是否已同步"的探测，未同步则交给后续的刷新回调处理。
+         */
+        boolean onMain = false;
+        try {
+            onMain = android.os.Looper.myLooper() == android.os.Looper.getMainLooper();
+        } catch (Throwable ignored) {}
+        if (onMain) {
             try {
                 Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
-                if (cur instanceof List && ((List)cur).size() == chatItems.size()) {
+                if (cur instanceof List && ((List) cur).size() == chatItems.size()) {
+                    return chatItems;
+                }
+            } catch (Throwable ignored) {}
+            /* 未同步：post 到下一帧继续，不阻塞当前帧 */
+            try {
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(
+                        new Runnable() {
+                            @Override
+                            public void run() {
+                                refreshChatList();
+                            }
+                        });
+            } catch (Throwable ignored) {}
+            return chatItems;
+        }
+        for (int wait = 0; wait < 60; ++wait) {
+            try {
+                Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
+                if (cur instanceof List && ((List) cur).size() == chatItems.size()) {
                     break;
                 }
             } catch (Throwable ignored) {}
@@ -3195,6 +3222,59 @@ public class ChatCardInjector {
             }
         } catch (Throwable ignored) {}
         return null;
+    }
+
+    private static volatile boolean sBadgeUncapHooked = false;
+
+    /**
+     * 未读数取消 999+ 上限：显示具体数字。
+     *
+     * 逆向 QUIBadge#f(int)：
+     *   this.j = r2;
+     *   if (r2 <= 999) { k = String.valueOf(r2); }
+     *   else           { k = "999+"; }
+     *   this.k = r3;
+     * 其中 j 是数字、k 是展示文本。这里 hook 后重写 k，让 >999 也显示真实条数。
+     */
+    public static void installBadgeUncapHook(java.lang.ClassLoader cl) {
+        if (sBadgeUncapHooked) {
+            return;
+        }
+        try {
+            Class<?> badge = de.robv.android.xposed.XposedHelpers.findClass(
+                    "com.tencent.mobileqq.quibadge.QUIBadge", cl);
+            de.robv.android.xposed.XposedBridge.hookAllMethods(badge, "f",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.args == null || param.args.length < 1) {
+                                    return;
+                                }
+                                Object a0 = param.args[0];
+                                if (!(a0 instanceof Integer)) {
+                                    return;
+                                }
+                                int n = ((Integer) a0).intValue();
+                                if (n <= 999) {
+                                    return;
+                                }
+                                /* 仅当宿主写成 "999+" 时替换为真实数字 */
+                                Object k = de.robv.android.xposed.XposedHelpers
+                                        .getObjectField(param.thisObject, "k");
+                                if (k != null && "999+".equals(String.valueOf(k))) {
+                                    de.robv.android.xposed.XposedHelpers.setObjectField(
+                                            param.thisObject, "k", String.valueOf(n));
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            sBadgeUncapHooked = true;
+            com.tencent.qqlitepro.util.Log.i("未读数: 已取消 999+ 上限（显示具体数字）");
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("未读数: 取消上限 hook 失败 " + t);
+        }
     }
 
     private static List<Activity> allActivities() {
