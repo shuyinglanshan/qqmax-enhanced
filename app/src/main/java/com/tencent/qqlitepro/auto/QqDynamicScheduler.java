@@ -125,7 +125,7 @@ public final class QqDynamicScheduler {
         }
     }
 
-    private static java.util.List<com.tencent.qqlitepro.auto.QqDynamicScheduler.FeedRecord> snapshot() {
+    public static java.util.List<com.tencent.qqlitepro.auto.QqDynamicScheduler.FeedRecord> snapshot() {
         java.util.ArrayList arrayList;
         java.util.Map<java.lang.String, com.tencent.qqlitepro.auto.QqDynamicScheduler.FeedRecord> map = sCaptured;
         synchronized (map) {
@@ -150,10 +150,42 @@ public final class QqDynamicScheduler {
         }
     }
 
+    private static volatile int sUiProbe = 0;
+
     public static void onUiFeedList(java.lang.Object obj, java.util.List<?> list) {
+        if (sUiProbe++ < 5) {
+            com.tencent.qqlitepro.util.Log.i("动态点赞诊断: onUiFeedList host="
+                    + (obj == null ? "null" : obj.getClass().getSimpleName())
+                    + " size=" + (list == null ? -1 : list.size()));
+        }
         if (obj != null) {
             sLastUiHost = new java.lang.ref.WeakReference<>(obj);
         }
+        /*
+         * 渲染点赞列表：必须在主线程操作 View。
+         * onUiFeedList 常在子线程触发（Binder/回调），直接 addView 不会触发重新测量，
+         * 表现为日志说"插入成功"但界面看不到。
+         */
+        try {
+            final Object fHost = obj;
+            final java.util.List<?> fList = list;
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        com.tencent.qqlitepro.hook.QzoneDynamicHook.resetFeedIndex();
+                        if (fList != null) {
+                            for (Object one : fList) {
+                                if (one != null) {
+                                    com.tencent.qqlitepro.hook.QzoneDynamicHook
+                                            .renderZanNamesFromHost(fHost, one);
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            });
+        } catch (Throwable ignored) {}
         if (list == null || list.isEmpty()) {
             return;
         }
@@ -910,13 +942,74 @@ public final class QqDynamicScheduler {
     }
 
     /* JADX INFO: Access modifiers changed from: private */
-    static final class FeedRecord {
-        final java.lang.Object feed;
-        java.lang.Object host;
-        final java.lang.String key;
-        final java.lang.String nick;
-        final long owner;
-        final long timeMs;
+    /**
+     * 逆向自宿主内核数据结构：
+     *   StFeed.getCellLike() -> StFeedCellLike
+     *   StFeedCellLike.getLikeMans() -> ArrayList<StLikeMan>
+     *   StLikeMan.getUser() -> StUser（nick=昵称, uin=QQ号, isSuperLike=特赞）
+     * 提取某条动态的全部点赞用户昵称（本人/他人通用）。
+     */
+    public static java.util.ArrayList<String> feedZanNicks(Object feed) {
+        java.util.ArrayList<String> out = new java.util.ArrayList<String>();
+        try {
+            if (feed == null) {
+                return out;
+            }
+            Object cellLike = de.robv.android.xposed.XposedHelpers.callMethod(feed, "getCellLike", new Object[0]);
+            if (cellLike == null) {
+                return out;
+            }
+            Object mans = de.robv.android.xposed.XposedHelpers.callMethod(cellLike, "getLikeMans", new Object[0]);
+            if (!(mans instanceof java.util.List)) {
+                return out;
+            }
+            for (Object man : (java.util.List) mans) {
+                if (man == null) continue;
+                try {
+                    Object user = de.robv.android.xposed.XposedHelpers.callMethod(man, "getUser", new Object[0]);
+                    if (user == null) continue;
+                    String nick = (String) de.robv.android.xposed.XposedHelpers.callMethod(user, "getNick", new Object[0]);
+                    String uin = "";
+                    try {
+                        uin = (String) de.robv.android.xposed.XposedHelpers.callMethod(user, "getUin", new Object[0]);
+                    } catch (Throwable ignored) {}
+                    boolean superLike = false;
+                    try {
+                        superLike = de.robv.android.xposed.XposedHelpers.callMethod(user, "getIsSuperLike", new Object[0]) != null
+                                && ((Boolean) de.robv.android.xposed.XposedHelpers.callMethod(user, "getIsSuperLike", new Object[0])).booleanValue();
+                    } catch (Throwable ignored) {}
+                    if (nick == null || nick.isEmpty()) {
+                        nick = uin == null || uin.isEmpty() ? "(未知)" : uin;
+                    }
+                    out.add(superLike ? nick + "(特赞)" : nick);
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("QQ动态: 提取点赞昵称失败 " + t);
+        }
+        return out;
+    }
+
+    /** 某条动态的点赞总数（StFeedCellLike.num） */
+    public static int feedZanCount(Object feed) {
+        try {
+            if (feed == null) return 0;
+            Object cellLike = de.robv.android.xposed.XposedHelpers.callMethod(feed, "getCellLike", new Object[0]);
+            if (cellLike == null) return 0;
+            Object n = de.robv.android.xposed.XposedHelpers.callMethod(cellLike, "getNum", new Object[0]);
+            return n instanceof Integer ? ((Integer) n).intValue() : 0;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    public static final class FeedRecord {
+        public final java.lang.Object feed;
+        public java.lang.Object host;
+        public final java.lang.String key;
+        public final java.lang.String nick;
+        public final long owner;
+        public final long timeMs;
 
         FeedRecord(java.lang.Object obj, java.lang.Object obj2, java.lang.String str, long j, java.lang.String str2, long j2) {
             this.feed = obj;
