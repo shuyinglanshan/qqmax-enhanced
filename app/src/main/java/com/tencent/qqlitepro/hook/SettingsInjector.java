@@ -342,8 +342,10 @@ public final class SettingsInjector {
                                     .append(one[0] == null || one[0].isEmpty() ? "未知" : one[0])
                                     .append("(").append(qq > 0 ? String.valueOf(qq)
                                             : (one[2] == null ? "?" : one[2]))
-                                    .append(") ").append(one[1]).append(" 条\n");
+                                    .append(") ").append(one[1]).append("条\n");
                         }
+                        /* 排行榜与来源之间空一行 */
+                        sb.append("\n");
                         sb.append("来源于QQMax增强模块\n");
                         sb.append("官方群号:801524531");
                         android.content.ClipboardManager cm = (android.content.ClipboardManager)
