@@ -228,7 +228,31 @@ public final class QzoneDynamicHook {
      *   NavController nc = NavHostFragment.S(fragment);
      *   nc.f(2114521173, b, null);
      */
+    /** 共享头像加载线程池（避免每头像一线程，加载更快） */
+    private static java.util.concurrent.ExecutorService ZAN_POOL = null;
+
+    private static synchronized java.util.concurrent.ExecutorService ZanAvatarPool() {
+        if (ZAN_POOL == null) {
+            ZAN_POOL = java.util.concurrent.Executors.newFixedThreadPool(6,
+                    new java.util.concurrent.ThreadFactory() {
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread t = new Thread(r, "zan-avatar");
+                            t.setDaemon(true);
+                            t.setPriority(java.lang.Thread.NORM_PRIORITY);
+                            return t;
+                        }
+                    });
+        }
+        return ZAN_POOL;
+    }
+
     private static android.app.Dialog sZanDialog = null;
+    /** 上一次渲染的点赞用户指纹，用于避免无变化时重建（防止头像闪烁） */
+    private static volatile String sLastZanSignature = null;
+    /** 头像缓存：uin -> Bitmap，避免每次刷新重新请求导致闪烁 */
+    private static final java.util.Map<Long, android.graphics.Bitmap> sAvatarCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private static Object sZanDialogData = null;
 
     /** 打开点赞用户全屏列表 */
@@ -344,6 +368,7 @@ public final class QzoneDynamicHook {
         } catch (Throwable ignored) {}
         sZanDialog = null;
         sZanDialogData = null;
+        sLastZanSignature = null;
     }
 
     /** 重新填充点赞用户列表（每项：头像 + 昵称 + QQ号，全部标蓝可点击） */
@@ -402,6 +427,30 @@ public final class QzoneDynamicHook {
                 }
             }
 
+            /* 增量刷新：数据签名未变则不重建，彻底消除头像闪烁 */
+            StringBuilder sig = new StringBuilder();
+            for (Object[] one : users) {
+                sig.append(one[1]).append('/');
+            }
+            String newSig = sig.toString();
+            Object oldSigObj = box.getTag(0x7f0e0005);
+            if (oldSigObj != null && newSig.equals(String.valueOf(oldSigObj))
+                    && box.getChildCount() > 0) {
+                return;
+            }
+            box.setTag(0x7f0e0005, newSig);
+
+            /* 内容未变化则不重建，避免每 2 秒刷新导致头像闪烁 */
+            StringBuilder sigb = new StringBuilder();
+            for (Object[] one : users) {
+                sigb.append(one[0]).append(':').append(one[1]).append(';');
+            }
+            String zanSig = sigb.toString();
+            if (zanSig.equals(sLastZanSignature) && box.getChildCount() > 0) {
+                return;
+            }
+            sLastZanSignature = zanSig;
+
             box.removeAllViews();
             if (users.isEmpty()) {
                 android.widget.TextView empty = new android.widget.TextView(ctx);
@@ -413,7 +462,23 @@ public final class QzoneDynamicHook {
                 return;
             }
             android.widget.TextView countTv = new android.widget.TextView(ctx);
-            countTv.setText("共 " + users.size() + " 人");
+            /* likeNum 是服务端下发的真实总赞数；likeMans 只含前 10 个 */
+            int totalLikes = users.size();
+            try {
+                Object num = de.robv.android.xposed.XposedHelpers
+                        .getObjectField(cellLike, "likeNum");
+                if (num != null) {
+                    int n = ((Number) num).intValue();
+                    if (n > totalLikes) {
+                        totalLikes = n;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            String cntText = "共 " + totalLikes + " 人";
+            if (totalLikes > users.size()) {
+                cntText += "（QQ 侧仅返回前 " + users.size() + " 个）";
+            }
+            countTv.setText(cntText);
             countTv.setTextSize(12.5f);
             countTv.setTextColor(-8355712);
             countTv.setPadding(0, 4, 0, 10);
@@ -457,35 +522,42 @@ public final class QzoneDynamicHook {
                 row.setClickable(false);
                 box.addView(row);
 
-                /* 头像异步加载 */
+                /* 头像：先查缓存，命中直接显示（不闪烁） */
                 if (uin > 0) {
                     final android.widget.ImageView fAv = av;
                     final long fUin = uin;
-                    new Thread(new Runnable() {
+                    android.graphics.Bitmap cachedAvatar = sAvatarCache.get(Long.valueOf(fUin));
+                    if (cachedAvatar != null && !cachedAvatar.isRecycled()) {
+                        try { fAv.setImageBitmap(cachedAvatar); } catch (Throwable ignored) {}
+                        continue;
+                    }
+                    ZanAvatarPool().execute(new Runnable() {
                         @Override
                         public void run() {
                             try {
                                 java.net.URL u = new java.net.URL(
-                                        "https://q1.qlogo.cn/g?b=qq&nk=" + fUin + "&s=100");
+                                        "https://q1.qlogo.cn/g?b=qq&nk=" + fUin + "&s=40");
                                 java.net.HttpURLConnection conn =
                                         (java.net.HttpURLConnection) u.openConnection();
-                                conn.setConnectTimeout(8000);
-                                conn.setReadTimeout(8000);
+                                conn.setConnectTimeout(4000);
+                                conn.setReadTimeout(4000);
                                 final android.graphics.Bitmap bm =
                                         android.graphics.BitmapFactory.decodeStream(conn.getInputStream());
                                 if (bm != null) {
+                                    sAvatarCache.put(Long.valueOf(fUin), bm);
                                     new android.os.Handler(android.os.Looper.getMainLooper())
                                             .post(new Runnable() {
                                                 @Override
                                                 public void run() {
-                                                    try { fAv.setImageBitmap(bm); }
-                                                    catch (Throwable ignored) {}
+                                                    try {
+                                                        fAv.setImageBitmap(bm);
+                                                    } catch (Throwable ignored) {}
                                                 }
                                             });
                                 }
                             } catch (Throwable ignored) {}
                         }
-                    }, "zan-avatar").start();
+                    });
                 }
             }
         } catch (Throwable ignored) {}
@@ -894,15 +966,39 @@ public final class QzoneDynamicHook {
             if (more == null) return;
             more.setTag("qqmax_more_probe");
             more.setTag(-0x7f0e0004, feed);
-            /* 用 OnTouchListener 记录，不消费事件，保证宿主原逻辑不受影响 */
+            /*
+             * 记录点击时的 feed。
+             * 关键：用 View 自己的 tag 存储（每次 onBind 都会刷新），
+             * 而不是闭包里捕获的 feed —— 否则 RecyclerView 复用后会拿到旧数据。
+             */
             more.setOnTouchListener(new android.view.View.OnTouchListener() {
                 @Override
                 public boolean onTouch(android.view.View v, android.view.MotionEvent e) {
                     try {
                         if (e.getAction() == android.view.MotionEvent.ACTION_DOWN) {
-                            Object f = v.getTag(-0x7f0e0004);
-                            if (f != null) {
-                                sLastClickedFeed = f;
+                            /*
+                             * 三重解析，确保拿到"这张卡片"的数据：
+                             *  1) ViewHolder.h（最准）
+                             *  2) 卡片在 RecyclerView 中的位置索引
+                             *  3) View 自己的 tag（onBind 时写入）
+                             */
+                            Object f = resolveFeedAt(v);
+                            if (f == null) {
+                                f = resolveFeedByPosition(v);
+                            }
+                            if (f == null) {
+                                f = v.getTag(-0x7f0e0004);
+                            }
+                            if (f == null) {
+                                f = v.getTag(-0x7f0e0004);
+                            }
+                            sLastClickedFeed = f;
+                            sClickedSeq++;
+                            if (sClickedSeq < 8) {
+                                com.tencent.qqlitepro.util.Log.i(
+                                        "动态点赞: 点击 seq=" + sClickedSeq
+                                        + " feed=" + (f == null ? "null"
+                                        : f.getClass().getSimpleName()));
                             }
                         }
                     } catch (Throwable ignored) {}
@@ -910,6 +1006,173 @@ public final class QzoneDynamicHook {
                 }
             });
         } catch (Throwable ignored) {}
+    }
+
+    /** 备选：按"卡片在 RecyclerView 中的位置"去 sLastFeedList 里取对应 feed */
+    private static Object resolveFeedByPosition(android.view.View v) {
+        try {
+            android.view.View cur = v;
+            android.view.View rv = null;
+            for (int i = 0; i < 12 && cur != null; i++) {
+                if (isRv(cur)) { rv = cur; break; }
+                android.view.ViewParent p = cur.getParent();
+                cur = (p instanceof android.view.View) ? (android.view.View) p : null;
+            }
+            if (!(rv instanceof android.view.ViewGroup)) {
+                return null;
+            }
+            android.view.View child = v;
+            android.view.ViewGroup vg = (android.view.ViewGroup) rv;
+            while (child != null && child.getParent() != vg) {
+                android.view.ViewParent p = child.getParent();
+                child = (p instanceof android.view.View) ? (android.view.View) p : null;
+            }
+            if (child == null) {
+                return null;
+            }
+            int idx = vg.indexOfChild(child);
+            java.util.List<?> feeds = sLastFeedList;
+            if (feeds == null || feeds.isEmpty()) {
+                return null;
+            }
+            /* 用首个可见位置做偏移，尽量对齐 */
+            int firstVisible = 0;
+            try {
+                Object fp = de.robv.android.xposed.XposedHelpers
+                        .callMethod(rv, "getChildAdapterPosition", child);
+                if (fp instanceof Integer && ((Integer) fp).intValue() >= 0) {
+                    firstVisible = ((Integer) fp).intValue() - idx;
+                }
+            } catch (Throwable ignored) {}
+            int target = firstVisible + idx;
+            if (target >= 0 && target < feeds.size()) {
+                return feeds.get(target);
+            }
+            return null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** 向上找到所属 RecyclerView */
+    private static Object rvOf(android.view.View v) {
+        try {
+            android.view.View cur = v;
+            for (int i = 0; i < 14 && cur != null; i++) {
+                if (isRv(cur)) return cur;
+                android.view.ViewParent p = cur.getParent();
+                cur = (p instanceof android.view.View) ? (android.view.View) p : null;
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** 该 RecyclerView 的 adapter 是否为动态列表适配器 */
+    private static boolean isQzoneFeedRv(Object rv) {
+        try {
+            Object ad = de.robv.android.xposed.XposedHelpers
+                    .callMethod(rv, "getAdapter", new Object[0]);
+            if (ad == null) return false;
+            String cn = ad.getClass().getName();
+            return cn.contains("QZoneFeedAdapter") || cn.contains("qzone_impl.frame");
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 记录最近一次被点击的 View（用于反查是哪张卡片） */
+    private static volatile android.view.View sLastTouchedView = null;
+
+    /** 安装全局触摸埋点：记录用户在动态页点了哪个 View */
+    public static void installTouchProbe() {
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(
+                    android.view.View.class, "performClick",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                android.view.View v = (android.view.View) param.thisObject;
+                                if (v == null) return;
+                                /*
+                                 * 注意：不要按 adapter 类名过滤 —— RecyclerView 可能被
+                                 * ConcatAdapter 包装导致类名不匹配（曾导致捕获失效）。
+                                 * resolveFeedAt 只在动态卡片上能取到 h 字段（BusinessFeedData），
+                                 * 弹层/其它页面的点击父链没有 RV，天然返回 null，不会污染。
+                                 */
+                                Object f = resolveFeedAt(v);
+                                if (f == null) {
+                                    f = resolveFeedByPosition(v);
+                                }
+                                if (f != null) {
+                                    sLastClickedFeed = f;
+                                    sClickedSeq++;
+                                    if (sClickedSeq < 10) {
+                                        com.tencent.qqlitepro.util.Log.i(
+                                                "动态点赞: 点击捕获 seq=" + sClickedSeq);
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+            com.tencent.qqlitepro.util.Log.i("动态点赞: performClick 埋点已安装");
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("动态点赞: performClick 埋点失败 " + t);
+        }
+    }
+
+    /** 从任意子 View 向上找到 RecyclerView，再用 getChildViewHolder 取该卡片的 feed */
+    private static Object resolveFeedAt(android.view.View v) {
+        try {
+            android.view.View cur = v;
+            android.view.View rv = null;
+            for (int i = 0; i < 12 && cur != null; i++) {
+                if (isRv(cur)) {
+                    rv = cur;
+                    break;
+                }
+                android.view.ViewParent p = cur.getParent();
+                cur = (p instanceof android.view.View) ? (android.view.View) p : null;
+            }
+            if (rv == null || !(rv instanceof android.view.ViewGroup)) {
+                return null;
+            }
+            /* 找到该 View 属于哪个 RecyclerView 的直接 child */
+            android.view.View child = v;
+            android.view.ViewGroup vg = (android.view.ViewGroup) rv;
+            while (child != null && child.getParent() != vg) {
+                android.view.ViewParent p = child.getParent();
+                child = (p instanceof android.view.View) ? (android.view.View) p : null;
+            }
+            if (child == null) {
+                return null;
+            }
+            java.lang.reflect.Method gvh = null;
+            for (java.lang.reflect.Method m : rv.getClass().getMethods()) {
+                if (m.getName().equals("getChildViewHolder")
+                        && m.getParameterTypes().length == 1
+                        && m.getParameterTypes()[0] == android.view.View.class) {
+                    gvh = m;
+                    break;
+                }
+            }
+            if (gvh == null) {
+                return null;
+            }
+            Object vh = gvh.invoke(rv, child);
+            if (vh == null) {
+                return null;
+            }
+            try {
+                Object f = de.robv.android.xposed.XposedHelpers.getObjectField(vh, "h");
+                if (f != null) {
+                    return f;
+                }
+            } catch (Throwable ignored) {}
+            return null;
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     /** 找卡片里的"三点/更多"按钮：ImageView 且无文字、位于右上角，或 id 名含 more */
@@ -953,6 +1216,7 @@ public final class QzoneDynamicHook {
     private static volatile java.util.List<?> sLastFeedList = null;
     /** 最近一次点击"更多操作"的那张卡片对应的 feed */
     private static volatile Object sLastClickedFeed = null;
+    private static volatile long sClickedSeq = 0L;
 
     /** 记录最近一次 onUiFeedList（由 QqDynamicScheduler 调用） */
     public static void rememberFeedList(java.util.List<?> list) {
@@ -1018,14 +1282,28 @@ public final class QzoneDynamicHook {
                 return;
             }
             /* 确定本弹层作用于哪条动态：优先用最近一次被"更多操作"点击的卡片 */
-            Object feed = sLastClickedFeed;
+            /*
+             * 只认"点击三点按钮时精确记录的那一条"。
+             * 绝不再用 findFeedForMenu() 兜底 —— 那会永远返回第一条有赞的动态，
+             * 导致所有动态显示同一份列表（历史 bug）。
+             */
+            /*
+             * 最可靠：从弹层内部的菜单项 Bundle 里提取 dynamic_id / touin，
+             * 这是宿主创建"更多操作"菜单时写入的、与该动态绑定的真实数据。
+             * （逆向：handleOperationMore 会 put dynamic_id=feedskey, touin=user.uin）
+             */
+            Object feed = resolveFeedFromDialogViews(all);
             if (feed == null) {
-                feed = findFeedForMenu(decor.getContext());
+                feed = sLastClickedFeed;
+            }
+            if (feed == null) {
+                /* 兜底：取 RecyclerView 中"屏幕上最靠上且带赞"的可见卡片 */
+                feed = firstVisibleFeedWithLikes();
             }
             sDialogFeed.put(d, feed);
-            if (feed == null) {
-                com.tencent.qqlitepro.util.Log.w("动态点赞: 弹层未关联到动态，跳过注入");
-                return;
+            if (sClickedSeq < 20) {
+                com.tencent.qqlitepro.util.Log.i("动态点赞: 弹层绑定 feed="
+                        + (feed == null ? "null" : "ok") + " (dialog-resolve)");
             }
             /* 找最深的竖排容器（按钮列表的父级） */
             android.view.ViewGroup best = null;
@@ -1065,10 +1343,15 @@ public final class QzoneDynamicHook {
             btn.setOnClickListener(new android.view.View.OnClickListener() {
                 @Override
                 public void onClick(android.view.View v) {
-                    Object feed = sDialogFeed.get(d);
+                    /* 优先用最近一次点击捕获的 feed（点击"更多操作"时记录） */
+                    Object feed = sLastClickedFeed;
+                    sLastClickedFeed = null;
+                    if (feed == null) {
+                        feed = sDialogFeed.get(d);
+                    }
                     try { d.dismiss(); } catch (Throwable ignored) {}
                     if (feed == null) {
-                        com.tencent.qqlitepro.util.Log.w("动态点赞: 该弹层未绑定动态数据");
+                        com.tencent.qqlitepro.util.Log.w("动态点赞: 未解析到该动态数据");
                         return;
                     }
                     showZanUsersDialog(v.getContext(), feed, null);
@@ -1106,6 +1389,153 @@ public final class QzoneDynamicHook {
         } catch (Throwable t) {
             com.tencent.qqlitepro.util.Log.w("动态点赞: 追加按钮失败 " + t);
         }
+    }
+
+    /**
+     * 从弹层视图树里提取菜单项携带的 dynamic_id / touin，
+     * 再到最近一次的 feed 列表里精确匹配出对应的 BusinessFeedData。
+     */
+    private static Object resolveFeedFromDialogViews(java.util.ArrayList<android.view.View> all) {
+        String dynId = null;
+        String touin = null;
+        try {
+            for (android.view.View v : all) {
+                if (v == null) continue;
+                for (Class<?> c = v.getClass(); c != null && c != java.lang.Object.class;
+                     c = c.getSuperclass()) {
+                    for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                        if (f.getType() != android.os.Bundle.class) continue;
+                        try {
+                            f.setAccessible(true);
+                            Object b = f.get(v);
+                            if (!(b instanceof android.os.Bundle)) continue;
+                            android.os.Bundle bb = (android.os.Bundle) b;
+                            if (dynId == null && bb.containsKey("dynamic_id")) {
+                                dynId = bb.getString("dynamic_id");
+                            }
+                            if (touin == null && bb.containsKey("touin")) {
+                                touin = bb.getString("touin");
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        if (dynId == null && touin == null) {
+            return null;
+        }
+        java.util.List<?> feeds = sLastFeedList;
+        if (feeds == null || feeds.isEmpty()) {
+            return null;
+        }
+        if (dynId != null) {
+            for (Object fd : feeds) {
+                if (fd == null) continue;
+                try {
+                    Object comm = de.robv.android.xposed.XposedHelpers
+                            .getObjectField(fd, "feedCommInfo");
+                    Object key = de.robv.android.xposed.XposedHelpers
+                            .getObjectField(comm, "feedskey");
+                    if (key != null && dynId.equals(String.valueOf(key))) {
+                        return fd;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        if (touin != null) {
+            for (Object fd : feeds) {
+                if (fd == null) continue;
+                try {
+                    Object u = de.robv.android.xposed.XposedHelpers.getObjectField(fd, "user");
+                    Object uin = de.robv.android.xposed.XposedHelpers.getObjectField(u, "uin");
+                    if (uin != null && touin.equals(String.valueOf(uin))) {
+                        return fd;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        return null;
+    }
+
+    /** 从 RecyclerView 里取当前可见的第一张带赞卡片的 feed */
+    private static Object firstVisibleFeedWithLikes() {
+        try {
+            android.view.View rv = findRvFromActivity();
+            if (sClickedSeq < 20) {
+                com.tencent.qqlitepro.util.Log.i("动态点赞: 兜底 rv="
+                        + (rv == null ? "null" : rv.getClass().getName()));
+            }
+            if (!(rv instanceof android.view.ViewGroup)) {
+                return null;
+            }
+            android.view.ViewGroup vg = (android.view.ViewGroup) rv;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                android.view.View card = vg.getChildAt(i);
+                if (card == null) continue;
+                Object vh = viewHolderOf(rv, card);
+                if (vh == null) continue;
+                try {
+                    Object f = de.robv.android.xposed.XposedHelpers.getObjectField(vh, "h");
+                    if (f == null) continue;
+                    Object cl = de.robv.android.xposed.XposedHelpers
+                            .getObjectField(f, "cellLikeInfo");
+                    if (cl == null) continue;
+                    Object mans = de.robv.android.xposed.XposedHelpers
+                            .getObjectField(cl, "likeMans");
+                    if (mans instanceof java.util.List
+                            && !((java.util.List) mans).isEmpty()) {
+                        return f;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /**
+     * 找动态页 RecyclerView：优先用 QqDynamicScheduler 里 hook 成功的 sLastUiHost
+     * （QZoneMainFrame），从它反查 RecyclerView —— 这是之前验证可行的路径。
+     */
+    private static android.view.View findRvFromActivity() {
+        try {
+            Object host = com.tencent.qqlitepro.auto.QqDynamicScheduler.lastUiHostPublic();
+            if (host != null) {
+                android.view.View rv = findRecyclerView(host);
+                if (rv != null) {
+                    return rv;
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            android.app.Activity a = com.tencent.qqlitepro.hook.ChatCardInjector.anyActivityPublic();
+            if (a == null) return null;
+            android.view.View decor = a.getWindow() != null
+                    ? a.getWindow().getDecorView() : null;
+            if (decor == null) return null;
+            java.util.ArrayList<android.view.View> all = new java.util.ArrayList<>();
+            collectAll(decor, all, 0);
+            for (android.view.View v : all) {
+                if (isRv(v)) {
+                    return v;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    /** 取 RecyclerView 中某 child 的 ViewHolder */
+    private static Object viewHolderOf(Object rv, android.view.View child) {
+        try {
+            for (java.lang.reflect.Method m : rv.getClass().getMethods()) {
+                if (m.getName().equals("getChildViewHolder")
+                        && m.getParameterTypes().length == 1
+                        && m.getParameterTypes()[0] == android.view.View.class) {
+                    m.setAccessible(true);
+                    return m.invoke(rv, child);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private static int depthOf(android.view.View root, android.view.View target) {
