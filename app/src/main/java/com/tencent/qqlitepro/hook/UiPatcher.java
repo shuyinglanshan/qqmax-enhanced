@@ -614,9 +614,12 @@ public final class UiPatcher {
                 }
             }
             String zanText = sb.length() == 0 ? "" : sb.toString();
-            /* 3) 找点赞按钮的父布局（遍历 itemView 找 id 名含 like 的 View） */
+            /* 3) 定位"点赞按钮/点赞数"所在的容器，作为插入锚点 */
             android.view.View itemView = (android.view.View) de.robv.android.xposed.XposedHelpers.getObjectField(holder, "itemView");
             android.view.View likeView = findViewByNameContains(itemView, "like");
+            if (likeView == null) {
+                likeView = findZanAnchor(itemView);
+            }
             android.view.ViewGroup insertParent = null;
             android.view.View insertAfter = null;
             if (likeView != null && likeView.getParent() instanceof android.view.ViewGroup) {
@@ -657,6 +660,11 @@ public final class UiPatcher {
                 tv.setTag("qqlite_zan_names");
                 tv.setTextSize(11.5f);
                 tv.setTextColor(-6643546);
+                /* 多条点赞自动换行 */
+                tv.setSingleLine(false);
+                tv.setMaxLines(20);
+                tv.setEllipsize(null);
+                tv.setLineSpacing(0f, 1.15f);
                 int pad = (int) (ctx.getResources().getDisplayMetrics().density * 8);
                 tv.setPadding(pad, 2, pad, 4);
                 android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(
@@ -669,7 +677,67 @@ public final class UiPatcher {
                 tv.setVisibility(android.view.View.VISIBLE);
             }
             tv.setText(zanText);
+            tv.setSingleLine(false);
+            tv.setMaxLines(20);
+            tv.setEllipsize(null);
         } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 找"点赞"锚点：优先找显示纯数字的 TextView（点赞数），
+     * 找不到就取卡片底部最后一个横向容器。
+     */
+    private static android.view.View findZanAnchor(android.view.View root) {
+        try {
+            java.util.ArrayList<android.view.View> all = new java.util.ArrayList<>();
+            collectViews(root, all, 0);
+            /* 1) 纯数字 TextView 且长度<=5（点赞数） */
+            android.view.View digitTv = null;
+            for (android.view.View v : all) {
+                if (!(v instanceof android.widget.TextView)) continue;
+                String txt = String.valueOf(((android.widget.TextView) v).getText()).trim();
+                if (txt.isEmpty() || txt.length() > 5) continue;
+                boolean allDigit = true;
+                for (int i = 0; i < txt.length(); i++) {
+                    if (!Character.isDigit(txt.charAt(i))) { allDigit = false; break; }
+                }
+                if (!allDigit) continue;
+                if ((int) ((android.widget.TextView) v).getTextSize() > 60) continue;
+                digitTv = v;
+            }
+            if (digitTv != null && digitTv.getParent() instanceof android.view.ViewGroup) {
+                return digitTv;
+            }
+            /* 2) 兜底：最靠下的横向容器 */
+            android.view.View best = null;
+            int bestBottom = -1;
+            for (android.view.View v : all) {
+                if (!(v instanceof android.widget.LinearLayout)) continue;
+                android.widget.LinearLayout ll = (android.widget.LinearLayout) v;
+                if (ll.getOrientation() != android.widget.LinearLayout.HORIZONTAL) continue;
+                int b = v.getBottom();
+                if (b > bestBottom) {
+                    bestBottom = b;
+                    best = v;
+                }
+            }
+            return best;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void collectViews(android.view.View root, java.util.ArrayList<android.view.View> out, int depth) {
+        if (root == null || depth > 20 || out.size() > 300) {
+            return;
+        }
+        out.add(root);
+        if (root instanceof android.view.ViewGroup) {
+            android.view.ViewGroup vg = (android.view.ViewGroup) root;
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                collectViews(vg.getChildAt(i), out, depth + 1);
+            }
         }
     }
 
