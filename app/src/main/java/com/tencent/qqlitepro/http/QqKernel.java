@@ -6915,7 +6915,8 @@ public final class QqKernel {
          * 新消息到达（首次登记）时给该 peerUid 累加未读，
          * 与宿主自己发消息的回显区分开：只有 msgTime 推进才算新消息。
          */
-        if (isNew) {
+        /* 只有"未读过期"的消息才累加：进入过会话并读到最新后，旧消息不再计数 */
+        if (isNew && !tempChatSeen(str, jSecondsToMs)) {
             bumpTempChatUnread(str, 1);
         }
         com.tencent.qqlitepro.util.Log.i("临时会话: 登记待显示 peerUid=" + str + " uin=" + jLongOf + " chatType=" + i + " nick=" + str3 + " msgTime=" + jSecondsToMs + " 待显示数=" + concurrentHashMap.size());
@@ -7020,7 +7021,11 @@ public final class QqKernel {
             new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.lang.String TEMP_CHAT_UNREAD_PREF_KEY = "unread_counts";
 
-    /** 记录某临时会话的未读数 */
+    /** 已读时间戳：清除未读时记录，之后只有更新的消息才重新计数 */
+    private static final java.util.concurrent.ConcurrentHashMap<java.lang.String, java.lang.Long>
+            sTempChatReadAt = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 记录某临时会话的未读数；count<=0 视为"已读"，记录已读时间 */
     public static void setTempChatUnread(java.lang.String peerUid, int count) {
         if (peerUid == null || peerUid.isEmpty()) {
             return;
@@ -7028,11 +7033,26 @@ public final class QqKernel {
         java.lang.String key = strictKey(peerUid);
         if (count <= 0) {
             sTempChatUnread.remove(key);
+            sTempChatReadAt.put(key, java.lang.Long.valueOf(java.lang.System.currentTimeMillis()));
         } else {
             sTempChatUnread.put(key, java.lang.Integer.valueOf(count));
         }
         saveTempChatUnread();
         refreshTempChatList();
+    }
+
+    /** 当前会话是否已读到最新（msgTime <= 已读时间则不再计数） */
+    public static boolean tempChatSeen(java.lang.String peerUid, long msgTimeMs) {
+        if (peerUid == null || peerUid.isEmpty()) {
+            return false;
+        }
+        java.lang.Long at = sTempChatReadAt.get(strictKey(peerUid));
+        return at != null && msgTimeMs <= at.longValue() + 2000L;
+    }
+
+    /** 清空某会话未读（进入会话时调用） */
+    public static void markTempChatRead(java.lang.String peerUid) {
+        setTempChatUnread(peerUid, 0);
     }
 
     /** 读取某临时会话的未读数 */
