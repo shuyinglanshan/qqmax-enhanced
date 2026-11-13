@@ -4427,9 +4427,9 @@ public final class QqKernel {
             return;
         }
         try {
-            // 先登记"本次要操作的会话"，供菜单 hook 内的删除逻辑定位目标
+            /* 登记目标 uid + 标记为 temp 菜单（与邮箱卡/正常会话完全隔离） */
             sMenuTargetUid = normPeerUid(peerUid);
-            com.tencent.qqlitepro.hook.ChatCardInjector.showNativeMailMenu(context);
+            com.tencent.qqlitepro.hook.ChatCardInjector.showTempKindMenu(context);
         } catch (java.lang.Throwable th) {
             com.tencent.qqlitepro.util.Log.w("临时会话: 弹出宿主菜单失败 " + chain(th));
         }
@@ -7210,8 +7210,9 @@ public final class QqKernel {
                     Object avObj = null;
                     if (avatarCls != null) {
                         try {
-                            avObj = avatarCls.newInstance();
-                            de.robv.android.xposed.XposedHelpers.setObjectField(avObj, "b", String.valueOf(jDigitsOf));
+                            avObj = avatarCls.getConstructor(Integer.TYPE, String.class,
+                                            Integer.class, Integer.class)
+                                    .newInstance(Integer.valueOf(1), String.valueOf(jDigitsOf), null, null);
                         } catch (Throwable ignored) {}
                     }
                     /* ===== 方案A：Unsafe 分配 + 逐字段赋值（绕过 Kotlin 非空构造器校验） ===== */
@@ -7314,6 +7315,71 @@ public final class QqKernel {
                 com.tencent.qqlitepro.util.Log.w("临时会话: 构建宿主 item 失败 " + chain(t2));
             }
 
+            /*
+             * ===== 首选：深度克隆宿主真实 ChatItem =====
+             * 宿主列表里必然有真实 item，用它做原型浅拷贝所有字段（保证 AvatarInfo/TitleInfo/
+             * SummaryInfo/UnreadInfo/VasInfo 等全部非空），再覆盖展示相关字段。
+             * 这样宿主在构造 DeleteItem/SetTopItem 等（内部会调 hashCode）时不会 NPE。
+             */
+            try {
+                Object proto = com.tencent.qqlitepro.hook.ChatCardInjector.hostChatItemPrototypePublic();
+                Class<?> itemCls0 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem");
+                if (proto != null && itemCls0 != null && itemCls0.isInstance(proto)) {
+                    Class<?> unsafeCls0 = Class.forName("sun.misc.Unsafe");
+                    java.lang.reflect.Field tf0 = unsafeCls0.getDeclaredField("theUnsafe");
+                    tf0.setAccessible(true);
+                    Object unsafe0 = tf0.get(null);
+                    Object clone = unsafeCls0.getMethod("allocateInstance", Class.class)
+                            .invoke(unsafe0, itemCls0);
+                    if (clone != null) {
+                        /* 浅拷贝原型所有字段（含 final 集合引用） */
+                        for (Class<?> cc = itemCls0; cc != null && cc != java.lang.Object.class;
+                             cc = cc.getSuperclass()) {
+                            for (java.lang.reflect.Field ff : cc.getDeclaredFields()) {
+                                if (java.lang.reflect.Modifier.isStatic(ff.getModifiers())) continue;
+                                try {
+                                    ff.setAccessible(true);
+                                    ff.set(clone, ff.get(proto));
+                                } catch (Throwable ignored) {}
+                            }
+                        }
+                        String previewTxt3 = previewOf(sTempChatKnown.get(str));
+                        String timeTxt3 = formatChatTime(j2);
+                        Class<?> sumCls3 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$SummaryInfo");
+                        Class<?> titleCls3 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$TitleInfo");
+                        Class<?> unreadCls3 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem$UnreadInfo");
+                        if (sumCls3 != null) {
+                            Object s3 = sumCls3.newInstance();
+                            de.robv.android.xposed.XposedHelpers.setObjectField(s3, "a", previewTxt3);
+                            de.robv.android.xposed.XposedHelpers.setObjectField(clone, "h", s3);
+                        }
+                        if (titleCls3 != null) {
+                            Object t3 = titleCls3.newInstance();
+                            de.robv.android.xposed.XposedHelpers.setObjectField(t3, "a", str3);
+                            de.robv.android.xposed.XposedHelpers.setObjectField(clone, "f", t3);
+                        }
+                        de.robv.android.xposed.XposedHelpers.setObjectField(clone, "g", timeTxt3);
+                        de.robv.android.xposed.XposedHelpers.setObjectField(clone, "d", str3);
+                        de.robv.android.xposed.XposedHelpers.setObjectField(clone, "a", objNewInstance);
+                        de.robv.android.xposed.XposedHelpers.setLongField(clone, "b", jDigitsOf);
+                        if (unreadCls3 != null) {
+                            try {
+                                Object u3 = unreadCls3.newInstance();
+                                de.robv.android.xposed.XposedHelpers.setIntField(u3, "a", unread);
+                                de.robv.android.xposed.XposedHelpers.setLongField(u3, "b", unread > 0 ? 1L : 0L);
+                                de.robv.android.xposed.XposedHelpers.setObjectField(clone, "i", u3);
+                            } catch (Throwable ignored) {}
+                        }
+                        de.robv.android.xposed.XposedHelpers.setBooleanField(clone, "k", isTempChatTop(str));
+                        com.tencent.qqlitepro.util.Log.i("临时会话: 克隆宿主 item 成功 uid=" + str
+                                + " title=" + str3 + " preview=" + previewTxt3);
+                        return clone;
+                    }
+                }
+            } catch (Throwable tClone) {
+                com.tencent.qqlitepro.util.Log.w("临时会话: 克隆宿主 item 失败 " + chain(tClone));
+            }
+
             /* ===== 回退方案：Unsafe 分配 + 逐字段赋值（绕过 Kotlin 非空构造器校验） ===== */
             try {
                 Class<?> itemCls2 = cls("com.tencent.qqnt.chats.core.adapter.itemdata.RecentContactChatItem");
@@ -7336,11 +7402,20 @@ public final class QqKernel {
                     }
                     Object av2 = null;
                     if (avatarCls2 != null) {
+                        /* 宿主 AvatarInfo(int showType, String path, Integer resId, Integer iconResId) */
                         try {
-                            av2 = avatarCls2.getDeclaredConstructor().newInstance();
-                            de.robv.android.xposed.XposedHelpers.setObjectField(av2, "b", String.valueOf(jDigitsOf));
-                        } catch (Throwable ignored) {
-                            av2 = null;
+                            av2 = avatarCls2.getConstructor(Integer.TYPE, String.class,
+                                            Integer.class, Integer.class)
+                                    .newInstance(Integer.valueOf(1), String.valueOf(jDigitsOf), null, null);
+                        } catch (Throwable ignored1) {
+                            try {
+                                av2 = avatarCls2.getConstructor(Integer.TYPE, String.class,
+                                                Integer.class, Integer.class, Integer.TYPE)
+                                        .newInstance(Integer.valueOf(1), String.valueOf(jDigitsOf),
+                                                null, null, Integer.valueOf(0));
+                            } catch (Throwable ignored2) {
+                                av2 = null;
+                            }
                         }
                     }
                     Class<?> unsafeCls = Class.forName("sun.misc.Unsafe");
