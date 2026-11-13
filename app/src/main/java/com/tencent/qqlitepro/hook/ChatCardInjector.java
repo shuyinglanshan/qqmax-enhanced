@@ -994,13 +994,26 @@ public class ChatCardInjector {
                 }
             } catch (Throwable ignored) {}
 
-            /* 卡片底色统一：binding.a 是根 ConstraintLayout。
-             * 首张卡常带宿主"焦点/选中"高亮底色，与其它卡不一致；
-             * 统一设为与宿主未选中条目同色。 */
+            /*
+             * 卡片底色：不要自己设色！
+             * 宿主 ItemRecentContactBinding.a 根容器本身带主题背景（与正常会话卡一致）。
+             * 旧实现强制 setBackgroundColor(-14013129) 会让临时卡比正常卡更深。
+             * 这里只清除可能的"高亮/选中"态残留，还原宿主默认。
+             */
             try {
                 Object rootC = bcls.getField("a").get(binding);
                 if (rootC instanceof android.view.View) {
-                    ((android.view.View) rootC).setBackgroundColor(-14013129);
+                    View rv0 = (View) rootC;
+                    if (rv0.isSelected() || rv0.isPressed() || rv0.isActivated()) {
+                        rv0.setSelected(false);
+                        rv0.setPressed(false);
+                        rv0.setActivated(false);
+                    }
+                    /* 不设自定义背景；仅当被我们早期代码污染过才重置 */
+                    android.graphics.drawable.Drawable bgd = rv0.getBackground();
+                    if (bgd instanceof android.graphics.drawable.ColorDrawable) {
+                        rv0.setBackground(null);
+                    }
                 }
             } catch (Throwable ignored) {}
 
@@ -2017,6 +2030,46 @@ public class ChatCardInjector {
                 itemView = (View) XposedHelpers.getObjectField(holder, "itemView");
             } catch (Throwable ignored) {}
 
+            /*
+             * 关键：itemView 会被 RecyclerView 复用。
+             * 旧版自绘卡曾给它设过深色圆角背景 / 12dp padding / 6dp 外边距，
+             * 换成宿主 binding 渲染后这些残留会让临时卡底色与正常会话不一致。
+             * 这里还原为宿主原生外观（宿主正常卡没有自定义背景，padding/外边距由布局自身决定）。
+             */
+            try {
+                if (itemView != null) {
+                    if (sBgProbe++ < 3) {
+                        Object bg1 = null;
+                        try { bg1 = XposedHelpers.callMethod(itemView, "getBackground"); } catch (Throwable ignored) {}
+                        Log.i("临时卡诊断: itemView=" + itemView.getClass().getSimpleName()
+                                + " bg=" + (bg1 == null ? "null" : bg1.getClass().getSimpleName())
+                                + " pad=" + itemView.getPaddingLeft() + "," + itemView.getPaddingTop()
+                                + " layoutParams=" + (itemView.getLayoutParams() == null
+                                        ? "null" : itemView.getLayoutParams().getClass().getSimpleName())
+                                + " holder=" + (holder == null ? "null" : holder.getClass().getSimpleName())
+                                + " binding=" + (binding == null ? "null" : binding.getClass().getSimpleName()));
+                    }
+                    itemView.setBackground(null);
+                    itemView.setPadding(0, 0, 0, 0);
+                    ViewGroup.LayoutParams lp0 = itemView.getLayoutParams();
+                    if (lp0 instanceof ViewGroup.MarginLayoutParams) {
+                        ViewGroup.MarginLayoutParams mlp0 = (ViewGroup.MarginLayoutParams) lp0;
+                        mlp0.leftMargin = 0;
+                        mlp0.rightMargin = 0;
+                        mlp0.topMargin = 0;
+                        mlp0.bottomMargin = 0;
+                        itemView.setLayoutParams(mlp0);
+                    }
+                }
+                /* 内层根容器（ConstraintLayout a）也清一次，避免自绘残留 */
+                Object rootA = readAnyField(binding, "a");
+                if (rootA instanceof View) {
+                    View rv = (View) rootA;
+                    rv.setBackground(null);
+                    rv.setPadding(0, 0, 0, 0);
+                }
+            } catch (Throwable ignored) {}
+
             /* 字段：a=ConstraintLayout b=AvatarView c=昵称 d=时间 e=摘要 f=置顶 g=未读 */
             Object oNick = readAnyField(binding, "c");
             Object oSummary = readAnyField(binding, "e");
@@ -2130,231 +2183,7 @@ public class ChatCardInjector {
         return null;
     }
 
-    /**
-     * 渲染第 idx 个临时会话卡。
-     * 样式严格对齐宿主 ItemRecentContact（WatchRecentItemBuilder.a 的 inflate 布局）：
-     *   圆角 16dp / 卡片内边距 12dp / 头像 40dp / 昵称 15sp / 预览 12.5sp /
-     *   时间 11sp / 未读红色徽章 + 置顶小图标。
-     * 数据：QqKernel.tempChatSnapshot() = {uid, nick, preview, unread, msgTime}
-     */
-    public static void bindTempChatItemCard(View view, int idx) {
-        try {
-            if (!(view instanceof android.view.ViewGroup)) {
-                return;
-            }
-            android.view.ViewGroup root = (android.view.ViewGroup) view;
-            java.util.List<java.lang.Object[]> list = com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
-            if (list == null || idx < 0 || idx >= list.size()) {
-                return;
-            }
-            final Object[] item = list.get(idx);
-            final String uid = (String) item[0];
-            String nick0 = item[1] == null ? "" : String.valueOf(item[1]);
-            nick0 = nick0.replace("（临时会话）", "").replace("(临时会话)", "").trim();
-            if (nick0.isEmpty()) {
-                nick0 = uid;
-            }
-            final String nick = nick0;
-            final String preview = item[2] == null ? "" : String.valueOf(item[2]);
-            final int unread = item[3] instanceof Integer ? (Integer) item[3] : 0;
-            final long msgTime = com.tencent.qqlitepro.http.QqKernel.longOf(item[4]);
-            final long uinTmp = com.tencent.qqlitepro.http.QqKernel.uidToUinPublic(uid);
-            final boolean topped = com.tencent.qqlitepro.http.QqKernel.isTempChatTop(uid);
 
-            final android.content.Context ctx = root.getContext();
-            root.removeAllViews();
-            /* 卡片背景：与宿主一致的圆角容器 */
-            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
-            bg.setColor(-14013129);
-            bg.setCornerRadius(dp(ctx, 16));
-            root.setBackground(bg);
-            root.setPadding(dp(ctx, 12), dp(ctx, 10), dp(ctx, 12), dp(ctx, 10));
-            root.setClickable(true);
-            root.setLongClickable(true);
-            /* 卡片外边距（宿主卡间距） */
-            try {
-                android.view.ViewGroup.LayoutParams lp = root.getLayoutParams();
-                if (lp instanceof android.view.ViewGroup.MarginLayoutParams) {
-                    android.view.ViewGroup.MarginLayoutParams mlp = (android.view.ViewGroup.MarginLayoutParams) lp;
-                    mlp.leftMargin = dp(ctx, 6);
-                    mlp.rightMargin = dp(ctx, 6);
-                    mlp.topMargin = dp(ctx, 3);
-                    mlp.bottomMargin = dp(ctx, 3);
-                    root.setLayoutParams(mlp);
-                }
-            } catch (Throwable ignored) {}
-
-            android.widget.LinearLayout row = new android.widget.LinearLayout(ctx);
-            row.setOrientation(0);
-            row.setGravity(16);
-            root.addView(row, new android.widget.LinearLayout.LayoutParams(-1, -2));
-
-            /* 头像 40dp（圆角方形，与宿主一致） */
-            final android.widget.ImageView avatar = new android.widget.ImageView(ctx);
-            int av = dp(ctx, 40);
-            android.widget.LinearLayout.LayoutParams avLp = new android.widget.LinearLayout.LayoutParams(av, av);
-            avatar.setLayoutParams(avLp);
-            avatar.setScaleType(android.widget.ImageView.ScaleType.CENTER_CROP);
-            android.graphics.drawable.GradientDrawable avBg = new android.graphics.drawable.GradientDrawable();
-            avBg.setColor(-13421773);
-            avBg.setCornerRadius(dp(ctx, 8));
-            avatar.setBackground(avBg);
-            avatar.setClipToOutline(true);
-            row.addView(avatar);
-            if (uinTmp > 0) {
-                new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            java.net.URL u = new java.net.URL("https://q1.qlogo.cn/g?b=qq&nk=" + uinTmp + "&s=140");
-                            java.net.HttpURLConnection c = (java.net.HttpURLConnection) u.openConnection();
-                            c.setConnectTimeout(6000);
-                            c.setReadTimeout(6000);
-                            c.setDoInput(true);
-                            c.setRequestProperty("User-Agent", "Mozilla/5.0 (Android)");
-                            final android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeStream(c.getInputStream());
-                            if (bm != null) {
-                                new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                                    @Override
-                                    public void run() {
-                                        try {
-                                            avatar.setImageBitmap(bm);
-                                            avatar.setBackground(null);
-                                        } catch (Throwable ignored) {}
-                                    }
-                                });
-                            }
-                        } catch (Throwable ignored) {}
-                    }
-                }, "temp-av").start();
-            }
-
-            /* 中间：昵称 + 预览 */
-            android.widget.LinearLayout mid = new android.widget.LinearLayout(ctx);
-            mid.setOrientation(1);
-            android.widget.LinearLayout.LayoutParams midLp =
-                    new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f);
-            midLp.leftMargin = dp(ctx, 10);
-            row.addView(mid, midLp);
-
-            android.widget.LinearLayout titleRow = new android.widget.LinearLayout(ctx);
-            titleRow.setOrientation(0);
-            titleRow.setGravity(16);
-            mid.addView(titleRow, new android.widget.LinearLayout.LayoutParams(-1, -2));
-
-            android.widget.TextView tvNick = new android.widget.TextView(ctx);
-            tvNick.setText(nick);
-            tvNick.setTextSize(15.0f);
-            tvNick.setTextColor(-1);
-            tvNick.setSingleLine(true);
-            tvNick.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            titleRow.addView(tvNick, new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f));
-
-            /* 「（临时会话）」小字标识（灰色，不挤占昵称） */
-            android.widget.TextView tvTag = new android.widget.TextView(ctx);
-            tvTag.setText("（临时会话）");
-            tvTag.setTextSize(9.5f);
-            tvTag.setTextColor(-8355712);
-            tvTag.setSingleLine(true);
-            android.widget.LinearLayout.LayoutParams tagLp =
-                    new android.widget.LinearLayout.LayoutParams(-2, -2);
-            tagLp.leftMargin = dp(ctx, 4);
-            titleRow.addView(tvTag, tagLp);
-
-            /* 置顶小图标（宿主原生是 binding.f ImageView） */
-            android.widget.TextView tvTop = new android.widget.TextView(ctx);
-            tvTop.setText("\uD83D\uDCCC");
-            tvTop.setTextSize(10.0f);
-            tvTop.setTextColor(-6643546);
-            tvTop.setVisibility(topped ? android.view.View.VISIBLE : android.view.View.GONE);
-            android.widget.LinearLayout.LayoutParams topLp = new android.widget.LinearLayout.LayoutParams(-2, -2);
-            topLp.leftMargin = dp(ctx, 4);
-            titleRow.addView(tvTop, topLp);
-
-            android.widget.TextView tvPrev = new android.widget.TextView(ctx);
-            tvPrev.setText(preview);
-            tvPrev.setTextSize(12.5f);
-            tvPrev.setTextColor(-6643546);
-            tvPrev.setSingleLine(true);
-            tvPrev.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            android.widget.LinearLayout.LayoutParams pvLp = new android.widget.LinearLayout.LayoutParams(-1, -2);
-            pvLp.topMargin = dp(ctx, 3);
-            mid.addView(tvPrev, pvLp);
-
-            /* 右侧：时间 + 未读徽章 */
-            android.widget.LinearLayout right = new android.widget.LinearLayout(ctx);
-            right.setOrientation(1);
-            right.setGravity(17);
-            android.widget.LinearLayout.LayoutParams rightLp = new android.widget.LinearLayout.LayoutParams(-2, -2);
-            rightLp.leftMargin = dp(ctx, 6);
-            row.addView(right, rightLp);
-
-            android.widget.TextView tvTime = new android.widget.TextView(ctx);
-            tvTime.setTextSize(11.0f);
-            tvTime.setTextColor(-6643546);
-            tvTime.setSingleLine(true);
-            if (msgTime > 0) {
-                long now = java.lang.System.currentTimeMillis();
-                java.text.SimpleDateFormat sdf;
-                if (now - msgTime < 86400000L) {
-                    sdf = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault());
-                } else {
-                    sdf = new java.text.SimpleDateFormat("MM/dd", java.util.Locale.getDefault());
-                }
-                tvTime.setText(sdf.format(new java.util.Date(msgTime)));
-            }
-            right.addView(tvTime, new android.widget.LinearLayout.LayoutParams(-2, -2));
-
-            if (unread > 0) {
-                android.widget.TextView badge = new android.widget.TextView(ctx);
-                badge.setText(unread > 99 ? "99+" : String.valueOf(unread));
-                badge.setTextSize(10.0f);
-                badge.setTextColor(-1);
-                badge.setGravity(17);
-                badge.setSingleLine(true);
-                android.graphics.drawable.GradientDrawable bd = new android.graphics.drawable.GradientDrawable();
-                bd.setColor(-2142769);
-                bd.setCornerRadius(dp(ctx, 9));
-                badge.setBackground(bd);
-                int minW = dp(ctx, 18);
-                badge.setMinWidth(minW);
-                badge.setPadding(dp(ctx, 4), 0, dp(ctx, 4), 0);
-                android.widget.LinearLayout.LayoutParams bLp = new android.widget.LinearLayout.LayoutParams(-2, dp(ctx, 18));
-                bLp.topMargin = dp(ctx, 4);
-                bLp.gravity = 17;
-                right.addView(badge, bLp);
-            }
-
-            /* 点击进会话 */
-            root.setOnClickListener(new android.view.View.OnClickListener() {
-                @Override
-                public void onClick(android.view.View v) {
-                    try {
-                        com.tencent.qqlitepro.http.QqKernel.setTempChatUnread(uid, 0);
-                        com.tencent.qqlitepro.http.QqKernel.openTempChatSession(v.getContext(), uid);
-                    } catch (Throwable ignored) {}
-                }
-            });
-            /* 长按：复用宿主原生会话卡片设置链路（逐会话独立生效） */
-            root.setOnLongClickListener(new android.view.View.OnLongClickListener() {
-                @Override
-                public boolean onLongClick(android.view.View v) {
-                    try {
-                        Object chatItem = com.tencent.qqlitepro.http.QqKernel.tempChatItemFor(uid);
-                        Object frag = ChatCardInjector.topAndroidXFragmentOf(v.getContext());
-                        if (chatItem != null
-                                && ChatCardInjector.showHostSessionMenu(v.getContext(), chatItem, frag)) {
-                            return true;
-                        }
-                        com.tencent.qqlitepro.http.QqKernel.showTempChatMenu(v.getContext(), uid);
-                    } catch (Throwable ignored) {}
-                    return true;
-                }
-            });
-        } catch (Throwable th) {
-            com.tencent.qqlitepro.util.Log.w("bindTempChatItemCard 失败: " + th);
-        }
-    }
 
     public static void bindTempChatCard(View view) {
         if (view == null) {
@@ -3938,6 +3767,7 @@ public class ChatCardInjector {
     private static volatile int sVTProbe = 0;
     private static volatile int sBindProbe = 0;
     private static volatile int sTimeProbe = 0;
+    private static volatile int sBgProbe = 0;
 
     static class GetItemOverride
     extends XC_MethodHook {
