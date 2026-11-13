@@ -670,6 +670,25 @@ public final class SettingsInjector {
         }
     }
 
+    /** 排行榜头像加载线程池（避免每个头像一个线程） */
+    private static java.util.concurrent.ExecutorService sRankAvatarPool = null;
+
+    private static synchronized java.util.concurrent.ExecutorService rankAvatarPool() {
+        if (sRankAvatarPool == null) {
+            sRankAvatarPool = java.util.concurrent.Executors.newFixedThreadPool(4,
+                    new java.util.concurrent.ThreadFactory() {
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread t = new Thread(r, "rank-avatar");
+                            t.setDaemon(true);
+                            t.setPriority(java.lang.Thread.MIN_PRIORITY);
+                            return t;
+                        }
+                    });
+        }
+        return sRankAvatarPool;
+    }
+
     /** 把 senderUid（u_xxx）转换成真实 QQ 号；转换失败返回 0 */
     private static long resolveQqUin(String uidOrUin) {
         if (uidOrUin == null || uidOrUin.isEmpty()) {
@@ -745,27 +764,33 @@ public final class SettingsInjector {
                 return row;
             }
             final android.widget.ImageView fav = avatar;
-            new Thread(new Runnable() {
+            /* 用共享线程池 + 小尺寸(40)，避免 15 个头像开 15 个线程 */
+            rankAvatarPool().execute(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        java.net.URL url = new java.net.URL("https://q1.qlogo.cn/g?b=qq&nk=" + u + "&s=100");
-                        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-                        conn.setConnectTimeout(8000);
-                        conn.setReadTimeout(8000);
+                        java.net.URL url = new java.net.URL(
+                                "https://q1.qlogo.cn/g?b=qq&nk=" + u + "&s=40");
+                        java.net.HttpURLConnection conn =
+                                (java.net.HttpURLConnection) url.openConnection();
+                        conn.setConnectTimeout(4000);
+                        conn.setReadTimeout(4000);
                         conn.setDoInput(true);
-                        android.graphics.Bitmap bm = android.graphics.BitmapFactory.decodeStream(conn.getInputStream());
+                        final android.graphics.Bitmap bm =
+                                android.graphics.BitmapFactory.decodeStream(conn.getInputStream());
                         if (bm != null) {
-                            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    try { fav.setImageBitmap(bm); } catch (Throwable ignored) {}
-                                }
-                            });
+                            new android.os.Handler(android.os.Looper.getMainLooper())
+                                    .post(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            try { fav.setImageBitmap(bm); }
+                                            catch (Throwable ignored) {}
+                                        }
+                                    });
                         }
                     } catch (Throwable ignored) {}
                 }
-            }, "rank-av-" + u).start();
+            });
         } catch (Throwable ignored) {}
         return row;
     }
