@@ -517,6 +517,8 @@ public final class UiPatcher {
      * hook onBindViewHolder after：从 holder.itemView 找点赞按钮（binding id likeCount /
      * 或含 like 的 ImageView）的父布局，插入/更新一条昵称 TextView。
      */
+    private static volatile int sZanProbe = 0;
+
     private static void installFeedZanListHook(java.lang.ClassLoader classLoader) {
         try {
             java.lang.Class<?> adapterCls = java.lang.Class.forName(
@@ -569,18 +571,25 @@ public final class UiPatcher {
         }
     }
 
-    /** 在点赞按钮下方插入"昵称(QQ号)，昵称(QQ号)…"一行 */
+    /** 在点赞按钮下方插入"昵称(QQ号)、昵称(QQ号)…"一行（自动换行） */
     private static void injectZanNames(Object adapter, Object holder, int position) {
         try {
+            android.view.View itemView = (android.view.View)
+                    de.robv.android.xposed.XposedHelpers.getObjectField(holder, "itemView");
+            if (itemView == null) {
+                return;
+            }
             /* 1) 取该位置的 BusinessFeedData */
             Object list = de.robv.android.xposed.XposedHelpers.getObjectField(adapter, "c");
-            if (!(list instanceof java.util.List) || position >= ((java.util.List) list).size()) {
+            if (!(list instanceof java.util.List) || position < 0
+                    || position >= ((java.util.List) list).size()) {
                 return;
             }
             Object data = ((java.util.List) list).get(position);
             if (data == null) {
                 return;
             }
+            /* 2) 取 CellLikeInfo：先方法，再字段（两种都试） */
             Object cellLike = null;
             try {
                 cellLike = de.robv.android.xposed.XposedHelpers.callMethod(data, "getCellLikeInfo", new Object[0]);
@@ -590,32 +599,44 @@ public final class UiPatcher {
                     cellLike = de.robv.android.xposed.XposedHelpers.getObjectField(data, "cellLikeInfo");
                 } catch (Throwable ignored) {}
             }
-            if (cellLike == null) {
-                return;
+            if (sZanProbe++ < 30) {
+                com.tencent.qqlitepro.util.Log.i("动态点赞诊断: pos=" + position
+                        + " data=" + (data == null ? "null" : data.getClass().getSimpleName())
+                        + " cellLike=" + (cellLike == null ? "null" : cellLike.getClass().getSimpleName()));
             }
-            /* 2) 拼 昵称(QQ号) 字符串 */
-            StringBuilder sb = new StringBuilder();
-            Object mans = de.robv.android.xposed.XposedHelpers.getObjectField(cellLike, "likeMans");
-            if (mans instanceof java.util.List) {
-                for (Object man : (java.util.List) mans) {
-                    if (man == null) continue;
-                    try {
-                        Object user = de.robv.android.xposed.XposedHelpers.getObjectField(man, "user");
-                        if (user == null) continue;
-                        String nick = (String) de.robv.android.xposed.XposedHelpers.getObjectField(user, "nick");
-                        String uin = "";
+            String zanText = "";
+            if (cellLike != null) {
+                Object mans = null;
+                try {
+                    mans = de.robv.android.xposed.XposedHelpers.getObjectField(cellLike, "likeMans");
+                } catch (Throwable ignored) {}
+                StringBuilder sb = new StringBuilder();
+                if (mans instanceof java.util.List) {
+                    for (Object man : (java.util.List) mans) {
+                        if (man == null) continue;
                         try {
-                            uin = (String) de.robv.android.xposed.XposedHelpers.getObjectField(user, "uin");
+                            Object user = de.robv.android.xposed.XposedHelpers.getObjectField(man, "user");
+                            if (user == null) continue;
+                            String nick = null;
+                            String uin = "";
+                            try {
+                                Object n = de.robv.android.xposed.XposedHelpers.getObjectField(user, "nick");
+                                nick = n == null ? null : String.valueOf(n);
+                            } catch (Throwable ignored) {}
+                            try {
+                                Object u = de.robv.android.xposed.XposedHelpers.getObjectField(user, "uin");
+                                uin = u == null ? "" : String.valueOf(u);
+                            } catch (Throwable ignored) {}
+                            if ((nick == null || nick.trim().isEmpty()) && uin.isEmpty()) continue;
+                            if (sb.length() > 0) sb.append("、");
+                            sb.append(nick == null || nick.trim().isEmpty() ? uin : nick.trim());
+                            sb.append("(").append(uin).append(")");
                         } catch (Throwable ignored) {}
-                        if (sb.length() > 0) sb.append("、");
-                        sb.append(nick == null || nick.isEmpty() ? (uin.isEmpty() ? "?" : uin) : nick)
-                          .append("(").append(uin).append(")");
-                    } catch (Throwable ignored) {}
+                    }
                 }
+                zanText = sb.toString();
             }
-            String zanText = sb.length() == 0 ? "" : sb.toString();
-            /* 3) 定位"点赞按钮/点赞数"所在的容器，作为插入锚点 */
-            android.view.View itemView = (android.view.View) de.robv.android.xposed.XposedHelpers.getObjectField(holder, "itemView");
+            /* 3) 定位插入容器：优先"点赞行"的父容器（整行下方），其次卡片垂直根 */
             android.view.View likeView = findViewByNameContains(itemView, "like");
             if (likeView == null) {
                 likeView = findZanAnchor(itemView);
@@ -623,22 +644,23 @@ public final class UiPatcher {
             android.view.ViewGroup insertParent = null;
             android.view.View insertAfter = null;
             if (likeView != null && likeView.getParent() instanceof android.view.ViewGroup) {
-                insertParent = (android.view.ViewGroup) likeView.getParent();
-                insertAfter = likeView;
-            } else {
-                /* 兜底：itemView 是垂直 LinearLayout 时直接 add */
-                if (itemView instanceof android.view.ViewGroup
-                        && ((android.view.ViewGroup) itemView).getChildCount() > 0) {
-                    android.view.View c0 = ((android.view.ViewGroup) itemView).getChildAt(0);
-                    if (c0 instanceof android.view.ViewGroup) {
-                        insertParent = (android.view.ViewGroup) c0;
-                    }
+                android.view.ViewGroup p0 = (android.view.ViewGroup) likeView.getParent();
+                /* 若父容器是横向（点赞行内），再上提一层，保证插在整行下方 */
+                if (p0.getParent() instanceof android.view.ViewGroup && isHorizontal(p0)) {
+                    insertAfter = p0;
+                    insertParent = (android.view.ViewGroup) p0.getParent();
+                } else {
+                    insertParent = p0;
+                    insertAfter = likeView;
                 }
+            }
+            if (insertParent == null) {
+                insertParent = findVerticalContainer(itemView);
             }
             if (insertParent == null) {
                 return;
             }
-            /* 4) 插入/复用标记 TextView（tag=qqlite_zan_names） */
+            /* 4) 复用/新建标记 TextView */
             android.widget.TextView exist = null;
             for (int i = 0; i < insertParent.getChildCount(); i++) {
                 android.view.View cv = insertParent.getChildAt(i);
@@ -646,6 +668,13 @@ public final class UiPatcher {
                     exist = (android.widget.TextView) cv;
                     break;
                 }
+            }
+            if (sZanProbe <= 30) {
+                com.tencent.qqlitepro.util.Log.i("动态点赞诊断: zanText=[" + zanText + "]"
+                        + " likeView=" + (likeView == null ? "null"
+                        : likeView.getClass().getSimpleName())
+                        + " parent=" + (insertParent == null ? "null"
+                        : insertParent.getClass().getSimpleName()));
             }
             if (zanText.isEmpty()) {
                 if (exist != null) {
@@ -660,28 +689,56 @@ public final class UiPatcher {
                 tv.setTag("qqlite_zan_names");
                 tv.setTextSize(11.5f);
                 tv.setTextColor(-6643546);
-                /* 多条点赞自动换行 */
                 tv.setSingleLine(false);
                 tv.setMaxLines(20);
                 tv.setEllipsize(null);
                 tv.setLineSpacing(0f, 1.15f);
                 int pad = (int) (ctx.getResources().getDisplayMetrics().density * 8);
-                tv.setPadding(pad, 2, pad, 4);
-                android.widget.LinearLayout.LayoutParams lp = new android.widget.LinearLayout.LayoutParams(
-                        -1, -2);
-                int idx = insertParent.indexOfChild(insertAfter);
-                if (idx < 0) idx = insertParent.getChildCount() - 1;
-                insertParent.addView(tv, Math.min(idx + 1, insertParent.getChildCount()), lp);
+                tv.setPadding(pad, 2, pad, 6);
+                android.widget.LinearLayout.LayoutParams lp =
+                        new android.widget.LinearLayout.LayoutParams(-1, -2);
+                int idx = insertAfter == null ? -1 : insertParent.indexOfChild(insertAfter);
+                if (idx < 0) {
+                    insertParent.addView(tv, lp);
+                } else {
+                    insertParent.addView(tv, Math.min(idx + 1, insertParent.getChildCount()), lp);
+                }
             } else {
                 tv = exist;
                 tv.setVisibility(android.view.View.VISIBLE);
             }
-            tv.setText(zanText);
-            tv.setSingleLine(false);
-            tv.setMaxLines(20);
-            tv.setEllipsize(null);
+            tv.setText("赞：" + zanText);
         } catch (Throwable ignored) {
         }
+    }
+
+    private static boolean isHorizontal(android.view.ViewGroup vg) {
+        try {
+            return vg instanceof android.widget.LinearLayout
+                    && ((android.widget.LinearLayout) vg).getOrientation()
+                    == android.widget.LinearLayout.HORIZONTAL;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 找卡片里第一个纵向容器作为插入父节点 */
+    private static android.view.ViewGroup findVerticalContainer(android.view.View root) {
+        try {
+            java.util.ArrayList<android.view.View> all = new java.util.ArrayList<>();
+            collectViews(root, all, 0);
+            for (android.view.View v : all) {
+                if (v instanceof android.widget.LinearLayout
+                        && ((android.widget.LinearLayout) v).getOrientation()
+                        == android.widget.LinearLayout.VERTICAL) {
+                    return (android.view.ViewGroup) v;
+                }
+            }
+            if (root instanceof android.view.ViewGroup) {
+                return (android.view.ViewGroup) root;
+            }
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     /**
