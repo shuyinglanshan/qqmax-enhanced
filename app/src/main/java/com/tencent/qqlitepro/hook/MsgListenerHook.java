@@ -330,19 +330,11 @@ public final class MsgListenerHook {
                     || str == null || str.isEmpty()) {
                 return;
             }
-            /* 1) 优先用多规则配置（按白名单匹配） */
-            java.util.List<java.lang.String[]> rules =
-                    com.tencent.qqlitepro.util.Config.parseSuffixRules(contextAppContext);
-            java.lang.StringBuilder sbSuffix = new java.lang.StringBuilder();
-            for (java.lang.String[] rule : rules) {
-                if (rule == null || rule.length < 2) continue;
-                if (com.tencent.qqlitepro.util.Config.suffixPeerAllowed(rule[1], peerUid)) {
-                    sbSuffix.append(rule[0]);
-                }
+            /* 白名单判定：空白名单=全部会话；否则只有名单内会话才追加 */
+            if (!com.tencent.qqlitepro.util.Config.catgirlPeerAllowed(contextAppContext, peerUid)) {
+                return;
             }
-            strCatgirlSuffix = sbSuffix.length() > 0
-                    ? sbSuffix.toString()
-                    : com.tencent.qqlitepro.util.Config.catgirlSuffix(contextAppContext);
+            strCatgirlSuffix = com.tencent.qqlitepro.util.Config.catgirlSuffix(contextAppContext);
             if (strCatgirlSuffix == null || strCatgirlSuffix.isEmpty()) {
                 return;
             }
