@@ -161,6 +161,9 @@ public final class QqDynamicScheduler {
         if (obj != null) {
             sLastUiHost = new java.lang.ref.WeakReference<>(obj);
         }
+        try {
+            com.tencent.qqlitepro.hook.QzoneDynamicHook.rememberFeedList(list);
+        } catch (Throwable ignored) {}
         /*
          * 渲染点赞列表：必须在主线程操作 View。
          * onUiFeedList 常在子线程触发（Binder/回调），直接 addView 不会触发重新测量，
@@ -174,6 +177,7 @@ public final class QqDynamicScheduler {
                 public void run() {
                     try {
                         com.tencent.qqlitepro.hook.QzoneDynamicHook.resetFeedIndex();
+                        com.tencent.qqlitepro.hook.QzoneDynamicHook.clearAllOverlayTexts();
                         if (fList != null) {
                             for (Object one : fList) {
                                 if (one != null) {
