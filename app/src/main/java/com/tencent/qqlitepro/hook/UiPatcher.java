@@ -83,19 +83,35 @@ public final class UiPatcher {
             return null;
         }
         java.util.Map<java.lang.String, com.tencent.qqlitepro.hook.UiPatcher.FakeDetect> map = FAKE_DETECT;
-        com.tencent.qqlitepro.hook.UiPatcher.FakeDetect fakeDetect = map.get(str);
-        if (fakeDetect != null && (fakeDetect.fake || java.lang.System.currentTimeMillis() - fakeDetect.at < FAKE_DETECT_NEGATIVE_TTL_MS)) {
-            return fakeDetect;
+        com.tencent.qqlitepro.hook.UiPatcher.FakeDetect cached = map.get(str);
+        /*
+         * 只缓存"识别成功"的结果。
+         * 旧实现把失败结果也缓存 FAKE_DETECT_NEGATIVE_TTL_MS，导致：
+         *   - 首次渲染时图片路径还没就绪（尤其宿主未运行时收到的消息）→ 记为 null
+         *   - 之后 TTL 内无论路径是否已就绪都直接返回 null → "概率识别不了"
+         * 现在失败不缓存，每次都重新扫；成功后立即缓存，保证性能。
+         */
+        if (cached != null && cached.fake) {
+            return cached;
         }
         com.tencent.qqlitepro.hook.UiPatcher.FakeDetect fakeDetectScanFake = scanFake(obj);
-        if (fakeDetectScanFake == null) {
-            return null;
+        if (fakeDetectScanFake == null || !fakeDetectScanFake.fake) {
+            /* 识别失败：不缓存（可能是图片尚未下载/路径未就绪） */
+            map.remove(str);
+            return fakeDetectScanFake;
         }
         map.put(str, fakeDetectScanFake);
         if (map.size() > FAKE_DETECT_MAX) {
             evictFakeDetect();
         }
         return fakeDetectScanFake;
+    }
+
+    /** 外部数据变化（如收到新消息、图片下载完成）时清空识别缓存，触发重新识别 */
+    public static void invalidateFakeCache() {
+        try {
+            FAKE_DETECT.clear();
+        } catch (Throwable ignored) {}
     }
 
     private static void evictFakeDetect() {
@@ -193,6 +209,9 @@ public final class UiPatcher {
         installGroupStatEntryHook(classLoader);
         installChatListFragmentHook(classLoader);
         installFeedZanListHook(classLoader);
+        com.tencent.qqlitepro.hook.QzoneDynamicHook.installOperationMoreHookDelayed(classLoader);
+        com.tencent.qqlitepro.hook.QzoneDynamicHook.installSelectItemClickHook(classLoader);
+        com.tencent.qqlitepro.hook.QzoneDynamicHook.installDialogShowHook();
         installMediaSaveDirHook(classLoader);
         installEditProfileSignatureHook(classLoader);
     }
@@ -2665,6 +2684,55 @@ public final class UiPatcher {
         return listFindAllPicPaths.get(0);
     }
 
+    /** 深度遍历对象图，收集所有可能携带媒体信息的节点（限深防环） */
+    private static void collectNodesDeep(java.lang.Object root,
+                                          java.util.ArrayList<java.lang.Object> out, int depth) {
+        if (root == null || depth > 6 || out.size() > 200) {
+            return;
+        }
+        try {
+            String cn = root.getClass().getName();
+            if (cn.startsWith("java.lang.") || cn.startsWith("java.util.")
+                    || root instanceof Number || root instanceof CharSequence) {
+                return;
+            }
+            out.add(root);
+            if (root instanceof java.util.Map) {
+                for (java.lang.Object v : ((java.util.Map<?, ?>) root).values()) {
+                    collectNodesDeep(v, out, depth + 1);
+                }
+                return;
+            }
+            if (root instanceof java.lang.Iterable) {
+                for (java.lang.Object v : (java.lang.Iterable<?>) root) {
+                    collectNodesDeep(v, out, depth + 1);
+                }
+                return;
+            }
+            if (root.getClass().isArray()) {
+                int n = java.lang.reflect.Array.getLength(root);
+                for (int i = 0; i < n && i < 50; i++) {
+                    collectNodesDeep(java.lang.reflect.Array.get(root, i), out, depth + 1);
+                }
+                return;
+            }
+            for (Class<?> c = root.getClass(); c != null && c != java.lang.Object.class;
+                 c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                    try {
+                        f.setAccessible(true);
+                        java.lang.Object v = f.get(root);
+                        if (v == null) continue;
+                        collectNodesDeep(v, out, depth + 1);
+                    } catch (java.lang.Throwable ignored) {
+                    }
+                }
+            }
+        } catch (java.lang.Throwable ignored) {
+        }
+    }
+
     private static java.util.List<java.lang.String> findAllPicPaths(java.lang.Object obj) {
         java.lang.String strPngByMd5;
         java.util.ArrayList arrayList = new java.util.ArrayList();
@@ -2724,6 +2792,39 @@ public final class UiPatcher {
             }
             i2++;
             i = 3;
+        }
+        /*
+         * 兜底：宿主未运行期间收到的消息，picElement 可能缺失或结构不同，
+         * 这里从整个消息对象做一次深度遍历，把任何带 md5HexStr / fileName 的节点都收进来，
+         * 再用 md5 反查下载目录里的真实文件。
+         */
+        try {
+            java.util.ArrayList<java.lang.Object> allNodes = new java.util.ArrayList<>();
+            collectNodesDeep(obj, allNodes, 0);
+            for (java.lang.Object node : allNodes) {
+                java.lang.String md5 = safeString(objField(node, "md5HexStr"), null);
+                if (md5 == null || md5.isEmpty()) {
+                    md5 = safeString(objField(node, "md5"), null);
+                }
+                if (md5 == null || md5.isEmpty()) {
+                    continue;
+                }
+                try {
+                    java.lang.String png = com.tencent.qqlitepro.http.FakeImage.pngByMd5(md5);
+                    if (png != null && !png.isEmpty() && !arrayList.contains(png)) {
+                        arrayList.add(png);
+                    }
+                } catch (java.lang.Throwable ignored) {
+                }
+                try {
+                    java.lang.String orig = com.tencent.qqlitepro.hook.FakeMediaReceiver.picOriginalPath(node);
+                    if (orig != null && !orig.isEmpty() && !arrayList.contains(orig)) {
+                        arrayList.add(orig);
+                    }
+                } catch (java.lang.Throwable ignored) {
+                }
+            }
+        } catch (java.lang.Throwable ignored) {
         }
         return arrayList;
     }
