@@ -459,51 +459,76 @@ public class ForceNoticeInjector {
         }
         android.widget.TextView[] textViewArr = new android.widget.TextView[2];
         android.view.View rootNotice = build(activity, jsonObject, textViewArr);
-        /*
-         * 右滑退出：倒计时未结束时不可滑出（有 0 进度提示），结束后从左往右滑即可关闭。
-         * 通过给根布局挂 OnTouchListener 实现，不影响内部按钮点击。
-         */
-        attachSwipeToDismiss(rootNotice, dialog);
-        dialog.setContentView(rootNotice);
+        /* 每次弹窗前重置倒计时标志，避免上次的 true 残留导致刚弹出就能滑走 */
+        sCountdownDone = false;
+        /* 包一层代理，负责右滑手势判定（不影响子 View 滚动与点击） */
+        android.view.View wrapped = wrapSwipeToDismiss(rootNotice, dialog);
+        dialog.setContentView(wrapped);
         dialog.show();
         sDialog = dialog;
-        startCountdown(textViewArr, new java.lang.Runnable[]{new com.tencent.qqlitepro.hook.ForceNoticeInjector$$ExternalSyntheticLambda15(strNoticeIdStr, dialog), new com.tencent.qqlitepro.hook.ForceNoticeInjector$$ExternalSyntheticLambda4(activity, strNoticeIdStr, dialog)}, 5);
+        startCountdown(textViewArr, new java.lang.Runnable[]{new com.tencent.qqlitepro.hook.ForceNoticeInjector$$ExternalSyntheticLambda15(strNoticeIdStr, dialog), new com.tencent.qqlitepro.hook.ForceNoticeInjector$$ExternalSyntheticLambda4(activity, strNoticeIdStr, dialog)}, 8);
     }
 
-    /** 倒计时结束后允许右滑关闭公告 */
-    private static void attachSwipeToDismiss(android.view.View root, final android.app.Dialog dialog) {
-        final float[] startX = new float[1];
-        final float[] startY = new float[1];
-        final boolean[] canDismiss = new boolean[1];
-        sSwipeDismissFlag = canDismiss;
-        root.setOnTouchListener(new android.view.View.OnTouchListener() {
-            @Override
-            public boolean onTouch(android.view.View v, android.view.MotionEvent event) {
-                switch (event.getActionMasked()) {
-                    case android.view.MotionEvent.ACTION_DOWN:
-                        startX[0] = event.getX();
-                        startY[0] = event.getY();
-                        canDismiss[0] = sCountdownDone;
-                        return false; // 不消费 down，让子控件继续响应
-                    case android.view.MotionEvent.ACTION_MOVE:
-                        if (!canDismiss[0]) {
-                            return false;
+    /**
+     * 倒计时结束后允许右滑关闭公告。
+     *
+     * 关键：不能用 setOnTouchListener —— 根布局的子 View（ScrollView/按钮）
+     * 会先消费事件，根布局收不到 MOVE，导致右滑永远失效。
+     * 改为包一层 FrameLayout 并覆写 dispatchTouchEvent，在分发前先判断手势，
+     * 命中右滑就直接关闭；未命中再交给子 View，不影响滚动与点击。
+     */
+    private static android.view.View wrapSwipeToDismiss(android.view.View root,
+                                                        final android.app.Dialog dialog) {
+        try {
+            final android.content.Context ctx = root.getContext();
+            final float[] startX = new float[1];
+            final float[] startY = new float[1];
+            final boolean[] tracking = new boolean[1];
+
+            android.widget.FrameLayout wrap = new android.widget.FrameLayout(ctx) {
+                @Override
+                public boolean dispatchTouchEvent(android.view.MotionEvent event) {
+                    try {
+                        switch (event.getActionMasked()) {
+                            case android.view.MotionEvent.ACTION_DOWN:
+                                startX[0] = event.getX();
+                                startY[0] = event.getY();
+                                tracking[0] = true;
+                                break;
+                            case android.view.MotionEvent.ACTION_MOVE:
+                                if (tracking[0] && sCountdownDone) {
+                                    float dx = event.getX() - startX[0];
+                                    float dy = Math.abs(event.getY() - startY[0]);
+                                    /* 右滑 60dp 且纵向偏移 < 80dp：关闭公告 */
+                                    if (dx > dp(ctx, 60.0f) && dy < dp(ctx, 80.0f)) {
+                                        tracking[0] = false;
+                                        try {
+                                            dialog.dismiss();
+                                        } catch (Throwable ignored) {
+                                        }
+                                        return true;
+                                    }
+                                }
+                                break;
+                            case android.view.MotionEvent.ACTION_UP:
+                            case android.view.MotionEvent.ACTION_CANCEL:
+                                tracking[0] = false;
+                                break;
+                            default:
+                                break;
                         }
-                        float dx = event.getX() - startX[0];
-                        float dy = Math.abs(event.getY() - startY[0]);
-                        if (dx > dp(v.getContext(), 80.0f) && dy < dp(v.getContext(), 60.0f)) {
-                            try {
-                                dialog.dismiss();
-                            } catch (Throwable ignored) {
-                            }
-                            return true;
-                        }
-                        return false;
-                    default:
-                        return false;
+                    } catch (Throwable ignored) {
+                    }
+                    return super.dispatchTouchEvent(event);
                 }
-            }
-        });
+            };
+            /* root 原本有自己的 LayoutParams，移入 wrap 时用铺满即可 */
+            wrap.addView(root, new android.widget.FrameLayout.LayoutParams(-1, -1));
+            return wrap;
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("公告右滑代理安装失败: " + t);
+        }
+        return root;
     }
 
     /* 倒计时结束标志（供右滑判断） */
@@ -586,6 +611,7 @@ public class ForceNoticeInjector {
                 android.widget.TextView[] textViewArr = this.val$btns;
                 if (i >= textViewArr.length) {
                     /* 倒计时结束：允许右滑退出 */
+                    com.tencent.qqlitepro.hook.ForceNoticeInjector.sCountdownDone = true;
                     if (com.tencent.qqlitepro.hook.ForceNoticeInjector.sSwipeDismissFlag != null) {
                         com.tencent.qqlitepro.hook.ForceNoticeInjector.sSwipeDismissFlag[0] = true;
                     }
@@ -664,10 +690,7 @@ public class ForceNoticeInjector {
         android.widget.TextView textViewText = text(context, nonEmpty(prims(jsonObject, "title"), "（标题）"), -1, titleSize, 1);
         textViewText.setGravity(17);
         frameLayout.addView(textViewText, new android.widget.FrameLayout.LayoutParams(-1, -2, 17));
-        android.view.View viewNodeSwitcher = nodeSwitcher(context);
-        android.widget.FrameLayout.LayoutParams layoutParams = new android.widget.FrameLayout.LayoutParams(dp(context, 44.0f), dp(context, 44.0f), 8388613);
-        layoutParams.topMargin = 0;
-        frameLayout.addView(viewNodeSwitcher, layoutParams);
+        /* 需求：删除右上角三条杠（nodeSwitcher）按钮，避免遮挡标题 */
         linearLayout.addView(frameLayout, m(-1, -2, 0, 0, 0, dp(context, 8.0f)));
         android.widget.TextView textViewText2 = text(context, "发布时间：" + nonEmpty(prims(jsonObject, "time"), "（时间未知）"), -6709078, 13.0f, 0);
         textViewText2.setGravity(17);
