@@ -203,6 +203,46 @@ public final class UiPatcher {
         return sHostCl;
     }
 
+    private static volatile boolean sSelfProfileHooked = false;
+
+    /**
+     * 截获宿主自身资料，用于取真实昵称。
+     * 逆向：ContactRepo.a(UserSimpleInfo) 内部读 profile.coreInfo.nick，
+     * 这是宿主唯一真正持有昵称的地方。
+     */
+    public static void installSelfProfileHook(java.lang.ClassLoader cl) {
+        if (sSelfProfileHooked) {
+            return;
+        }
+        try {
+            Class<?> repo = de.robv.android.xposed.XposedHelpers.findClass(
+                    "com.tencent.qqnt.watch.contact.data.ContactRepo", cl);
+            Class<?> simpleInfo = de.robv.android.xposed.XposedHelpers.findClass(
+                    "com.tencent.qqnt.kernel.nativeinterface.UserSimpleInfo", cl);
+            de.robv.android.xposed.XposedBridge.hookAllMethods(repo, "a",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.args == null || param.args.length < 1) {
+                                    return;
+                                }
+                                String nick = com.tencent.qqlitepro.http.QqKernel
+                                        .extractNickFromSimpleInfo(param.args[0]);
+                                if (!nick.isEmpty()) {
+                                    com.tencent.qqlitepro.util.Log.i(
+                                            "selfNick: 从 ContactRepo 捕获到昵称 [" + nick + "]");
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    });
+            sSelfProfileHooked = true;
+            com.tencent.qqlitepro.util.Log.i("selfNick: ContactRepo 资料截获 hook 已安装");
+        } catch (Throwable t) {
+            com.tencent.qqlitepro.util.Log.w("selfNick: ContactRepo hook 失败 " + t);
+        }
+    }
+
     public static void patch(java.lang.ClassLoader classLoader) {
         startStyleReconcile();
         installLanzouLinkHook(classLoader);
@@ -210,6 +250,7 @@ public final class UiPatcher {
         installChatListFragmentHook(classLoader);
         installFeedZanListHook(classLoader);
         com.tencent.qqlitepro.hook.ChatCardInjector.installBadgeUncapHook(classLoader);
+        installSelfProfileHook(classLoader);
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installOperationMoreHookDelayed(classLoader);
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installSelectItemClickHook(classLoader);
         com.tencent.qqlitepro.hook.QzoneDynamicHook.installDialogShowHook();
