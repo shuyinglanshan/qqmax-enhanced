@@ -6884,13 +6884,62 @@ public final class QqKernel {
         }
     }
 
+    /**
+     * 取宿主 ClassLoader。
+     * 注意：绝不能用 QqKernel.class.getClassLoader() —— 那是模块自己的
+     * PathClassLoader，里面没有 mqq.app.MobileQQ 等宿主类，会抛
+     * ClassNotFoundException（个性签名"保存失败：异常"的根因）。
+     */
+    private static java.lang.ClassLoader hostCl() {
+        java.lang.ClassLoader cl = sCl;
+        if (cl != null) {
+            return cl;
+        }
+        /* 次级来源：当前线程上下文 / 宿主 ActivityThread 的 cls loader */
+        try {
+            cl = Thread.currentThread().getContextClassLoader();
+            if (cl != null && classExists("mqq.app.MobileQQ", cl)) {
+                return cl;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object app = at.getMethod("currentApplication").invoke(null);
+            if (app != null) {
+                cl = app.getClass().getClassLoader();
+                if (cl != null) {
+                    return cl;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return QqKernel.class.getClassLoader();
+    }
+
+    private static boolean classExists(String name, java.lang.ClassLoader cl) {
+        try {
+            Class.forName(name, false, cl);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     /** 用宿主包装层 IProfileService.n(text, cb) 保存签名（与改昵称完全同一条链路） */
     public static String setLongNickViaHostWrapper(String text) {
+        /* 优先走内核 ProfileService 直连（不依赖 mqq.app.MobileQQ） */
+        String direct = setLongNick(text);
+        if (direct == null) {
+            return null;
+        }
+        com.tencent.qqlitepro.util.Log.w("个性签名: 内核直连未成功(" + direct + ")，回退宿主包装层");
         try {
-            ClassLoader cl = QqKernel.class.getClassLoader();
-            Object mobileQQ = Class.forName("mqq.app.MobileQQ", false, cl).getField("sMobileQQ").get(null);
+            /* 关键修复：必须用宿主 ClassLoader */
+            ClassLoader cl = hostCl();
+            Object mobileQQ = Class.forName("mqq.app.MobileQQ", false, cl)
+                    .getField("sMobileQQ").get(null);
             Object runtime = mobileQQ.getClass().getMethod("peekAppRuntime").invoke(mobileQQ);
-            Class<?> kernelSvcCls = Class.forName("com.tencent.qqnt.kernel.api.IKernelService", false, cl);
+            Class<?> kernelSvcCls = Class.forName(
+                    "com.tencent.qqnt.kernel.api.IKernelService", false, cl);
             Object kernelSvc = runtime.getClass().getMethod("getRuntimeService", Class.class, String.class)
                     .invoke(runtime, kernelSvcCls, "");
             Object profile = kernelSvc.getClass().getMethod("getProfileService").invoke(kernelSvc);
@@ -6927,7 +6976,36 @@ public final class QqKernel {
             latch.await(12, java.util.concurrent.TimeUnit.SECONDS);
             return null;
         } catch (Throwable th) {
-            return "异常 " + chain(th);
+            /* 不要把原始堆栈抛给用户，只记日志并给可读提示 */
+            com.tencent.qqlitepro.util.Log.w("个性签名保存失败: " + th);
+            return friendlyError(th);
+        }
+    }
+
+
+    /** 把技术异常翻译成用户能看懂的短提示 */
+    private static String friendlyError(Throwable th) {
+        try {
+            String cn = th == null ? "" : th.getClass().getSimpleName();
+            String msg = th == null || th.getMessage() == null ? "" : th.getMessage();
+            if (msg.contains("ClassNotFound") || cn.contains("ClassNotFound")) {
+                return "宿主组件未就绪，请重启 QQ 后重试";
+            }
+            if (msg.contains("NoSuchMethod") || cn.contains("NoSuchMethod")) {
+                return "当前 QQ 版本不支持该操作";
+            }
+            if (msg.contains("NullPointer") || cn.contains("NullPointer")) {
+                return "宿主服务暂不可用，请稍后重试";
+            }
+            if (msg.contains("timeout") || msg.contains("Timeout")) {
+                return "保存超时，请检查网络后重试";
+            }
+            if (msg.contains("Permission") || cn.contains("Security")) {
+                return "权限不足，无法修改签名";
+            }
+            return "保存失败，请稍后重试";
+        } catch (Throwable ignored) {
+            return "保存失败，请稍后重试";
         }
     }
 
