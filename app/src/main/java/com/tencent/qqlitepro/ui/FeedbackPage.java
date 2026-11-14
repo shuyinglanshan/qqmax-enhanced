@@ -45,10 +45,31 @@ public final class FeedbackPage {
             final android.app.Dialog dialog = new android.app.Dialog(ctx);
             dialog.requestWindowFeature(1);
             dialog.setCanceledOnTouchOutside(true);
+            /*
+             * 修复"按返回键变灰屏"：
+             * 返回键关闭 Dialog 后，若窗口背景是半透明/未铺满，会露出灰色底层。
+             * 这里禁止返回键直接关闭（改为走我们自己的 close，先还原背景），
+             * 同时把窗口背景设为不透明深色，避免任何间隙露出灰底。
+             */
+            dialog.setOnKeyListener(new android.content.DialogInterface.OnKeyListener() {
+                @Override
+                public boolean onKey(android.content.DialogInterface d, int keyCode,
+                                     android.view.KeyEvent event) {
+                    if (keyCode == android.view.KeyEvent.KEYCODE_BACK
+                            && event.getAction() == android.view.KeyEvent.ACTION_UP) {
+                        try {
+                            d.dismiss();
+                        } catch (Throwable ignored) {
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+            });
 
             final LinearLayout root = new LinearLayout(ctx);
             root.setOrientation(1);
-            root.setBackgroundColor(COLOR_BG);
+            root.setBackgroundColor(0xFF111316);
             int pad = dp(ctx, 14);
             root.setPadding(pad, dp(ctx, 10), pad, dp(ctx, 14));
 
@@ -80,6 +101,10 @@ public final class FeedbackPage {
             body.setOrientation(1);
             sv.addView(body);
             root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+            final java.util.List<FeedbackApi.FbType>[] typesRef = new java.util.List[]{null};
+            final int[] selIdx = {0};
+            final String[] selValue = {null};
 
             /* ---- 提示 ---- */
             TextView tip = new TextView(ctx);
@@ -147,64 +172,66 @@ public final class FeedbackPage {
             contactCard.addView(etContact, lp());
             body.addView(contactCard, top(ctx, 10));
 
-            /* ---- 崩溃日志勾选 ---- */
-            LinearLayout logCard = card(ctx);
-            logCard.addView(label(ctx, "崩溃日志"), lp());
+            /* ---- 崩溃日志：仅「功能异常」显示，单选，默认最近的 ---- */
+            final LinearLayout logCard = card(ctx);
+            logCard.addView(label(ctx, "崩溃日志（仅功能异常可附）"), lp());
             final java.util.List<java.io.File> crashFiles = CrashLog.listFiles();
-            final boolean hasCrash = crashFiles != null && !crashFiles.isEmpty();
-            final boolean[] uploadLog = new boolean[]{hasCrash && !sLogUploadedOnce};
+            final int[] selLog = {0};   /* 选中的日志下标；始终单选 */
+            final TextView[] logRows = new TextView[0];
+            final java.util.List<TextView> rowList = new java.util.ArrayList<>();
 
-            final TextView logRow = new TextView(ctx);
-            logRow.setTextSize(13f);
-            logRow.setPadding(dp(ctx, 10), dp(ctx, 9), dp(ctx, 10), dp(ctx, 9));
-            GradientDrawable lbg = new GradientDrawable();
-            lbg.setColor(-14935012);
-            lbg.setCornerRadius(dp(ctx, 8));
-            logRow.setBackground(lbg);
-            logCard.addView(logRow, lp());
+            if (crashFiles == null || crashFiles.isEmpty()) {
+                TextView none = new TextView(ctx);
+                none.setText("（未检测到崩溃日志）");
+                none.setTextSize(12.5f);
+                none.setTextColor(COLOR_HINT);
+                none.setPadding(dp(ctx, 8), dp(ctx, 6), 0, dp(ctx, 6));
+                logCard.addView(none, lp());
+            } else {
+                for (int i = 0; i < crashFiles.size(); i++) {
+                    final int idx = i;
+                    java.io.File f = crashFiles.get(i);
+                    TextView row = new TextView(ctx);
+                    row.setTextSize(12.5f);
+                    row.setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8));
+                    row.setTag("qqmax_log_row_" + i);
+                    row.setOnClickListener(new android.view.View.OnClickListener() {
+                        @Override
+                        public void onClick(android.view.View v) {
+                            selLog[0] = idx;
+                            for (int k = 0; k < rowList.size(); k++) {
+                                styleLogRow(ctx, rowList.get(k),
+                                        String.valueOf(crashFiles.get(k).getName()),
+                                        crashFiles.get(k).length(), k == idx);
+                            }
+                        }
+                    });
+                    rowList.add(row);
+                    LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
+                    if (i > 0) {
+                        rlp.topMargin = dp(ctx, 5);
+                    }
+                    logCard.addView(row, rlp);
+                }
+                /* 默认勾选最近的（listFiles 已按时间倒序） */
+                selLog[0] = 0;
+                for (int k = 0; k < rowList.size(); k++) {
+                    styleLogRow(ctx, rowList.get(k),
+                            String.valueOf(crashFiles.get(k).getName()),
+                            crashFiles.get(k).length(), k == 0);
+                }
+            }
             body.addView(logCard, top(ctx, 10));
 
-            final Runnable refreshLogRow = new Runnable() {
+            /* 类型变化时显示/隐藏日志卡片 */
+            final Runnable syncLogVisibility = new Runnable() {
                 @Override
                 public void run() {
-                    try {
-                        if (!hasCrash) {
-                            logRow.setText("（未检测到崩溃日志）");
-                            logRow.setTextColor(COLOR_HINT);
-                            uploadLog[0] = false;
-                            return;
-                        }
-                        if (sLogUploadedOnce) {
-                            logRow.setText("log.txt 已上传过，本次不再重复上传");
-                            logRow.setTextColor(COLOR_HINT);
-                            uploadLog[0] = false;
-                            return;
-                        }
-                        long size = crashFiles.get(0).length();
-                        String mark = uploadLog[0] ? "[√] " : "[ ] ";
-                        logRow.setText(mark + "上传最近崩溃日志（"
-                                + crashFiles.get(0).getName() + "，" + humanSize(size) + "）");
-                        logRow.setTextColor(uploadLog[0] ? COLOR_ACCENT : COLOR_TITLE);
-                    } catch (Throwable ignored) {}
+                    boolean isBug = "bug".equals(selValue[0]);
+                    logCard.setVisibility(isBug
+                            ? android.view.View.VISIBLE : android.view.View.GONE);
                 }
             };
-            refreshLogRow.run();
-
-            logRow.setOnClickListener(new android.view.View.OnClickListener() {
-                @Override
-                public void onClick(android.view.View v) {
-                    if (!hasCrash) {
-                        toast(ctx, "未检测到崩溃日志");
-                        return;
-                    }
-                    if (sLogUploadedOnce) {
-                        toast(ctx, "本次已上传过日志，请勿重复提交");
-                        return;
-                    }
-                    uploadLog[0] = !uploadLog[0];
-                    refreshLogRow.run();
-                }
-            });
 
             /* ---- 提交按钮 ---- */
             final TextView submit = new TextView(ctx);
@@ -232,15 +259,14 @@ public final class FeedbackPage {
                 attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
                 attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
                 dialog.getWindow().setAttributes(attrs);
+                /* 不透明背景，避免关闭瞬间露出灰底 */
                 dialog.getWindow().setBackgroundDrawable(
-                        new android.graphics.drawable.ColorDrawable(COLOR_BG));
+                        new android.graphics.drawable.ColorDrawable(0xFF111316));
+                dialog.getWindow().setDimAmount(0f);
             }
             dialog.show();
 
             /* ---- 异步加载类型 ---- */
-            final java.util.List<FeedbackApi.FbType>[] typesRef = new java.util.List[]{null};
-            final int[] selIdx = {0};
-            final String[] selValue = {null};
             new Thread(new Runnable() {
                 @Override
                 public void run() {
@@ -256,6 +282,7 @@ public final class FeedbackPage {
                             }
                             selValue[0] = types.get(0).value;
                             typeTv.setText(types.get(0).label + "  ▾");
+                            syncLogVisibility.run();
                         }
                     });
                 }
@@ -269,23 +296,97 @@ public final class FeedbackPage {
                         toast(ctx, "类型未加载");
                         return;
                     }
-                    String[] labels = new String[types.size()];
+                    /* 自建卡片选择器（不用系统 AlertDialog，与模块风格一致） */
+                    final android.app.Dialog pick = new android.app.Dialog(ctx);
+                    pick.requestWindowFeature(1);
+                    LinearLayout box = new LinearLayout(ctx);
+                    box.setOrientation(1);
+                    GradientDrawable pbg = new GradientDrawable();
+                    pbg.setColor(COLOR_CARD);
+                    pbg.setCornerRadius(dp(ctx, 14));
+                    box.setBackground(pbg);
+                    int pp = dp(ctx, 14);
+                    box.setPadding(pp, dp(ctx, 12), pp, dp(ctx, 12));
+
+                    TextView head = new TextView(ctx);
+                    head.setText("选择反馈类型");
+                    head.setTextSize(15f);
+                    head.setTextColor(COLOR_TITLE);
+                    head.setGravity(17);
+                    head.setPadding(0, 0, 0, dp(ctx, 10));
+                    box.addView(head);
+
                     for (int i = 0; i < types.size(); i++) {
-                        labels[i] = types.get(i).label;
+                        final int which = i;
+                        final FeedbackApi.FbType t = types.get(i);
+                        TextView opt = new TextView(ctx);
+                        opt.setTextSize(13.5f);
+                        opt.setGravity(17);
+                        opt.setPadding(dp(ctx, 10), dp(ctx, 11), dp(ctx, 10), dp(ctx, 11));
+                        boolean on = (which == selIdx[0]);
+                        GradientDrawable obg = new GradientDrawable();
+                        obg.setColor(on ? -15000558 : -14935012);
+                        obg.setCornerRadius(dp(ctx, 9));
+                        if (on) {
+                            obg.setStroke(dp(ctx, 1.2f), COLOR_ACCENT);
+                        }
+                        opt.setBackground(obg);
+                        opt.setTextColor(on ? COLOR_ACCENT : COLOR_TITLE);
+                        opt.setText((on ? "● " : "○ ") + t.label);
+                        opt.setClickable(true);
+                        opt.setOnClickListener(new android.view.View.OnClickListener() {
+                            @Override
+                            public void onClick(android.view.View v) {
+                                selIdx[0] = which;
+                                selValue[0] = t.value;
+                                typeTv.setText(t.label + "  ▾");
+                                syncLogVisibility.run();
+                                try { pick.dismiss(); } catch (Throwable ignored) {}
+                            }
+                        });
+                        LinearLayout.LayoutParams olp =
+                                new LinearLayout.LayoutParams(-1, -2);
+                        if (i > 0) {
+                            olp.topMargin = dp(ctx, 6);
+                        }
+                        box.addView(opt, olp);
                     }
-                    new android.app.AlertDialog.Builder(ctx)
-                            .setTitle("选择反馈类型")
-                            .setSingleChoiceItems(labels, selIdx[0],
-                                    new android.content.DialogInterface.OnClickListener() {
-                                        @Override
-                                        public void onClick(android.content.DialogInterface d, int which) {
-                                            selIdx[0] = which;
-                                            selValue[0] = types.get(which).value;
-                                            typeTv.setText(types.get(which).label + "  ▾");
-                                            try { d.dismiss(); } catch (Throwable ignored) {}
-                                        }
-                                    })
-                            .show();
+
+                    TextView cancel = new TextView(ctx);
+                    cancel.setText("取消");
+                    cancel.setTextSize(13f);
+                    cancel.setTextColor(COLOR_SUB);
+                    cancel.setGravity(17);
+                    cancel.setPadding(0, dp(ctx, 11), 0, dp(ctx, 6));
+                    cancel.setOnClickListener(new android.view.View.OnClickListener() {
+                        @Override
+                        public void onClick(android.view.View v) {
+                            try { pick.dismiss(); } catch (Throwable ignored) {}
+                        }
+                    });
+                    box.addView(cancel);
+
+                    /* 返回键关闭选择器（不穿透到下层） */
+                    pick.setOnKeyListener(new android.content.DialogInterface.OnKeyListener() {
+                        @Override
+                        public boolean onKey(android.content.DialogInterface d, int keyCode,
+                                             android.view.KeyEvent event) {
+                            if (keyCode == android.view.KeyEvent.KEYCODE_BACK
+                                    && event.getAction() == android.view.KeyEvent.ACTION_UP) {
+                                try { d.dismiss(); } catch (Throwable ignored) {}
+                                return true;
+                            }
+                            return false;
+                        }
+                    });
+                    pick.setCanceledOnTouchOutside(true);
+                    pick.setContentView(box);
+                    if (pick.getWindow() != null) {
+                        pick.getWindow().setBackgroundDrawable(
+                                new android.graphics.drawable.ColorDrawable(0x00000000));
+                        pick.getWindow().setDimAmount(0.6f);
+                    }
+                    pick.show();
                 }
             });
 
@@ -300,7 +401,10 @@ public final class FeedbackPage {
                     final String content = etContent.getText().toString().trim();
                     final String contact = etContact.getText().toString().trim();
                     final String type = selValue[0];
-                    final boolean wantLog = uploadLog[0];
+                    /* 仅「功能异常」且已选日志时才带文件 */
+                    final boolean wantLog = "bug".equals(type)
+                            && crashFiles != null && !crashFiles.isEmpty()
+                            && selLog[0] >= 0 && selLog[0] < crashFiles.size();
 
                     if (type == null || type.isEmpty()) {
                         resultTv.setTextColor(-1739917);
@@ -329,7 +433,12 @@ public final class FeedbackPage {
                         public void run() {
                             byte[] logBytes = null;
                             if (wantLog) {
-                                logBytes = readLogBytes(crashFiles);
+                                final java.io.File pick =
+                                        crashFiles.get(selLog[0]);
+                                java.util.ArrayList<java.io.File> one =
+                                        new java.util.ArrayList<>();
+                                one.add(pick);
+                                logBytes = readLogBytes(one);
                             }
                             final FeedbackApi.SubmitResult r = FeedbackApi.submit(
                                     safe(QqKernel.selfUin()),
@@ -355,8 +464,13 @@ public final class FeedbackPage {
                                                 resultTv.setText("反馈已提交，编号 "
                                                         + (r.id == null ? "-" : r.id));
                                                 etContent.setText("");
-                                                uploadLog[0] = false;
-                                                refreshLogRow.run();
+                                                /* 重置为默认选中最近一个 */
+                                                selLog[0] = 0;
+                                                for (int k = 0; k < rowList.size(); k++) {
+                                                    styleLogRow(ctx, rowList.get(k),
+                                                            String.valueOf(crashFiles.get(k).getName()),
+                                                            crashFiles.get(k).length(), k == 0);
+                                                }
                                                 toast(ctx, "反馈已提交，感谢反馈");
                                             } else {
                                                 resultTv.setTextColor(-1739917);
@@ -416,6 +530,22 @@ public final class FeedbackPage {
             Log.w("反馈: 读取日志失败 " + t);
             return null;
         }
+    }
+
+    /** 渲染单条日志行：选中=蓝框+蓝字，未选=灰底 */
+    private static void styleLogRow(Context ctx, TextView row, String name,
+                                    long size, boolean selected) {
+        try {
+            GradientDrawable bg = new GradientDrawable();
+            bg.setColor(selected ? -15000558 : -14935012);
+            bg.setCornerRadius(dp(ctx, 8));
+            if (selected) {
+                bg.setStroke(dp(ctx, 1.2f), COLOR_ACCENT);
+            }
+            row.setBackground(bg);
+            row.setTextColor(selected ? COLOR_ACCENT : COLOR_TITLE);
+            row.setText((selected ? "● " : "○ ") + name + "（" + humanSize(size) + "）");
+        } catch (Throwable ignored) {}
     }
 
     private static String humanSize(long b) {
