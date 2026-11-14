@@ -114,6 +114,70 @@ public class MainHook implements de.robv.android.xposed.IXposedHookLoadPackage {
                     "模块开始注入 process=" + loadPackageParam.processName);
         } catch (java.lang.Throwable ignored) {
         }
+        /*
+         * RecyclerView 布局异常兜底。
+         *
+         * 背景：模块往宿主会话列表 submitList 注入临时会话卡片，
+         * 与宿主自身的 diff 刷新并发时，GapWorker 预取可能撞上
+         * "Inconsistency detected. Invalid item position" —— 这是
+         * androidx RecyclerView 的已知竞态，宿主自身也可能触发。
+         * 一旦抛出就是整进程崩溃，这里捕获后仅记录 + 让 RV 自恢复。
+         */
+        if (TARGET_APP.equals(loadPackageParam.packageName)
+                && loadPackageParam.processName != null
+                && !loadPackageParam.processName.endsWith(":MSF")) {
+            try {
+                Thread.setDefaultUncaughtExceptionHandler(
+                        new java.lang.Thread.UncaughtExceptionHandler() {
+                            private final java.lang.Thread.UncaughtExceptionHandler prev =
+                                    Thread.getDefaultUncaughtExceptionHandler();
+
+                            @Override
+                            public void uncaughtException(java.lang.Thread t,
+                                                          java.lang.Throwable e) {
+                                try {
+                                    String cn = e == null ? "" : e.getClass().getName();
+                                    String msg = e == null || e.getMessage() == null
+                                            ? "" : e.getMessage();
+                                    boolean rvInconsistency =
+                                            cn.contains("IndexOutOfBoundsException")
+                                                    && msg.contains("Inconsistency detected");
+                                    if (rvInconsistency) {
+                                        com.tencent.qqlitepro.util.CrashLog.record(
+                                                "RV inconsistency (suppressed)", e);
+                                        com.tencent.qqlitepro.util.Log.w(
+                                                "RV 布局竞态已拦截（不崩溃）: " + msg);
+                                        /* 通知主线程刷新一次列表，让 RV 重新对齐 */
+                                        try {
+                                            new android.os.Handler(
+                                                    android.os.Looper.getMainLooper())
+                                                    .post(new Runnable() {
+                                                        @Override
+                                                        public void run() {
+                                                            try {
+                                                                com.tencent.qqlitepro.hook
+                                                                        .ChatCardInjector
+                                                                        .refreshChatList();
+                                                            } catch (Throwable ignored) {
+                                                            }
+                                                        }
+                                                    });
+                                        } catch (Throwable ignored) {
+                                        }
+                                        return;   /* 吞掉，不交给 prev → 不崩溃 */
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                                /* 其它异常走原有链路 */
+                                if (prev != null) {
+                                    prev.uncaughtException(t, e);
+                                }
+                            }
+                        });
+                com.tencent.qqlitepro.util.Log.i("RV 布局竞态兜底已安装");
+            } catch (java.lang.Throwable ignored) {
+            }
+        }
         java.lang.String str = loadPackageParam.processName;
         if (str != null && str.endsWith(":MSF")) {
             try {
@@ -258,30 +322,43 @@ public class MainHook implements de.robv.android.xposed.IXposedHookLoadPackage {
                             return;
                         }
                         /*
-                         * 昵称是宿主在打开会话/动态时才加载的，
-                         * 首次上报前先等 ContactRepo hook 捕获到真名（最多 30 秒）；
-                         * 超时仍没拿到才用 QQ 号占位，避免一直不上报。
+                         * 需求：必须拿到真实昵称才上报，绝不用 QQ 号兜底。
+                         * 昵称是宿主打开会话/资料页时才加载的，这里持续等待
+                         * （每秒一次，最多等 5 分钟）；仍然拿不到就放弃本次上报，
+                         * 等下次进程启动再试 —— 宁可不上报，也不写错误昵称。
                          */
                         if (!com.tencent.qqlitepro.http.QqKernel.hasCapturedNick()
-                                && nickTries[0] < 30) {
+                                && nickTries[0] < 300) {
                             nickTries[0]++;
+                            if (nickTries[0] % 30 == 0) {
+                                com.tencent.qqlitepro.util.Log.i(
+                                        "QQMax上报: 等待昵称中… 已等 "
+                                                + nickTries[0] + " 秒");
+                            }
                             h.postDelayed(this, 1000L);
                             return;
                         }
-                        /* 宿主已完全启动：后台线程取昵称并首次上报 */
+                        if (!com.tencent.qqlitepro.http.QqKernel.hasCapturedNick()) {
+                            com.tencent.qqlitepro.util.Log.w(
+                                    "QQMax上报: 5 分钟内未获取到昵称，放弃本次上报"
+                                            + "（不会用 QQ 号代替）");
+                            return;
+                        }
+                        /* 宿主已完全启动且昵称已就绪：后台线程取昵称并首次上报 */
                         new Thread(new Runnable() {
                             @Override
                             public void run() {
                                 try {
                                     String qq = com.tencent.qqlitepro.http.QqKernel.selfUin();
-                                    String nick = qq;
-                                    try {
-                                        String n = com.tencent.qqlitepro.http.QqKernel
-                                                .selfNick();
-                                        if (n != null && !n.trim().isEmpty()) {
-                                            nick = n.trim();
-                                        }
-                                    } catch (Throwable ignored) {}
+                                    String nick = com.tencent.qqlitepro.http.QqKernel
+                                            .capturedNick();
+                                    if (nick == null || nick.trim().isEmpty()
+                                            || nick.trim().equals(qq)) {
+                                        com.tencent.qqlitepro.util.Log.w(
+                                                "QQMax上报: 昵称为空或等于 QQ 号，放弃上报");
+                                        return;
+                                    }
+                                    nick = nick.trim();
                                     com.tencent.qqlitepro.util.Log.i(
                                             "QQMax上报: 宿主就绪，取到昵称=[" + nick
                                                     + "] qq=" + qq);
