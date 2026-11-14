@@ -2794,6 +2794,53 @@ public final class SettingsInjector {
     }
 
     /** 根据未读数更新红点样式 */
+    /**
+     * 通知列表页标记已读后，立即刷新这里的小红点。
+     * （否则要等下一轮 60s 轮询才更新，体验上就是"点了没反应"）
+     */
+    public static void refreshUnreadBadge() {
+        try {
+            final android.widget.TextView badge = sBadgeView;
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        String qq = com.tencent.qqlitepro.http.QqKernel.selfUin();
+                        if (qq == null || !qq.matches("\\d{5,12}")) {
+                            return;
+                        }
+                        final int n = com.tencent.qqlitepro.net.FeedbackApi.fetchUnread(qq);
+                        if (n < 0) {
+                            return;
+                        }
+                        sUnread = n;
+                        new android.os.Handler(android.os.Looper.getMainLooper())
+                                .post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        applyBadge(badge, n);
+                                    }
+                                });
+                    } catch (Throwable ignored) {}
+                }
+            }, "notice-badge-refresh").start();
+        } catch (Throwable ignored) {}
+    }
+
+    /** 让通知页直接改红点数字（本地先变，无需等网络） */
+    public static void setUnreadBadge(int unread) {
+        try {
+            sUnread = unread;
+            final android.widget.TextView badge = sBadgeView;
+            new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                @Override
+                public void run() {
+                    applyBadge(badge, sUnread);
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
+
     private static void applyBadge(android.widget.TextView badge, int unread) {
         try {
             if (badge == null) {
