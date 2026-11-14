@@ -1333,7 +1333,17 @@ public final class QqKernel {
 
     public static boolean hasCapturedNick() {
         String n = sCapturedNick;
-        return n != null && !n.isEmpty();
+        if (n == null || n.isEmpty()) {
+            return false;
+        }
+        /* 与 QQ 号相同的"昵称"视为无效（绝不能当真实昵称上报） */
+        try {
+            String uin = selfUin();
+            if (uin != null && uin.equals(n)) {
+                return false;
+            }
+        } catch (Throwable ignored) {}
+        return true;
     }
 
     public static void setSelfProfile(Object profile) {
@@ -5803,12 +5813,66 @@ public final class QqKernel {
         }
     }
 
+    /** 当前临时会话数据所属的账号 uid（切换账号时用于隔离） */
+    private static volatile java.lang.String sTempChatOwnerUid = "";
+
+    /** 取当前登录账号 uid（用 selfUid 保证与实际渲染的账号一致） */
+    private static java.lang.String currentOwnerUid() {
+        try {
+            String uid = selfUidPublic();
+            if (uid != null && !uid.isEmpty()) {
+                return uid;
+            }
+            String uin = selfUin();
+            return uin == null ? "" : uin;
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    /**
+     * 若登录账号已变，清空上一个账号的临时会话数据。
+     * 这是"切换账号后仍显示旧账号临时会话卡片"的根因修复点。
+     * @return true 表示发生了切换（调用方应触发列表刷新）
+     */
+    public static boolean ensureTempChatOwner() {
+        try {
+            String owner = currentOwnerUid();
+            if (owner.isEmpty()) {
+                return false;
+            }
+            if (owner.equals(sTempChatOwnerUid)) {
+                return false;
+            }
+            boolean had = !sTempChatKnown.isEmpty();
+            sTempChatKnown.clear();
+            try {
+                sTempChatUnread.clear();
+            } catch (Throwable ignored) {
+            }
+            sTempChatOwnerUid = owner;
+            com.tencent.qqlitepro.util.Log.i("临时会话: 账号切换为 " + owner
+                    + (had ? "，已清空旧账号的临时会话" : ""));
+            /* 立刻载入新账号自己的登记 */
+            loadTempChatKnown();
+            return had;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static void loadTempChatKnown() {
         loadTempChatUnread();
         java.lang.String string;
         try {
             android.content.Context contextAppContext = appContext();
-            if (contextAppContext != null && (string = contextAppContext.getSharedPreferences(TEMP_CHAT_PREF, 0).getString(TEMP_CHAT_PREF_KEY, "")) != null && !string.isEmpty()) {
+            String owner = currentOwnerUid();
+            if (!owner.isEmpty()) {
+                sTempChatOwnerUid = owner;
+            }
+            String prefKey = TEMP_CHAT_PREF_KEY
+                    + (sTempChatOwnerUid.isEmpty() ? "" : ("_" + sTempChatOwnerUid));
+            if (contextAppContext != null && (string = contextAppContext.getSharedPreferences(TEMP_CHAT_PREF, 0).getString(prefKey, "")) != null && !string.isEmpty()) {
                 for (java.lang.String str : string.split("\n")) {
                     java.lang.String[] strArrSplit = str.split("\t", -1);
                     if (strArrSplit.length >= 4 && !strArrSplit[0].isEmpty()) {
@@ -5854,7 +5918,10 @@ public final class QqKernel {
                     sb.append('\n');
                 }
             }
-            contextAppContext.getSharedPreferences(TEMP_CHAT_PREF, 0).edit().putString(TEMP_CHAT_PREF_KEY, sb.toString()).apply();
+            String prefKey = TEMP_CHAT_PREF_KEY
+                    + (sTempChatOwnerUid.isEmpty() ? "" : ("_" + sTempChatOwnerUid));
+            contextAppContext.getSharedPreferences(TEMP_CHAT_PREF, 0).edit()
+                    .putString(prefKey, sb.toString()).apply();
         } catch (java.lang.Throwable thRethrow6) {
             com.tencent.qqlitepro.util.Log.w("临时会话: 保存持久登记失败 " + chain(thRethrow6));
         }
@@ -7360,6 +7427,8 @@ public final class QqKernel {
     public static java.util.List<java.lang.Object[]> tempChatSnapshot() {
         java.util.ArrayList<java.lang.Object[]> out = new java.util.ArrayList<>();
         try {
+            /* 关键：每次取快照前确认账号未切换，否则会渲染上一个账号的卡片 */
+            ensureTempChatOwner();
             java.util.ArrayList<java.util.Map.Entry> list = new java.util.ArrayList<>(sTempChatKnown.entrySet());
             /* 去重：同一 uid 只保留最新一条，避免卡片重复出现 */
             java.util.HashSet<java.lang.String> seenUid = new java.util.HashSet<>();
