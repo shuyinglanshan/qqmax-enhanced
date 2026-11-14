@@ -200,6 +200,89 @@ public final class FeedbackApi {
         }
     }
 
+    /* ===================== 人机验证 ===================== */
+
+    /** 验证挑战 */
+    public static class Captcha {
+        public String captchaId;
+        /** data:image/svg+xml;base64,... 可直接解码为 SVG 文本 */
+        public String image;
+        public int cols;
+        public int rows;
+        public long expiresAt;
+        /** 服务端 HMAC 签名，必须原样回传 */
+        public String signature;
+        public String hint;
+        public long ttlMs = 180000L;
+        public long minMs = 300L;
+        public int maxFails = 5;
+    }
+
+    /**
+     * 获取人机验证挑战。
+     * 注意：每次提交失败后都必须重新调用（挑战一次性）。
+     */
+    public static Captcha fetchCaptcha() {
+        try {
+            String r = get("/api/captcha");
+            if (r == null) {
+                return null;
+            }
+            org.json.JSONObject o = new org.json.JSONObject(r);
+            if (!o.optBoolean("ok", false)) {
+                return null;
+            }
+            Captcha c = new Captcha();
+            c.captchaId = o.optString("captchaId");
+            c.image = o.optString("image");
+            c.cols = o.optInt("cols", 4);
+            c.rows = o.optInt("rows", 3);
+            c.expiresAt = o.optLong("expiresAt", 0L);
+            c.signature = o.optString("signature");
+            c.hint = o.optString("hint", "请点击图中的星形图案");
+            org.json.JSONObject meta = o.optJSONObject("meta");
+            if (meta != null) {
+                c.ttlMs = meta.optLong("ttlMs", 180000L);
+                c.minMs = meta.optLong("minMs", 300L);
+                c.maxFails = meta.optInt("maxFails", 5);
+            }
+            if (c.captchaId == null || c.captchaId.isEmpty()) {
+                return null;
+            }
+            return c;
+        } catch (Throwable t) {
+            Log.w("反馈API: 获取验证挑战失败 " + t);
+            return null;
+        }
+    }
+
+    /** 把 data:image/svg+xml;base64,xxx 解码成 SVG 文本 */
+    public static String decodeSvg(String dataUri) {
+        try {
+            if (dataUri == null) {
+                return null;
+            }
+            int comma = dataUri.indexOf(',');
+            if (comma < 0) {
+                return null;
+            }
+            String b64 = dataUri.substring(comma + 1);
+            byte[] raw = android.util.Base64.decode(b64, android.util.Base64.DEFAULT);
+            return new String(raw, "UTF-8");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 验证参数 */
+    public static class CaptchaPayload {
+        public String captchaId;
+        public String captchaSig;
+        public double captchaX;
+        public double captchaY;
+        public long captchaMs;
+    }
+
     /* ===================== 反馈 ===================== */
 
     public static class FbType {
@@ -238,7 +321,7 @@ public final class FeedbackApi {
 
     public static SubmitResult submit(String qq, String nickname, String type,
                                       String content, String contact, String version,
-                                      byte[] logBytes) {
+                                      byte[] logBytes, CaptchaPayload cap) {
         SubmitResult res = new SubmitResult();
         java.net.HttpURLConnection conn = null;
         try {
@@ -263,6 +346,14 @@ public final class FeedbackApi {
                 writeField(bos, boundary, "content", content);
                 writeField(bos, boundary, "contact", contact);
                 writeField(bos, boundary, "version", version);
+                /* 人机验证（一次性挑战，服务端会重算 HMAC 比对） */
+                if (cap != null) {
+                    writeField(bos, boundary, "captchaId", cap.captchaId);
+                    writeField(bos, boundary, "captchaX", String.valueOf(cap.captchaX));
+                    writeField(bos, boundary, "captchaY", String.valueOf(cap.captchaY));
+                    writeField(bos, boundary, "captchaMs", String.valueOf(cap.captchaMs));
+                    writeField(bos, boundary, "captchaSig", cap.captchaSig);
+                }
                 bos.write(("--" + boundary + "\r\n").getBytes("UTF-8"));
                 bos.write(("Content-Disposition: form-data; name=\"log\"; "
                         + "filename=\"qqmax_log.txt\"\r\n").getBytes("UTF-8"));
@@ -279,6 +370,14 @@ public final class FeedbackApi {
                 o.put("content", content == null ? "" : content);
                 if (contact != null && !contact.isEmpty()) o.put("contact", contact);
                 if (version != null && !version.isEmpty()) o.put("version", version);
+                /* 人机验证字段 */
+                if (cap != null) {
+                    o.put("captchaId", cap.captchaId);
+                    o.put("captchaX", cap.captchaX);
+                    o.put("captchaY", cap.captchaY);
+                    o.put("captchaMs", cap.captchaMs);
+                    o.put("captchaSig", cap.captchaSig);
+                }
                 bos.write(o.toString().getBytes("UTF-8"));
             }
 
@@ -332,6 +431,14 @@ public final class FeedbackApi {
                 if (body.contains("RATE_LIMITED")) return "提交太频繁，请 1 分钟后再试";
                 if (body.contains("REPLAY")) return "请求重复，请重试";
                 if (body.contains("TS_INVALID")) return "设备时间不准，请校准后重试";
+                if (body.contains("CAPTCHA_LOCKED")) return "验证失败次数过多，请 10 分钟后再试";
+                if (body.contains("CAPTCHA_FAILED")) {
+                    if (body.contains("TOO_FAST")) return "点击太快，请重新验证";
+                    if (body.contains("TOO_MANY_FAILS")) return "验证失败次数过多，请 10 分钟后再试";
+                    if (body.contains("WRONG_CELL")) return "没点中星形，请重新验证";
+                    if (body.contains("EXPIRED")) return "验证已过期，请重新验证";
+                    return "人机验证未通过，请重新验证";
+                }
             }
             if (code == 401) return "鉴权失败，请联系开发者";
             if (code == 413) return "文件太大";
