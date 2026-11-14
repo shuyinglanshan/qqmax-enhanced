@@ -33,10 +33,82 @@ public final class FeedbackPage {
     private static final int COLOR_ACCENT = -16737793;
     private static final int COLOR_HINT = -8355712;
 
-    /** 本次进程内是否已成功上传过日志（避免重复上传同一个崩溃日志） */
-    private static volatile boolean sLogUploadedOnce = false;
+    /**
+     * 已成功提交过的日志指纹（sha256 十六进制）。
+     * 同一份日志只允许提交一次 —— 与文件名无关，改了名也认得。
+     */
+    private static final java.util.Set<String> sUploadedLogHash =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
     /** 防止连点 */
     private static volatile boolean sSubmitting = false;
+    /** 上次提交时间（毫秒），限速用 */
+    private static volatile long sLastSubmitAt = 0L;
+    /** 两次提交最小间隔 */
+    private static final long SUBMIT_INTERVAL_MS = 60_000L;
+    /** 滑动窗口内最多提交次数 */
+    private static final int SUBMIT_WINDOW_MAX = 3;
+    /** 滑动窗口时长 */
+    private static final long SUBMIT_WINDOW_MS = 10 * 60_000L;
+    /** 窗口内的提交时间 */
+    private static final java.util.Deque<Long> sSubmitTimes = new java.util.ArrayDeque<>();
+
+    /** 日志内容 sha256（十六进制）；用于识别"同一份文件" */
+    private static String sha256Hex(byte[] data) {
+        try {
+            java.security.MessageDigest md =
+                    java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(data);
+            StringBuilder sb = new StringBuilder(d.length * 2);
+            for (byte b : d) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 客户端限速：
+     *  - 两次提交至少间隔 60 秒
+     *  - 10 分钟窗口内最多 3 次（大量请求直接拦截，不再发往服务端）
+     * @return 超限提示；null = 放行
+     */
+    private static String rateLimitCheck() {
+        long now = System.currentTimeMillis();
+        long last = sLastSubmitAt;
+        if (last > 0) {
+            long gap = now - last;
+            if (gap < SUBMIT_INTERVAL_MS) {
+                long wait = (SUBMIT_INTERVAL_MS - gap) / 1000L + 1;
+                return "提交太频繁，请 " + wait + " 秒后再试";
+            }
+        }
+        synchronized (sSubmitTimes) {
+            while (!sSubmitTimes.isEmpty()
+                    && now - sSubmitTimes.peekFirst() > SUBMIT_WINDOW_MS) {
+                sSubmitTimes.pollFirst();
+            }
+            if (sSubmitTimes.size() >= SUBMIT_WINDOW_MAX) {
+                return "10 分钟内已提交 " + sSubmitTimes.size()
+                        + " 次反馈，请稍后再试";
+            }
+        }
+        return null;
+    }
+
+    /** 提交成功后登记（限速计数） */
+    private static void rateLimitMark() {
+        long now = System.currentTimeMillis();
+        sLastSubmitAt = now;
+        synchronized (sSubmitTimes) {
+            sSubmitTimes.addLast(now);
+            while (!sSubmitTimes.isEmpty()
+                    && now - sSubmitTimes.peekFirst() > SUBMIT_WINDOW_MS) {
+                sSubmitTimes.pollFirst();
+            }
+        }
+    }
 
     private FeedbackPage() {
     }
@@ -52,29 +124,32 @@ public final class FeedbackPage {
             final android.app.Dialog dialog = new android.app.Dialog(ctx);
             dialog.requestWindowFeature(1);
             dialog.setCanceledOnTouchOutside(true);
+            /*
+             * 登记为 77 号虚拟页面：
+             * 这样宿主返回键派发时模块知道当前在子页面。
+             * 关闭时（dismiss 回调）必须复位导航状态，
+             * 否则宿主 interceptBack() 会 removeAllViews 重绘导致整屏灰。
+             */
+            try {
+                com.tencent.qqlitepro.hook.SettingsInjector.enterSubPage();
+            } catch (Throwable ignored) {
+            }
+            dialog.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                @Override
+                public void onDismiss(android.content.DialogInterface d) {
+                    try {
+                        com.tencent.qqlitepro.hook.SettingsInjector.resetNavigationState();
+                        com.tencent.qqlitepro.hook.SettingsInjector.returnToMenuFromDialog();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
 
             final LinearLayout root = new LinearLayout(ctx);
             root.setOrientation(1);
             root.setBackgroundColor(0xFF111316);
             int pad = dp(ctx, 14);
             root.setPadding(pad, dp(ctx, 10), pad, dp(ctx, 14));
-
-            /* 返回键直接关闭（不再做特殊处理） */
-            dialog.setOnKeyListener(new android.content.DialogInterface.OnKeyListener() {
-                @Override
-                public boolean onKey(android.content.DialogInterface d, int keyCode,
-                                     android.view.KeyEvent event) {
-                    if (keyCode == android.view.KeyEvent.KEYCODE_BACK
-                            && event.getAction() == android.view.KeyEvent.ACTION_UP) {
-                        try {
-                            d.dismiss();
-                        } catch (Throwable ignored) {
-                        }
-                        return true;
-                    }
-                    return false;
-                }
-            });
 
 
             /* ---- 标题栏 ---- */
@@ -237,145 +312,6 @@ public final class FeedbackPage {
                 }
             };
 
-            /* ---- 极验人机验证（插在崩溃日志与提交按钮之间） ---- */
-            final LinearLayout capCard = card(ctx);
-            capCard.addView(label(ctx, "人机验证"), lp());
-
-            final TextView capHint = new TextView(ctx);
-            capHint.setText("点击下方按钮完成验证");
-            capHint.setTextSize(12f);
-            capHint.setTextColor(COLOR_SUB);
-            capHint.setSingleLine(true);
-            capHint.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            capHint.setPadding(0, 0, 0, dp(ctx, 6));
-            capCard.addView(capHint, lp());
-
-            /* 极验 WebView 容器（自适应：无感/点击/滑块都由 SDK 决定） */
-            final android.widget.FrameLayout gtBox = new android.widget.FrameLayout(ctx);
-            GradientDrawable gbg = new GradientDrawable();
-            gbg.setColor(-14935012);
-            gbg.setCornerRadius(dp(ctx, 8));
-            gtBox.setBackground(gbg);
-            gtBox.setVisibility(android.view.View.GONE);
-            LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-1, 0);
-            glp.height = dp(ctx, 260);
-            capCard.addView(gtBox, glp);
-
-            final TextView capStatus = new TextView(ctx);
-            capStatus.setTextSize(11.5f);
-            capStatus.setTextColor(COLOR_HINT);
-            capStatus.setSingleLine(false);
-            capStatus.setMaxLines(2);
-            capStatus.setPadding(0, dp(ctx, 5), 0, 0);
-            capCard.addView(capStatus, lp());
-
-            final TextView capVerifyBtn = new TextView(ctx);
-            capVerifyBtn.setText("开始验证");
-            capVerifyBtn.setTextSize(13f);
-            capVerifyBtn.setTextColor(-1);
-            capVerifyBtn.setGravity(17);
-            capVerifyBtn.setPadding(0, dp(ctx, 11), 0, dp(ctx, 11));
-            GradientDrawable vbg = new GradientDrawable();
-            vbg.setColor(COLOR_ACCENT);
-            vbg.setCornerRadius(dp(ctx, 9));
-            capVerifyBtn.setBackground(vbg);
-            LinearLayout.LayoutParams vrlp = lp();
-            vrlp.topMargin = dp(ctx, 8);
-            capCard.addView(capVerifyBtn, vrlp);
-
-            body.addView(capCard, top(ctx, 10));
-
-            /* ---- 极验状态 ---- */
-            final FeedbackApi.GtConfig[] gtCfg = {null};
-            final GeetestBridge[] gtBridge = {null};
-            final FeedbackApi.GtResult[] gtResult = {null};
-            final boolean[] gtInited = {false};
-
-            /* 异步拉配置 + 初始化 WebView */
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    final FeedbackApi.GtConfig c = FeedbackApi.fetchGtConfig();
-                    new android.os.Handler(android.os.Looper.getMainLooper())
-                            .post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if (c == null) {
-                                        capStatus.setText("验证服务不可用，请稍后重试");
-                                        capStatus.setTextColor(-1739917);
-                                        capVerifyBtn.setEnabled(false);
-                                        capVerifyBtn.setAlpha(0.5f);
-                                        return;
-                                    }
-                                    gtCfg[0] = c;
-                                    gtBridge[0] = new GeetestBridge(ctx, c);
-                                    gtBridge[0].init(new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            gtInited[0] = true;
-                                            capStatus.setText("");
-                                            /* 把 WebView 挂进容器 */
-                                            android.view.View v = gtBridge[0].view();
-                                            FrameLayout.LayoutParams wlp =
-                                                    new FrameLayout.LayoutParams(-1, -1);
-                                            android.view.ViewParent vp = v.getParent();
-                                            if (vp instanceof android.view.ViewGroup) {
-                                                ((android.view.ViewGroup) vp).removeView(v);
-                                            }
-                                            gtBox.removeAllViews();
-                                            gtBox.addView(v, wlp);
-                                        }
-                                    }, new Runnable() {
-                                        @Override
-                                        public void run() {
-                                            capStatus.setText("验证组件加载失败");
-                                            capStatus.setTextColor(-1739917);
-                                        }
-                                    });
-                                }
-                            });
-                }
-            }, "fb-gt-config").start();
-
-            capVerifyBtn.setOnClickListener(new android.view.View.OnClickListener() {
-                @Override
-                public void onClick(android.view.View v) {
-                    if (gtBridge[0] == null || !gtInited[0]) {
-                        toast(ctx, "验证组件尚未就绪");
-                        return;
-                    }
-                    gtResult[0] = null;
-                    gtBox.setVisibility(android.view.View.VISIBLE);
-                    capStatus.setText("请完成验证…");
-                    capStatus.setTextColor(COLOR_HINT);
-                    gtBridge[0].verify(new GeetestBridge.Callback() {
-                        @Override
-                        public void onSuccess(FeedbackApi.GtResult r) {
-                            gtResult[0] = r;
-                            capStatus.setText("验证已通过");
-                            capStatus.setTextColor(-11751600);
-                            capHint.setText("已完成验证");
-                        }
-
-                        @Override
-                        public void onError(String reason) {
-                            gtResult[0] = null;
-                            capStatus.setText("验证未通过，请重新验证");
-                            capStatus.setTextColor(-1739917);
-                            /* lot_number 一次性：必须重置 SDK */
-                            try {
-                                gtBridge[0].reset();
-                            } catch (Throwable ignored) {
-                            }
-                        }
-
-                        @Override
-                        public void onShow() {
-                            gtBox.setVisibility(android.view.View.VISIBLE);
-                        }
-                    });
-                }
-            });
             /* ---- 提交按钮 ---- */
             final TextView submit = new TextView(ctx);
             submit.setText("提交反馈");
@@ -524,9 +460,10 @@ public final class FeedbackPage {
                     pick.setCanceledOnTouchOutside(true);
                     pick.setContentView(box);
                     if (pick.getWindow() != null) {
+                        /* 关键：不用变暗遮罩（setDimAmount 在该 ROM 上 dismiss 后
+                         * 会残留整屏灰层）；背景直接用不透明深色 */
                         pick.getWindow().setBackgroundDrawable(
-                                new android.graphics.drawable.ColorDrawable(0x00000000));
-                        pick.getWindow().setDimAmount(0.6f);
+                                new android.graphics.drawable.ColorDrawable(0xFF111316));
                     }
                     pick.show();
                 }
@@ -563,16 +500,13 @@ public final class FeedbackPage {
                         resultTv.setText("描述超过 2000 字，请精简");
                         return;
                     }
-                    /* 必须完成人机验证才能提交 */
-                    final FeedbackApi.GtResult cap = gtResult[0];
-                    if (cap == null) {
+
+                    /* ---- 客户端限速：超限直接拦截，不发请求 ---- */
+                    String limitMsg = rateLimitCheck();
+                    if (limitMsg != null) {
                         resultTv.setTextColor(-1739917);
-                        resultTv.setText("请先拖动滑块完成验证");
-                        return;
-                    }
-                    if (!cap.valid()) {
-                        resultTv.setTextColor(-1739917);
-                        resultTv.setText("请先完成人机验证");
+                        resultTv.setText(limitMsg);
+                        toast(ctx, limitMsg);
                         return;
                     }
 
@@ -585,25 +519,97 @@ public final class FeedbackPage {
                     new Thread(new Runnable() {
                         @Override
                         public void run() {
-                            byte[] logBytes = null;
+                            final byte[][] logBytesRef = {null};
+                            final String[] logNameRef = {null};
                             if (wantLog) {
                                 final java.io.File pick =
                                         crashFiles.get(selLog[0]);
                                 java.util.ArrayList<java.io.File> one =
                                         new java.util.ArrayList<>();
                                 one.add(pick);
-                                logBytes = readLogBytes(one);
+                                logBytesRef[0] = readLogBytes(one);
+                                if (logBytesRef[0] != null) {
+                                    /* 上传用文件原名（如 crash_20261114_132410.log） */
+                                    logNameRef[0] = pick.getName();
+                                    /*
+                                     * 防重复提交：按内容指纹（sha256）识别同一份日志，
+                                     * 与文件名无关 —— 改名后也认得，杜绝刷上传。
+                                     */
+                                    String h = sha256Hex(logBytesRef[0]);
+                                    if (h != null && sUploadedLogHash.contains(h)) {
+                                        final String dup = h;
+                                        new android.os.Handler(
+                                                android.os.Looper.getMainLooper())
+                                                .post(new Runnable() {
+                                                    @Override
+                                                    public void run() {
+                                                        sSubmitting = false;
+                                                        submit.setText("提交反馈");
+                                                        submit.setAlpha(1f);
+                                                        resultTv.setTextColor(-1739917);
+                                                        resultTv.setText(
+                                                                "该崩溃日志已提交过，请勿重复上传");
+                                                    }
+                                                });
+                                        return;
+                                    }
+                                }
                             }
-                            final FeedbackApi.SubmitResult r = FeedbackApi.submit(
+                            /*
+                             * 2026-11-14 新协议：
+                             *  - 日志 <1KB 服务端直接拒（FILE_TOO_SMALL），提前拦截
+                             *  - USER_NOT_FOUND（QQ 未上报过）→ 先补 report 再重试 1 次
+                             */
+                            if (logBytesRef[0] != null && logBytesRef[0].length < FeedbackApi.MIN_LOG_BYTES) {
+                                final FeedbackApi.SubmitResult tooSmall =
+                                        new FeedbackApi.SubmitResult();
+                                tooSmall.error = "日志文件太小（至少 1 KB），请重新选择";
+                                new android.os.Handler(
+                                        android.os.Looper.getMainLooper())
+                                        .post(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                sSubmitting = false;
+                                                submit.setText("提交反馈");
+                                                submit.setAlpha(1f);
+                                                resultTv.setTextColor(-1739917);
+                                                resultTv.setText(tooSmall.error);
+                                            }
+                                        });
+                                return;
+                            }
+                            final FeedbackApi.SubmitResult[] rRef =
+                                    {FeedbackApi.submit(
                                     safe(QqKernel.selfUin()),
-                                    nick,
                                     type,
                                     content,
                                     contact,
                                     safe(com.tencent.qqlitepro.BuildConfig.VERSION_NAME),
-                                    logBytes,
-                                    cap);
-                            final boolean usedLog = logBytes != null && logBytes.length > 0;
+                                    logBytesRef[0],
+                                    logNameRef[0])};
+                            /* USER_NOT_FOUND：用户还没上报过 → 先 report 一次再重试 1 次 */
+                            if (!rRef[0].ok && rRef[0].error != null
+                                    && rRef[0].error.contains("USER_NOT_FOUND")) {
+                                try {
+                                    com.tencent.qqlitepro.net.QqMaxReporter
+                                            .reportNowPublic();
+                                } catch (Throwable ignored) {
+                                }
+                                /* 等 report 落库 */
+                                try {
+                                    Thread.sleep(1200L);
+                                } catch (Throwable ignored) {
+                                }
+                                rRef[0] = FeedbackApi.submit(
+                                        safe(QqKernel.selfUin()),
+                                        type,
+                                        content,
+                                        contact,
+                                        safe(com.tencent.qqlitepro.BuildConfig.VERSION_NAME),
+                                        logBytesRef[0],
+                                        logNameRef[0]);
+                            }
+                            final FeedbackApi.SubmitResult r = rRef[0];
                             new android.os.Handler(android.os.Looper.getMainLooper())
                                     .post(new Runnable() {
                                         @Override
@@ -612,8 +618,13 @@ public final class FeedbackPage {
                                             submit.setText("提交反馈");
                                             submit.setAlpha(1f);
                                             if (r.ok) {
-                                                if (usedLog) {
-                                                    sLogUploadedOnce = true;
+                                                /* 登记限速计数 + 日志指纹 */
+                                                rateLimitMark();
+                                                if (logBytesRef[0] != null) {
+                                                    String h = sha256Hex(logBytesRef[0]);
+                                                    if (h != null) {
+                                                        sUploadedLogHash.add(h);
+                                                    }
                                                 }
                                                 resultTv.setTextColor(-11751600);
                                                 resultTv.setText("反馈已提交，编号 "
@@ -627,18 +638,6 @@ public final class FeedbackPage {
                                                             crashFiles.get(k).length(), k == 0);
                                                 }
                                                 toast(ctx, "反馈已提交，感谢反馈");
-                                                /*
-                                                 * 提交成功：lot_number 一次性，
-                                                 * 下一次提交必须重新完成极验。
-                                                 */
-                                                gtResult[0] = null;
-                                                capHint.setText("点击下方按钮完成验证");
-                                                capStatus.setText("");
-                                                try {
-                                                    if (gtBridge[0] != null) {
-                                                        gtBridge[0].reset();
-                                                    }
-                                                } catch (Throwable ignored) {}
                                             } else {
                                                 resultTv.setTextColor(-1739917);
                                                 resultTv.setText(r.error == null
@@ -647,25 +646,6 @@ public final class FeedbackPage {
                                                  * 人机验证失败 → 立即自动刷新验证图，并给出明确提示。
                                                  * 服务端挑战为一次性，任何失败都不能重试同一个。
                                                  */
-                                                boolean captchaIssue = r.error != null
-                                                        && (r.error.contains("验证")
-                                                        || r.error.contains("极验")
-                                                        || r.error.contains("失效")
-                                                        || r.error.contains("过期"));
-                                                if (captchaIssue) {
-                                                    capStatus.setText("验证未通过，请重新验证");
-                                                    capStatus.setTextColor(-1739917);
-                                                }
-                                                /* 任何失败都清空结果 + 重置 SDK（lot_number 一次性） */
-                                                gtResult[0] = null;
-                                                try {
-                                                    if (gtBridge[0] != null) {
-                                                        gtBridge[0].reset();
-                                                    }
-                                                } catch (Throwable ignored) {}
-                                                if (captchaIssue) {
-                                                    toast(ctx, "验证未通过，请重新验证");
-                                                }
                                             }
                                         }
                                     });
