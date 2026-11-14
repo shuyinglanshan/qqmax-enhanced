@@ -168,6 +168,10 @@ public final class NoticePage {
                         public void run() {
                             final String qq = safe(QqKernel.selfUin());
                             final boolean ok = FeedbackApi.markAllRead(qq);
+                            if (ok) {
+                                /* 全部已读：红点直接清零，无需再等网络 */
+                                com.tencent.qqlitepro.hook.SettingsInjector.setUnreadBadge(0);
+                            }
                             h.post(new Runnable() {
                                 @Override
                                 public void run() {
@@ -275,6 +279,8 @@ public final class NoticePage {
                     @Override
                     public void run() {
                         FeedbackApi.markRead(n.id, qq);
+                        /* 立即刷新设置页小红点（不等下一轮轮询） */
+                        com.tencent.qqlitepro.hook.SettingsInjector.refreshUnreadBadge();
                         h.post(new Runnable() {
                             @Override
                             public void run() {
