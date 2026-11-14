@@ -2730,9 +2730,126 @@ public final class SettingsInjector {
         }
     }
 
+    /** 通知红点当前数量（-1=未知/未拉取） */
+    private static volatile int sUnread = -1;
+    private static volatile boolean sPollingStarted = false;
+    private static volatile android.widget.TextView sBadgeView = null;
+
+    /**
+     * 主菜单顶部：左边标题，右边「通知」按钮 + 小红点。
+     * 红点数量来自 /api/notifications/unread（60 秒轮询，仅前台）。
+     */
+    private static android.view.View menuHeader(final android.content.Context context) {
+        android.widget.LinearLayout bar = new android.widget.LinearLayout(context);
+        bar.setOrientation(0);
+        bar.setGravity(16);
+        bar.setPadding(dp(context, 20.0f), dp(context, 14.0f),
+                dp(context, 12.0f), dp(context, 10.0f));
+
+        android.widget.TextView title = text(context, "增强模块设置", TITLE, 17.0f, 8388611);
+        bar.addView(title, new android.widget.LinearLayout.LayoutParams(0, -2, 1.0f));
+
+        /* 右上角：通知按钮（FrameLayout 便于叠红点） */
+        android.widget.FrameLayout box = new android.widget.FrameLayout(context);
+        android.widget.LinearLayout.LayoutParams boxLp =
+                new android.widget.LinearLayout.LayoutParams(dp(context, 40.0f), dp(context, 34.0f));
+        bar.addView(box, boxLp);
+
+        final android.widget.TextView bell = new android.widget.TextView(context);
+        bell.setText("通知");
+        bell.setTextSize(12.5f);
+        bell.setTextColor(ACCENT);
+        bell.setGravity(17);
+        android.graphics.drawable.GradientDrawable bbg = new android.graphics.drawable.GradientDrawable();
+        bbg.setColor(-14935012);
+        bbg.setCornerRadius(dp(context, 8));
+        bell.setBackground(bbg);
+        bell.setClickable(true);
+        bell.setOnClickListener(new android.view.View.OnClickListener() {
+            @Override
+            public void onClick(android.view.View v) {
+                com.tencent.qqlitepro.ui.NoticePage.show(v.getContext());
+            }
+        });
+        box.addView(bell, new android.widget.FrameLayout.LayoutParams(-1, -1));
+
+        /* 红点 */
+        final android.widget.TextView badge = new android.widget.TextView(context);
+        badge.setTextSize(9f);
+        badge.setTextColor(-1);
+        badge.setGravity(17);
+        badge.setVisibility(android.view.View.GONE);
+        android.graphics.drawable.GradientDrawable rbg = new android.graphics.drawable.GradientDrawable();
+        rbg.setColor(-65536);
+        rbg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        badge.setBackground(rbg);
+        android.widget.FrameLayout.LayoutParams blp =
+                new android.widget.FrameLayout.LayoutParams(dp(context, 16.0f), dp(context, 16.0f), 8388613);
+        box.addView(badge, blp);
+        sBadgeView = badge;
+
+        applyBadge(badge, sUnread);
+        startNoticePolling(context);
+        return bar;
+    }
+
+    /** 根据未读数更新红点样式 */
+    private static void applyBadge(android.widget.TextView badge, int unread) {
+        try {
+            if (badge == null) {
+                return;
+            }
+            if (unread <= 0) {
+                badge.setVisibility(android.view.View.GONE);
+                return;
+            }
+            badge.setVisibility(android.view.View.VISIBLE);
+            badge.setText(unread > 99 ? "99+" : String.valueOf(unread));
+        } catch (Throwable ignored) {}
+    }
+
+    /** 启动通知轮询（60 秒，幂等） */
+    private static void startNoticePolling(final android.content.Context ctx) {
+        if (sPollingStarted) {
+            return;
+        }
+        sPollingStarted = true;
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        Runnable task = new Runnable() {
+            @Override
+            public void run() {
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            String qq = com.tencent.qqlitepro.http.QqKernel.selfUin();
+                            if (qq == null || !qq.matches("\\d{5,12}")) {
+                                return;
+                            }
+                            final int n = com.tencent.qqlitepro.net.FeedbackApi.fetchUnread(qq);
+                            if (n >= 0) {
+                                sUnread = n;
+                                h.post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        applyBadge(sBadgeView, n);
+                                    }
+                                });
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                }, "notice-poll").start();
+                h.postDelayed(this, 60000L);
+            }
+        };
+        h.postDelayed(task, 3000L);
+        com.tencent.qqlitepro.util.Log.i("通知: 未读数轮询已启动（60s）");
+    }
+
     private static void renderMenu(android.content.Context context, android.view.ViewGroup viewGroup) {
         viewGroup.removeAllViews();
-        viewGroup.addView(section(context, "增强模块设置"));
+        /* 顶部：标题 + 右上角通知按钮（带红点） */
+        viewGroup.addView(menuHeader(context));
         addDivider(viewGroup);
         viewGroup.addView(navRow(context, "基础设置", "防撤回 / 翻译接口 / 通用", 1));
         addDivider(viewGroup);
@@ -2757,6 +2874,9 @@ public final class SettingsInjector {
         viewGroup.addView(navRow(context, "QQ 动态", "定时点赞 / 评论动态 / 黑名单 / 日志", 15));
         addDivider(viewGroup);
         viewGroup.addView(navRow(context, "关于模块", "版本 / 作者 / 官方群聊", 4));
+        addDivider(viewGroup);
+        /* 需求：反馈入口放在「关于模块」与「官方公告」之间 */
+        viewGroup.addView(navRow(context, "问题反馈", "提交问题 / 附带崩溃日志", 77));
         addDivider(viewGroup);
         viewGroup.addView(navRow(context, "官方公告", "查看最新公告 / 版本更新", 11));
     }
@@ -2833,6 +2953,10 @@ public final class SettingsInjector {
                 break;
             case 3:
                 buildPort(context, viewGroup);
+                break;
+
+            case 77:
+                com.tencent.qqlitepro.ui.FeedbackPage.show(context);
                 break;
             case 4:
             case 14:
