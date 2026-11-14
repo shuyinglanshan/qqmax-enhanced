@@ -54,6 +54,26 @@ public final class QqMaxReporter {
     }
 
     /**
+     * 立即补报一次用户信息（供反馈模块在 USER_NOT_FOUND 时调用）。
+     * 只在已启动（有 qq/昵称）时才有效；否则静默跳过。
+     * @return true = 已发起（不代表服务端成功）
+     */
+    public static boolean reportNowPublic() {
+        try {
+            if (!sStarted || sQq == null || sQq.isEmpty()) {
+                return false;
+            }
+            /*
+             * 同步执行：反馈模块 USER_NOT_FOUND 重试前必须确保 report 落库，
+             * 异步的话调用方拿不到结果。调用方已在后台线程。
+             */
+            return doReport();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
      * 启动上报（幂等）。
      *
      * @param qq       当前登录 QQ 号（纯数字）
@@ -66,6 +86,13 @@ public final class QqMaxReporter {
             }
             sQq = qq;
             sNickname = sanitizeNickname(nickname, qq);
+            /* 需求：昵称无效直接不启动上报，绝不用 QQ 号兜底 */
+            if (sNickname == null || sNickname.isEmpty() || sNickname.equals(qq)) {
+                com.tencent.qqlitepro.util.Log.w(
+                        "QQMax上报: 昵称无效(" + nickname + ")，不启动上报");
+                sStarted = true;   /* 置位避免重复尝试 */
+                return;
+            }
             if (sStarted) {
                 /* 已启动：只更新资料，立刻补一次心跳 */
                 runAsync(new Runnable() {
@@ -153,11 +180,14 @@ public final class QqMaxReporter {
         sb.append("{\"qq\":\"").append(qq).append("\"");
         /*
          * 服务端 nickname 为必填（缺失会 400 BAD_NICKNAME）。
-         * 优先用真实昵称；真拿不到时才用 QQ 号占位，避免整个上报被拒。
+         * 需求：绝不用 QQ 号兜底 —— 拿不到真实昵称就不上报，
+         * 避免服务端存下错误昵称（后续很难纠正）。
          */
         String nick = sNickname;
-        if (nick == null || nick.isEmpty()) {
-            nick = qq;
+        if (nick == null || nick.isEmpty() || nick.equals(qq)) {
+            com.tencent.qqlitepro.util.Log.w(
+                    "QQMax上报: 无有效昵称，跳过 report（不写 QQ 号）");
+            return false;
         }
         sb.append(",\"nickname\":\"").append(escapeJson(nick)).append("\"");
         String v = clientVersion();
