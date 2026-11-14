@@ -1263,38 +1263,17 @@ public class ChatCardInjector {
          * 重要：绝不能在主线程 sleep —— 那会直接卡住 UI（最多 1 秒）。
          * 主线程只做一次"是否已同步"的探测，未同步则交给后续的刷新回调处理。
          */
-        boolean onMain = false;
-        try {
-            onMain = android.os.Looper.myLooper() == android.os.Looper.getMainLooper();
-        } catch (Throwable ignored) {}
-        if (onMain) {
-            try {
-                Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
-                if (cur instanceof List && ((List) cur).size() == chatItems.size()) {
-                    return chatItems;
-                }
-            } catch (Throwable ignored) {}
-            /* 未同步：post 到下一帧继续，不阻塞当前帧 */
-            try {
-                new android.os.Handler(android.os.Looper.getMainLooper()).post(
-                        new Runnable() {
-                            @Override
-                            public void run() {
-                                refreshChatList();
-                            }
-                        });
-            } catch (Throwable ignored) {}
-            return chatItems;
-        }
-        for (int wait = 0; wait < 60; ++wait) {
-            try {
-                Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
-                if (cur instanceof List && ((List) cur).size() == chatItems.size()) {
-                    break;
-                }
-            } catch (Throwable ignored) {}
-            try { Thread.sleep(10L); } catch (InterruptedException ie) { break; }
-        }
+        /*
+         * 关键（RV 竞态修复）：submitList 是异步 diff。
+         * 之前在这里轮询 getCurrentList 等它生效（后台线程最长 600ms），
+         * 这期间宿主自己的刷新也在跑，两边 diff 交错会让 GapWorker 预取时
+         * 拿到不一致的 position → "Invalid item position" 崩溃。
+         *
+         * 现在提交后**不做任何等待**，直接返回；
+         * diff 完成后的渲染由宿主 adapter 自然驱动。
+         * 需要确保"卡片已就位"的场景（如点击导航），由调用方
+         * 在 refreshChatList() 的下一轮自然拿到最新列表。
+         */
         return chatItems;
     }
 
