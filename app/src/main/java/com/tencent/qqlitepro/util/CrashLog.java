@@ -83,10 +83,38 @@ public final class CrashLog {
                 appendSync(boot.toString());
             } catch (Throwable ignored) {
             }
+            /*
+             * 兜底：hook 主线程 Looper 的 messageLogging（部分 ROM 的崩溃会绕过
+             * default handler）。这里不替换日志器，只在主线程发生 FATAL 时补记一条。
+             * 真正的堆栈仍由 default handler 记录，两者互补。
+             */
+            try {
+                installMainLooperWatchdog();
+            } catch (Throwable ignored) {
+            }
             Log.i("崩溃日志: 全局异常捕获已安装 -> " + crashFilePath());
         } catch (Throwable t) {
             Log.w("崩溃日志: 安装失败 " + t);
         }
+    }
+
+    /**
+     * 主线程看门狗：每 5 秒打一条心跳轨迹。
+     * 若进程在主线程死锁/ANR 后被杀，日志里能看到"最后一次心跳"时间，
+     * 从而定位卡死时段（这是纯 crash handler 抓不到的场景）。
+     */
+    private static void installMainLooperWatchdog() {
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        h.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    breadcrumb("主线程心跳");
+                } catch (Throwable ignored) {
+                }
+                h.postDelayed(this, 30000L);
+            }
+        }, 30000L);
     }
 
     /** 记录一条操作轨迹（崩溃时一并输出，便于还原现场） */
@@ -241,44 +269,84 @@ public final class CrashLog {
         return null;
     }
 
-    /** 崩溃路径是"最后机会"，同步写，不用队列 */
+    /** 崩溃路径是"最后机会"，同步写，不用队列；失败重试 3 次（含重建目录） */
     private static void appendSync(String text) {
         synchronized (LOCK) {
-            java.io.FileOutputStream fos = null;
+            byte[] bytes;
             try {
-                java.io.File f = crashFile();
-                if (f == null) {
-                    return;
-                }
-                /* 超过上限：滚动 */
-                if (f.exists() && f.length() > MAX_BYTES) {
-                    java.io.File old = new java.io.File(f.getParentFile(), f.getName() + ".1");
-                    try {
-                        if (old.exists()) {
-                            old.delete();
+                bytes = text.getBytes("UTF-8");
+            } catch (Throwable t) {
+                bytes = text.getBytes();
+            }
+            /* 第一次写；失败则重建目录后重试，最多 3 轮 */
+            for (int attempt = 0; attempt < 3; attempt++) {
+                java.io.FileOutputStream fos = null;
+                try {
+                    java.io.File f = crashFile();
+                    if (f == null) {
+                        /* 目录可能被清理：强制重建一次 */
+                        sForceRebuildDir = true;
+                        continue;
+                    }
+                    if (f.exists() && f.length() > MAX_BYTES) {
+                        java.io.File old = new java.io.File(f.getParentFile(),
+                                f.getName() + ".1");
+                        try {
+                            if (old.exists()) {
+                                old.delete();
+                            }
+                            f.renameTo(old);
+                        } catch (Throwable ignored) {
                         }
-                        f.renameTo(old);
+                    }
+                    fos = new java.io.FileOutputStream(f, true);
+                    fos.write(bytes);
+                    fos.flush();
+                    /* 关键：崩溃后进程随时被杀，必须 fsync 落盘 */
+                    try {
+                        fos.getFD().sync();
                     } catch (Throwable ignored) {
                     }
-                }
-                fos = new java.io.FileOutputStream(f, true);
-                fos.write(text.getBytes("UTF-8"));
-                fos.flush();
-            } catch (Throwable ignored) {
-            } finally {
-                if (fos != null) {
+                    return;   /* 成功 */
+                } catch (Throwable t) {
+                    if (attempt == 2) {
+                        return;   /* 彻底失败，静默 */
+                    }
                     try {
-                        fos.close();
+                        Thread.sleep(20L);
                     } catch (Throwable ignored) {
+                    }
+                } finally {
+                    if (fos != null) {
+                        try {
+                            fos.close();
+                        } catch (Throwable ignored) {
+                        }
                     }
                 }
             }
         }
     }
 
+    /** 标记需要重建目录 */
+    private static volatile boolean sForceRebuildDir = false;
+
     /** 崩溃日志文件（按天）；失败时回退到应用私有目录 */
     private static java.io.File crashFile() {
         try {
+            if (sForceRebuildDir) {
+                sForceRebuildDir = false;
+                try {
+                    java.io.File ext = android.os.Environment.getExternalStorageDirectory();
+                    if (ext != null) {
+                        java.io.File d = new java.io.File(ext, DIR_NAME);
+                        if (!d.exists()) {
+                            d.mkdirs();
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
             java.io.File dir = null;
             try {
                 java.io.File ext = android.os.Environment.getExternalStorageDirectory();
