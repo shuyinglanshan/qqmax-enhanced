@@ -21,6 +21,8 @@ public final class FeedbackApi {
     private static final int TIMEOUT_MS = 10000;
     /** 日志文件大小上限：2MB（服务端硬限制） */
     public static final int MAX_LOG_BYTES = 2 * 1024 * 1024;
+    /** 日志文件最小体积：1KB（2026-11-14 新增，小于此值服务端拒绝） */
+    public static final int MIN_LOG_BYTES = 1024;
 
     private static final java.security.SecureRandom RANDOM = new java.security.SecureRandom();
     private static final char[] NONCE_CHARS =
@@ -202,94 +204,6 @@ public final class FeedbackApi {
 
     /* ===================== 人机验证 ===================== */
 
-    /* ===================== 极验 GT4 ===================== */
-
-    /** 极验配置（服务端下发，不含 key） */
-    public static class GtConfig {
-        public boolean configured;
-        public String captchaId;
-        public String scriptUrl;
-        public String product = "bind";
-        public String language = "zho";
-        public int maxFails = 5;
-        public long failWindowMs = 600000L;
-    }
-
-    /** 查询极验配置；失败返回 null */
-    public static GtConfig fetchGtConfig() {
-        try {
-            String r = get("/api/geetest/config");
-            if (r == null) {
-                return null;
-            }
-            org.json.JSONObject o = new org.json.JSONObject(r);
-            GtConfig c = new GtConfig();
-            c.configured = o.optBoolean("configured", false);
-            c.captchaId = o.optString("captchaId");
-            String su = o.optString("scriptUrl");
-            if (su != null && !su.isEmpty()) {
-                c.scriptUrl = su;
-            } else {
-                c.scriptUrl = "https://static.geetest.com/v4/gt4.js";
-            }
-            String pr = o.optString("product");
-            if (pr != null && !pr.isEmpty()) {
-                c.product = pr;
-            }
-            String lg = o.optString("language");
-            if (lg != null && !lg.isEmpty()) {
-                c.language = lg;
-            }
-            org.json.JSONObject meta = o.optJSONObject("meta");
-            if (meta != null) {
-                c.maxFails = meta.optInt("maxFails", 5);
-                c.failWindowMs = meta.optLong("failWindowMs", 600000L);
-            }
-            if (!c.configured || c.captchaId == null || c.captchaId.isEmpty()) {
-                return null;
-            }
-            return c;
-        } catch (Throwable t) {
-            Log.w("反馈API: 获取极验配置失败 " + t);
-            return null;
-        }
-    }
-
-    /** 极验验证结果：getValidate() 的 4 个值，原样回传 */
-    public static class GtResult {
-        public String lotNumber;
-        public String captchaOutput;
-        public String passToken;
-        public String genTime;
-
-        public boolean valid() {
-            return notEmpty(lotNumber) && notEmpty(captchaOutput)
-                    && notEmpty(passToken) && notEmpty(genTime);
-        }
-
-        private static boolean notEmpty(String s) {
-            return s != null && !s.isEmpty();
-        }
-    }
-
-    /** 把 data:image/svg+xml;base64,xxx 解码成文本（保留给日志/调试用） */
-    public static String decodeSvg(String dataUri) {
-        try {
-            if (dataUri == null) {
-                return null;
-            }
-            int comma = dataUri.indexOf(',');
-            if (comma < 0) {
-                return null;
-            }
-            byte[] raw = android.util.Base64.decode(
-                    dataUri.substring(comma + 1), android.util.Base64.DEFAULT);
-            return new String(raw, "UTF-8");
-        } catch (Throwable t) {
-            return null;
-        }
-    }
-
     /* ===================== 反馈 ===================== */
 
     public static class FbType {
@@ -326,9 +240,15 @@ public final class FeedbackApi {
         public String error;
     }
 
-    public static SubmitResult submit(String qq, String nickname, String type,
+    /**
+     * 提交反馈（2026-11-14 协议）：
+     *  - qq 必填且必须是已上报用户
+     *  - nickname 不传（服务端按用户库自动回填，传错反而被拒）
+     *  - 人机验证已移除，无验证字段
+     */
+    public static SubmitResult submit(String qq, String type,
                                       String content, String contact, String version,
-                                      byte[] logBytes, GtResult gt) {
+                                      byte[] logBytes, String logName) {
         SubmitResult res = new SubmitResult();
         java.net.HttpURLConnection conn = null;
         try {
@@ -347,23 +267,34 @@ public final class FeedbackApi {
             if (logBytes != null && logBytes.length > 0) {
                 conn.setRequestProperty("Content-Type",
                         "multipart/form-data; boundary=" + boundary);
+                /*
+                 * 日志内容摘要：服务端可用它做服务端级去重，
+                 * 也能校验传输过程是否被篡改（防中间人）。
+                 */
+                try {
+                    java.security.MessageDigest md =
+                            java.security.MessageDigest.getInstance("SHA-256");
+                    byte[] d = md.digest(logBytes);
+                    StringBuilder sb2 = new StringBuilder(d.length * 2);
+                    for (byte b : d) {
+                        sb2.append(String.format("%02x", b));
+                    }
+                    conn.setRequestProperty("X-Log-Sha256", sb2.toString());
+                } catch (Throwable ignored) {
+                }
                 writeField(bos, boundary, "qq", qq);
-                writeField(bos, boundary, "nickname", nickname);
                 writeField(bos, boundary, "type", type);
                 writeField(bos, boundary, "content", content);
                 writeField(bos, boundary, "contact", contact);
                 writeField(bos, boundary, "version", version);
                 /* 人机验证（一次性挑战，服务端会重算 HMAC 比对） */
-                /* 极验 4 个值：原样回传，服务端会用 key 重新校验 */
-                if (gt != null && gt.valid()) {
-                    writeField(bos, boundary, "lot_number", gt.lotNumber);
-                    writeField(bos, boundary, "captcha_output", gt.captchaOutput);
-                    writeField(bos, boundary, "pass_token", gt.passToken);
-                    writeField(bos, boundary, "gen_time", gt.genTime);
-                }
                 bos.write(("--" + boundary + "\r\n").getBytes("UTF-8"));
+                /* 上传时保留原始文件名（便于服务端/管理员区分来源） */
+                String fname = (logName == null || logName.trim().isEmpty())
+                        ? "qqmax_log.txt" : logName.trim();
+                fname = fname.replace('\"', '_').replace('\r', '_').replace('\n', '_');
                 bos.write(("Content-Disposition: form-data; name=\"log\"; "
-                        + "filename=\"qqmax_log.txt\"\r\n").getBytes("UTF-8"));
+                        + "filename=\"" + fname + "\"\r\n").getBytes("UTF-8"));
                 bos.write("Content-Type: text/plain; charset=utf-8\r\n\r\n".getBytes("UTF-8"));
                 bos.write(logBytes);
                 bos.write("\r\n".getBytes("UTF-8"));
@@ -372,18 +303,11 @@ public final class FeedbackApi {
                 conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
                 org.json.JSONObject o = new org.json.JSONObject();
                 o.put("qq", qq == null ? "" : qq);
-                o.put("nickname", nickname == null ? "" : nickname);
                 o.put("type", type);
                 o.put("content", content == null ? "" : content);
                 if (contact != null && !contact.isEmpty()) o.put("contact", contact);
                 if (version != null && !version.isEmpty()) o.put("version", version);
                 /* 人机验证字段 */
-                if (gt != null && gt.valid()) {
-                    o.put("lot_number", gt.lotNumber);
-                    o.put("captcha_output", gt.captchaOutput);
-                    o.put("pass_token", gt.passToken);
-                    o.put("gen_time", gt.genTime);
-                }
                 bos.write(o.toString().getBytes("UTF-8"));
             }
 
@@ -429,6 +353,10 @@ public final class FeedbackApi {
     private static String friendlyError(int code, String body) {
         try {
             if (body != null) {
+                if (body.contains("FILE_TOO_SMALL")) return "日志文件太小（至少 1 KB）";
+                if (body.contains("USER_NOT_FOUND")) return "USER_NOT_FOUND";
+                if (body.contains("USER_MISMATCH")) return "USER_MISMATCH";
+                if (body.contains("DAILY_LIMIT_EXCEEDED")) return "今日反馈次数已用完，明天再试";
                 if (body.contains("BAD_EXT")) return "日志文件必须是 .txt";
                 if (body.contains("BAD_CONTENT")) return "日志不是纯文本，请换 UTF-8 编码的 .txt";
                 if (body.contains("FILE_TOO_LARGE")) return "日志超过 2MB，请截取后再传";
