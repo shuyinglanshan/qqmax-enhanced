@@ -3123,6 +3123,66 @@ public final class SettingsInjector {
     }
 
     /* JADX INFO: Access modifiers changed from: private */
+    /**
+     * 登记：当前进入了模块自建的全屏子页面（如问题反馈）。
+     * 让宿主返回键派发时 interceptBack() 能识别到"在子页面"。
+     */
+    public static void enterSubPage() {
+        try {
+            sCurrentPage = 77;
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 复位页面导航状态（供外部全屏 Dialog 关闭时调用）。
+     *
+     * 背景：FeedbackPage 等自建全屏页以 77 号"虚拟页面"形式存在，
+     * 用户按返回/关闭后 BACK 事件会继续传给宿主 SettingsActivity，
+     * 命中模块的 interceptBack() → 它会 removeAllViews + renderMenu 重绘，
+     * 在 Dialog 刚关闭、窗口焦点切换的瞬间执行会渲染异常（整屏灰）。
+     * 这里先复位状态，让 interceptBack() 返回 false，宿主走正常返回逻辑。
+     */
+    public static void resetNavigationState() {
+        try {
+            sCurrentPage = 0;
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 全屏 Dialog 关闭后回到模块主菜单。
+     * 在 Dialog 完全关闭后由 onDismiss 延迟调用，此时窗口焦点已回到宿主，
+     * 重绘是安全的（不会像 interceptBack 在焦点切换瞬间执行那样导致灰屏）。
+     */
+    public static void returnToMenuFromDialog() {
+        try {
+            android.view.ViewGroup group = sPageGroup;
+            if (group == null) {
+                return;
+            }
+            final android.view.ViewGroup g = group;
+            final android.content.Context c = group.getContext();
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                    new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                sCurrentPage = 0;
+                                g.removeAllViews();
+                                renderMenu(c, g);
+                                com.tencent.qqlitepro.util.Log.i(
+                                        "反馈页关闭: 已返回模块主菜单");
+                            } catch (Throwable t) {
+                                com.tencent.qqlitepro.util.Log.w(
+                                        "反馈页关闭: 返回主菜单失败 " + t);
+                            }
+                        }
+                    }, 120L);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static boolean interceptBack() {
         if (sPageGroup != null && sCurrentPage != 0) {
             if (sCurrentPage == 21) {
