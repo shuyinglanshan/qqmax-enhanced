@@ -10,7 +10,7 @@ package com.tencent.qqlitepro.util;
  *  4. 关键生命周期事件（用于还原崩溃前的操作路径）
  *
  * 落盘位置（与模块日志同目录，按天分文件，便于定位）：
- *  /sdcard/QQMax增强/crash/crash_YYYYMMDD.log
+ *  /sdcard/QQMax增强/crash/crash_YYYYMMDD_HHmmss.log（每次进程启动一份）
  *
  * 特性：
  *  - 每条记录独立时间戳（yyyy-MM-dd HH:mm:ss.SSS），一眼区分
@@ -370,8 +370,13 @@ public final class CrashLog {
             if (dir == null) {
                 return null;
             }
+            /*
+             * 文件名带完整时间戳（到秒）：
+             * crash_20261114_154530.log
+             * 每次进程启动各生成一份，互不覆盖，方便逐份上报/比对。
+             */
             java.text.SimpleDateFormat dsf =
-                    new java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.US);
+                    new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US);
             return new java.io.File(dir, PREFIX + dsf.format(new java.util.Date()) + ".log");
         } catch (Throwable ignored) {
             return null;
@@ -415,6 +420,18 @@ public final class CrashLog {
                     return Long.compare(b.lastModified(), a.lastModified());
                 }
             });
+            /* 带时间戳后文件数会增多：超过 30 份时删除最旧的，避免无限堆积 */
+            if (out.size() > 30) {
+                for (int i = 30; i < out.size(); i++) {
+                    try {
+                        out.get(i).delete();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                while (out.size() > 30) {
+                    out.remove(out.size() - 1);
+                }
+            }
         } catch (Throwable ignored) {
         }
         return out;
