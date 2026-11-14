@@ -233,6 +233,164 @@ public final class FeedbackPage {
                 }
             };
 
+            /* ---- 人机验证（插在崩溃日志与提交按钮之间） ---- */
+            final LinearLayout capCard = card(ctx);
+            capCard.addView(label(ctx, "人机验证"), lp());
+
+            final TextView capHint = new TextView(ctx);
+            capHint.setTextSize(12.5f);
+            capHint.setTextColor(COLOR_SUB);
+            capHint.setPadding(0, 0, 0, dp(ctx, 6));
+            capHint.setSingleLine(false);
+            capHint.setMaxLines(2);
+            capCard.addView(capHint, lp());
+
+            /*
+             * 用于承载 SVG 的容器。
+             * 注意：宽必须 MATCH_PARENT、高固定，否则在部分 ROM 上
+             * LinearLayout 会把子 View 压成 0 宽（文字被挤成竖排、溢出到左侧）。
+             * 同时 clipChildren 保证内部任何绘制都不越界。
+             */
+            final android.widget.FrameLayout capBox = new android.widget.FrameLayout(ctx);
+            GradientDrawable cabg = new GradientDrawable();
+            cabg.setColor(-14935012);
+            cabg.setCornerRadius(dp(ctx, 8));
+            capBox.setBackground(cabg);
+            capBox.setClipChildren(true);
+            capBox.setClipToPadding(true);
+            LinearLayout.LayoutParams capLp = new LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT, dp(ctx, 150));
+            capCard.addView(capBox, capLp);
+
+            final TextView capStatus = new TextView(ctx);
+            capStatus.setTextSize(11.5f);
+            capStatus.setTextColor(COLOR_HINT);
+            capStatus.setPadding(0, dp(ctx, 5), 0, 0);
+            capStatus.setSingleLine(false);
+            /* 允许换行并按宽度折行，避免被挤成竖排 */
+            capStatus.setMaxLines(3);
+            capCard.addView(capStatus, lp());
+
+            final TextView capRefresh = new TextView(ctx);
+            capRefresh.setText("刷新验证");
+            capRefresh.setTextSize(12.5f);
+            capRefresh.setTextColor(COLOR_ACCENT);
+            capRefresh.setGravity(17);
+            capRefresh.setPadding(0, dp(ctx, 9), 0, dp(ctx, 9));
+            GradientDrawable crbg = new GradientDrawable();
+            crbg.setColor(-14935012);
+            crbg.setCornerRadius(dp(ctx, 8));
+            capRefresh.setBackground(crbg);
+            LinearLayout.LayoutParams crlp = lp();
+            crlp.topMargin = dp(ctx, 8);
+            capCard.addView(capRefresh, crlp);
+
+            body.addView(capCard, top(ctx, 10));
+
+            /* 验证状态 */
+            final FeedbackApi.Captcha[] capCur = {null};
+            final FeedbackApi.CaptchaPayload[] capPayload = {null};
+            final long[] capShownAt = {0L};
+            final android.view.View[] capSvgView = {null};
+
+            final Runnable loadCaptcha = new Runnable() {
+                @Override
+                public void run() {
+                    capCur[0] = null;
+                    capPayload[0] = null;
+                    capShownAt[0] = 0L;
+                    capStatus.setText("加载验证中…");
+                    capStatus.setTextColor(COLOR_HINT);
+                    capBox.removeAllViews();
+                    /* 重置图框边框（取消已选中样式） */
+                    GradientDrawable idle = new GradientDrawable();
+                    idle.setColor(-14935012);
+                    idle.setCornerRadius(dp(ctx, 8));
+                    capBox.setBackground(idle);
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            final FeedbackApi.Captcha c = FeedbackApi.fetchCaptcha();
+                            new android.os.Handler(android.os.Looper.getMainLooper())
+                                    .post(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            if (c == null) {
+                                                capStatus.setText("验证加载失败，点击「刷新验证」重试");
+                                                capStatus.setTextColor(-1739917);
+                                                return;
+                                            }
+                                            capCur[0] = c;
+                                            capHint.setText(c.hint == null || c.hint.isEmpty()
+                                                    ? "请点击图中的星形图案" : c.hint);
+                                            capStatus.setText("请点击上图中的星形");
+                                            capStatus.setTextColor(COLOR_HINT);
+                                            capShownAt[0] = 0L;   /* 重置，等图片真正显示后再记 */
+                                            captchaShownCallback = new CaptchaShownCallback() {
+                                                @Override
+                                                public void onShown(long atMs) {
+                                                    capShownAt[0] = atMs;
+                                                }
+                                            };
+                                            renderCaptchaSvg(ctx, capBox, c, capSvgView,
+                                                    new CaptchaTapListener() {
+                                                        @Override
+                                                        public void onTap(float px, float py,
+                                                                          float w, float h) {
+                                                            if (capCur[0] == null || w <= 0 || h <= 0) {
+                                                                return;
+                                                            }
+                                                            /* 换算成百分比（必须用显示尺寸） */
+                                                            double x = px * 100.0 / w;
+                                                            double y = py * 100.0 / h;
+                                                            /* 计时起点必须是"图片显示完成"时刻 */
+                                                            long shown = capShownAt[0] > 0
+                                                                    ? capShownAt[0] : sLastShownAt;
+                                                            long ms = shown <= 0 ? 0
+                                                                    : System.currentTimeMillis() - shown;
+                                                            FeedbackApi.CaptchaPayload p =
+                                                                    new FeedbackApi.CaptchaPayload();
+                                                            p.captchaId = capCur[0].captchaId;
+                                                            p.captchaSig = capCur[0].signature;
+                                                            p.captchaX = Math.round(x * 100) / 100.0;
+                                                            p.captchaY = Math.round(y * 100) / 100.0;
+                                                            p.captchaMs = ms;
+                                                            capPayload[0] = p;
+                                                            /*
+                                                             * 视觉反馈：改为图框描边高亮（不再画圆点）。
+                                                             * 之前的小圆点会溢出到容器边界外，看起来像
+                                                             * 左上角有一块"没显示全的蓝色东西"。
+                                                             */
+                                                            GradientDrawable picked = new GradientDrawable();
+                                                            picked.setColor(-14935012);
+                                                            picked.setCornerRadius(dp(ctx, 8));
+                                                            picked.setStroke(dp(ctx, 1.5f),
+                                                                    ms < 300L ? -1739917 : COLOR_ACCENT);
+                                                            capBox.setBackground(picked);
+                                                            if (ms < 300L) {
+                                                                capStatus.setText("点击太快，请稍候再点（需 ≥ 0.3 秒）");
+                                                                capStatus.setTextColor(-1739917);
+                                                            } else {
+                                                                capStatus.setText("已选择位置，可提交");
+                                                                capStatus.setTextColor(-11751600);
+                                                            }
+                                                        }
+                                                    });
+                                        }
+                                    });
+                        }
+                    }, "fb-captcha").start();
+                }
+            };
+
+            capRefresh.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    loadCaptcha.run();
+                }
+            });
+            loadCaptcha.run();
+
             /* ---- 提交按钮 ---- */
             final TextView submit = new TextView(ctx);
             submit.setText("提交反馈");
@@ -254,17 +412,16 @@ public final class FeedbackPage {
             body.addView(resultTv, lp());
 
             dialog.setContentView(root);
-            if (dialog.getWindow() != null) {
-                android.view.WindowManager.LayoutParams attrs = dialog.getWindow().getAttributes();
-                attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
-                attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
-                dialog.getWindow().setAttributes(attrs);
-                /* 不透明背景，避免关闭瞬间露出灰底 */
-                dialog.getWindow().setBackgroundDrawable(
-                        new android.graphics.drawable.ColorDrawable(0xFF111316));
-                dialog.getWindow().setDimAmount(0f);
-            }
+            /*
+             * 窗口背景必须"先设再 show"，但如果只设背景不设 FLAG，
+             * 部分 ROM 会在 dismiss 动画期间露出窗口底色（=灰屏）。
+             * 这里同时：① 不透明背景 ② 去掉变暗 ③ 关闭窗口动画
+             * ④ show 之后再强制重设一次尺寸（防止首次布局用了默认 wrap）。
+             */
+            applyFullscreenWindow(dialog);
             dialog.show();
+            /* show 之后再校正一次（首次 getWindow 布局尚未完成） */
+            applyFullscreenWindow(dialog);
 
             /* ---- 异步加载类型 ---- */
             new Thread(new Runnable() {
@@ -421,6 +578,18 @@ public final class FeedbackPage {
                         resultTv.setText("描述超过 2000 字，请精简");
                         return;
                     }
+                    /* 必须完成人机验证才能提交 */
+                    final FeedbackApi.CaptchaPayload cap = capPayload[0];
+                    if (cap == null) {
+                        resultTv.setTextColor(-1739917);
+                        resultTv.setText("请先点击上方验证图中的星形");
+                        return;
+                    }
+                    if (cap.captchaMs < 300L) {
+                        resultTv.setTextColor(-1739917);
+                        resultTv.setText("点击太快，请稍候重新点击验证图");
+                        return;
+                    }
 
                     sSubmitting = true;
                     submit.setText("提交中…");
@@ -447,7 +616,8 @@ public final class FeedbackPage {
                                     content,
                                     contact,
                                     safe(com.tencent.qqlitepro.BuildConfig.VERSION_NAME),
-                                    logBytes);
+                                    logBytes,
+                                    cap);
                             final boolean usedLog = logBytes != null && logBytes.length > 0;
                             new android.os.Handler(android.os.Looper.getMainLooper())
                                     .post(new Runnable() {
@@ -472,10 +642,36 @@ public final class FeedbackPage {
                                                             crashFiles.get(k).length(), k == 0);
                                                 }
                                                 toast(ctx, "反馈已提交，感谢反馈");
+                                                /*
+                                                 * 提交成功后也必须换新挑战：
+                                                 * 挑战是一次性的，旧 challenge 已被服务端消费。
+                                                 */
+                                                try {
+                                                    loadCaptcha.run();
+                                                } catch (Throwable ignored) {}
                                             } else {
                                                 resultTv.setTextColor(-1739917);
                                                 resultTv.setText(r.error == null
                                                         ? "提交失败" : r.error);
+                                                /*
+                                                 * 人机验证失败 → 立即自动刷新验证图，并给出明确提示。
+                                                 * 服务端挑战为一次性，任何失败都不能重试同一个。
+                                                 */
+                                                boolean captchaIssue = r.error != null
+                                                        && (r.error.contains("验证")
+                                                        || r.error.contains("星形")
+                                                        || r.error.contains("点击太快")
+                                                        || r.error.contains("过期"));
+                                                if (captchaIssue) {
+                                                    capStatus.setText("验证已失效，正在刷新…");
+                                                    capStatus.setTextColor(-1739917);
+                                                }
+                                                try {
+                                                    loadCaptcha.run();
+                                                } catch (Throwable ignored) {}
+                                                if (captchaIssue) {
+                                                    toast(ctx, "验证未通过，已刷新验证图，请重新点击星形");
+                                                }
                                             }
                                         }
                                     });
@@ -532,6 +728,110 @@ public final class FeedbackPage {
         }
     }
 
+    /** 验证图点击回调 */
+    private interface CaptchaTapListener {
+        void onTap(float px, float py, float w, float h);
+    }
+
+    /**
+     * 把服务端下发的 SVG 渲染到 FrameLayout 并监听点击。
+     *
+     * 服务端返回的是 data:image/svg+xml;base64,... 的 SVG 文本，
+     * Android 原生不支持 SVG，这里用一个轻量解析器把它画成 Bitmap：
+     * 只处理本验证图用到的子集（rect / circle / polygon / path / 纯色填充）。
+     */
+    private static void renderCaptchaSvg(final Context ctx, final android.widget.FrameLayout box,
+                                         final FeedbackApi.Captcha cap,
+                                         final android.view.View[] holder,
+                                         final CaptchaTapListener listener) {
+        renderCaptchaSvg(ctx, box, cap, holder, listener, captchaShownCallback);
+    }
+
+    private static void renderCaptchaSvg(final Context ctx, final android.widget.FrameLayout box,
+                                         final FeedbackApi.Captcha cap,
+                                         final android.view.View[] holder,
+                                         final CaptchaTapListener listener,
+                                         final CaptchaShownCallback shownCb) {
+        try {
+            final android.graphics.Bitmap bm = CaptchaSvg.render(
+                    FeedbackApi.decodeSvg(cap.image),
+                    dp(ctx, 420), dp(ctx, 315));
+            if (bm == null) {
+                TextView err = new TextView(ctx);
+                err.setText("验证图渲染失败，请点「刷新验证」");
+                err.setTextSize(12f);
+                err.setTextColor(-1739917);
+                err.setGravity(17);
+                box.addView(err, new android.widget.FrameLayout.LayoutParams(-1, -1));
+                return;
+            }
+            final android.widget.ImageView iv = new android.widget.ImageView(ctx);
+            iv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+            iv.setImageBitmap(bm);
+            box.addView(iv, new android.widget.FrameLayout.LayoutParams(-1, -1));
+            holder[0] = iv;
+            /* 图片就绪后开始计时（必须从显示时刻算，不是请求发出时） */
+            /*
+             * 计时起点：用 OnPreDrawListener 捕捉"图片即将上屏"的那一刻，
+             * 比 post() 更准（post 可能在首帧绘制前就执行，导致 captchaMs 偏大
+             * 或用户看到图时时间已被消耗掉）。
+             */
+            iv.getViewTreeObserver().addOnPreDrawListener(
+                    new android.view.ViewTreeObserver.OnPreDrawListener() {
+                        @Override
+                        public boolean onPreDraw() {
+                            try {
+                                iv.getViewTreeObserver().removeOnPreDrawListener(this);
+                            } catch (Throwable ignored) {
+                            }
+                            try {
+                                sLastShownAt = System.currentTimeMillis();
+                                if (shownCb != null) {
+                                    shownCb.onShown(sLastShownAt);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                            return true;
+                        }
+                    });
+            iv.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    /* 用显示尺寸换算，不能用 SVG 原始尺寸 */
+                    float w = iv.getWidth();
+                    float h = iv.getHeight();
+                    if (w <= 0 || h <= 0) {
+                        return;
+                    }
+                    listener.onTap(v.getX(), v.getY(), w, h);
+                }
+            });
+            box.setOnClickListener(new android.view.View.OnClickListener() {
+                @Override
+                public void onClick(android.view.View v) {
+                    float w = box.getWidth();
+                    float h = box.getHeight();
+                    if (w <= 0 || h <= 0) {
+                        return;
+                    }
+                    listener.onTap(v.getX(), v.getY(), w, h);
+                }
+            });
+        } catch (Throwable t) {
+            Log.w("验证图渲染异常: " + t);
+        }
+    }
+
+    /** 最近一次验证图显示时刻（用于计算 captchaMs） */
+    private static volatile long sLastShownAt = 0L;
+
+    /** 图片显示完成回调（用于精确开始计时） */
+    interface CaptchaShownCallback {
+        void onShown(long atMs);
+    }
+
+    private static volatile CaptchaShownCallback captchaShownCallback = null;
+
     /** 渲染单条日志行：选中=蓝框+蓝字，未选=灰底 */
     private static void styleLogRow(Context ctx, TextView row, String name,
                                     long size, boolean selected) {
@@ -552,6 +852,35 @@ public final class FeedbackPage {
         if (b < 1024) return b + "B";
         if (b < 1024 * 1024) return (b / 1024) + "KB";
         return String.format(java.util.Locale.US, "%.1fMB", b / 1048576.0);
+    }
+
+    /**
+     * 全屏不透明窗口设置。
+     * 关键点：
+     *  - 背景用不透明色，避免 dismiss 动画期间露出系统灰底
+     *  - dimAmount=0 去掉变暗遮罩
+     *  - 关闭窗口进出动画（动画期间窗口背景会被系统临时替换成灰）
+     */
+    private static void applyFullscreenWindow(android.app.Dialog dialog) {
+        try {
+            android.view.Window w = dialog.getWindow();
+            if (w == null) {
+                return;
+            }
+            android.view.WindowManager.LayoutParams attrs = w.getAttributes();
+            attrs.width = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+            attrs.height = android.view.ViewGroup.LayoutParams.MATCH_PARENT;
+            attrs.dimAmount = 0f;
+            w.setAttributes(attrs);
+            w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0xFF111316));
+            /* 关闭窗口进出动画：动画期间系统会临时用灰底，这是灰屏的真正来源 */
+            w.setWindowAnimations(0);
+            try {
+                w.addFlags(android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private static String safe(String s) {
