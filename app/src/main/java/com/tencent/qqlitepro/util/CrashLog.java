@@ -290,9 +290,18 @@ public final class CrashLog {
         }
     }
 
+    /** 卡死落盘节流（避免卡死期间反复 dump 反而加重卡顿） */
+    private static volatile long sLastHangDumpAt = 0L;
+    private static final long HANG_DUMP_MIN_INTERVAL = 30_000L;
+
     /** 卡死时抓主线程 + 全线程栈并落盘 */
     private static void onHang(long lagMs, boolean severe) {
         try {
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - sLastHangDumpAt < HANG_DUMP_MIN_INTERVAL) {
+                return;   /* 30 秒内只 dump 一次 */
+            }
+            sLastHangDumpAt = nowMs;
             StringBuilder sb = new StringBuilder(8192);
             sb.append("\n========== ").append(severe ? "应用卡死" : "主线程卡顿")
                     .append(' ').append(now()).append(" ==========\n");
