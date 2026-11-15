@@ -218,9 +218,20 @@ public class ChatCardInjector {
             }
             long[] hostTimes = hostItemTimes(adapter);
             int hostCount = hostTimes.length;
+            /*
+             * 关键去重：宿主自己已经有这张会话卡时，不再插临时卡。
+             * 覆盖"加好友后"（变成正常好友会话）与"从临时会话转入主列表"两类重复。
+             */
+            java.util.Set<String> hostUids = hostPeerUids(adapter);
             int limit = Math.min(50, snap.size());
+            int skipped = 0;
             for (int i = 0; i < limit; i++) {
                 Object[] one = snap.get(i);
+                String uid = one[0] == null ? "" : String.valueOf(one[0]).trim();
+                if (!uid.isEmpty() && hostUids.contains(uid)) {
+                    skipped++;
+                    continue;
+                }
                 long t = com.tencent.qqlitepro.http.QqKernel.longOf(one[4]);
                 int at = hostCount;
                 for (int k = 0; k < hostCount; k++) {
@@ -231,6 +242,11 @@ public class ChatCardInjector {
                 }
                 plan.add(new int[]{i, at});
             }
+            if (skipped > 0 && sLastSkipLog + 5000L < System.currentTimeMillis()) {
+                sLastSkipLog = System.currentTimeMillis();
+                Log.i("临时会话: 宿主已有同 uid 会话，跳过 " + skipped
+                        + " 条（防重复卡），实际插入 " + plan.size() + " 条");
+            }
         } catch (Throwable th) {
             Log.w("insertPlan 失败: " + th);
         }
@@ -238,6 +254,53 @@ public class ChatCardInjector {
     }
 
     /** 宿主当前列表每条会话的 lastMsgTime（秒->毫秒归一化） */
+    /**
+     * 收集宿主当前会话列表里所有 peerUid。
+     *
+     * 这是判断"宿主是否已经自己渲染了这张卡"的最可靠依据 ——
+     * 比 isFriend() 可靠：后者被模块 hook 放行（恒 true），
+     * 也比 getBuddies() 可靠：本 ROM 上 getBuddyListV2 返回空（好友 0 个）。
+     */
+    private static java.util.Set<String> hostPeerUids(Object adapter) {
+        java.util.HashSet<String> out = new java.util.HashSet<>();
+        try {
+            Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
+            if (!(cur instanceof List)) {
+                return out;
+            }
+            List list = (List) cur;
+            for (int i = 0; i < list.size(); i++) {
+                Object it = list.get(i);
+                if (it == null) continue;
+                String cn = it.getClass().getName();
+                if (!cn.endsWith("RecentContactChatItem")) continue;
+                try {
+                    Object info = XposedHelpers.getObjectField(it, "a");
+                    Object uid = XposedHelpers.getObjectField(info, "peerUid");
+                    if (uid != null) {
+                        String u = String.valueOf(uid).trim();
+                        if (!u.isEmpty()) {
+                            out.add(u);
+                        }
+                    }
+                    /* 同时收 uin，兼容 peerUid 为数字的情形 */
+                    Object uin = XposedHelpers.getObjectField(info, "peerUin");
+                    if (uin != null) {
+                        String u = String.valueOf(uin).trim();
+                        if (!u.isEmpty() && !"0".equals(u)) {
+                            out.add(u);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return out;
+    }
+
+    private static volatile long sLastSkipLog = 0L;
+
     private static long[] hostItemTimes(Object adapter) {
         try {
             Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
@@ -3488,7 +3551,34 @@ public class ChatCardInjector {
 
     public static void setMailEnabled(boolean z) {
         sMailEnabledCache = z;
+        /*
+         * 邮箱开关即时生效的关键：
+         * getItemCount 的 extrab 数量会随开关变化（+1 或 +0），
+         * 必须让 RecyclerView 重新测量数据源，否则会出现
+         * "开关已改但列表还是旧的" —— 表现为要退出重进才生效。
+         * notifyDataSetChanged 会触发完整重绑，配合下面的多轮刷新
+         * 覆盖 adapter diff 尚未完成的窗口期。
+         */
         ChatCardInjector.refreshChatList();
+        /* 再补两轮（300ms/800ms），兜住 diff 尚未提交完成的情况 */
+        try {
+            final android.os.Handler h =
+                    new android.os.Handler(android.os.Looper.getMainLooper());
+            h.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    ChatCardInjector.refreshChatList();
+                }
+            }, 300L);
+            h.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    ChatCardInjector.refreshChatList();
+                }
+            }, 800L);
+        } catch (Throwable ignored) {
+        }
+        Log.i("邮箱卡: 开关已切换为 " + z + "，已触发列表重排");
     }
 
     private static int hookInHierarchy(Class<?> cls, String str, XC_MethodHook xC_MethodHook) {
