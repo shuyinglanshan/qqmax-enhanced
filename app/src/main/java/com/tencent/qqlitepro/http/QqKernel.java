@@ -7607,7 +7607,15 @@ public final class QqKernel {
              *     如果这里还保留临时卡，就会出现两张一模一样的卡片。
              */
             java.util.HashSet<java.lang.String> seenUid = new java.util.HashSet<>();
+            /*
+             * 第二层去重：同一个人可能存在两条记录 ——
+             * 一条 uid 是 u_xxx，另一条 uid 是数字 uin（不同来源登记），
+             * 按 uid 去重挡不住，会渲染成两张一模一样的卡。
+             * 这里再用 uin / (昵称+预览) 做归并。
+             */
+            java.util.HashSet<java.lang.String> seenIdentity = new java.util.HashSet<>();
             int skippedFriend = 0;
+            int skippedDup = 0;
             for (java.util.Map.Entry e : list) {
                 java.lang.String uid = (java.lang.String) e.getKey();
                 java.lang.Object[] v = (java.lang.Object[]) e.getValue();
@@ -7622,9 +7630,24 @@ public final class QqKernel {
                     skippedFriend++;
                     continue;
                 }
-                out.add(new java.lang.Object[]{norm, strOf(v[1]), previewOf(v),
+                /* 身份键：uin 优先（唯一），没有则用 昵称|预览 兜底 */
+                long uin = longOf(v[0]);
+                String nick = strOf(v[1]);
+                String prev = previewOf(v);
+                java.lang.String ident = uin > 0
+                        ? ("uin:" + uin)
+                        : ("nn:" + nick + "|" + (prev == null ? "" : prev));
+                if (!seenIdentity.add(ident)) {
+                    skippedDup++;
+                    continue;
+                }
+                out.add(new java.lang.Object[]{norm, nick, prev,
                         java.lang.Integer.valueOf(tempChatUnread(norm)),
                         java.lang.Long.valueOf(longOf(v[2]))});
+            }
+            if (skippedDup > 0) {
+                com.tencent.qqlitepro.util.Log.i(
+                        "临时会话: 已按 uin/昵称归并 " + skippedDup + " 条重复记录");
             }
             if (skippedFriend > 0) {
                 com.tencent.qqlitepro.util.Log.i(
