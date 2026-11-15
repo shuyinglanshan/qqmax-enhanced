@@ -48,17 +48,39 @@ public class StatusProvider extends android.content.ContentProvider {
              * 由模块进程自己落盘"曾经注入成功"，供宿主未运行时仍能显示"已激活"。
              * 不能在宿主进程写：那里的 getSharedPreferences 指向宿主包目录，模块读不到。
              */
-            if (alive) {
-                try {
-                    android.content.Context ctx = getContext();
-                    if (ctx != null) {
-                        com.tencent.qqlitepro.util.Status.markEverInjected(ctx);
-                    }
-                } catch (java.lang.Throwable ignored) {
+            /*
+             * 重要：只要收到 report_injected，就说明「宿主进程活着 + 模块正在跑」，
+             * 这本身就是注入成功的铁证 —— 不应依赖 sTokenAlive。
+             * 老框架（EdXp/EdXposed、太极）的 Binder 死亡回调经常不触发，
+             * sTokenAlive 长期为 false，导致"已激活却显示未注入"。
+             */
+            try {
+                android.content.Context ctx = getContext();
+                if (ctx != null) {
+                    com.tencent.qqlitepro.util.Status.markBeat(ctx);
+                    com.tencent.qqlitepro.util.Status.markEverInjected(ctx);
                 }
+            } catch (java.lang.Throwable ignored) {
             }
         } else if ("get_status".equals(str)) {
-            boolean z = sToken != null && sTokenAlive;
+            /*
+             * 注入判定放宽：
+             *  1) Binder token 存活 → 注入
+             *  2) 或者 30 秒内有过心跳 → 注入（老框架兜底）
+             */
+            boolean byBinder = sToken != null && sTokenAlive;
+            boolean byBeat = false;
+            try {
+                android.content.Context ctx = getContext();
+                if (ctx != null) {
+                    long last = ctx.getSharedPreferences("qqlitepro_status", 0)
+                            .getLong("last_beat", 0L);
+                    byBeat = last > 0L
+                            && System.currentTimeMillis() - last < 30_000L;
+                }
+            } catch (java.lang.Throwable ignored) {
+            }
+            boolean z = byBinder || byBeat;
             bundle2.putBoolean("injected", z);
             bundle2.putInt("fw", z ? sReportedFw : -1);
         }
