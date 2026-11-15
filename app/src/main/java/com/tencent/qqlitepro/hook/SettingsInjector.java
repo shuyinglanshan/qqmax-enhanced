@@ -81,6 +81,9 @@ public final class SettingsInjector {
     private static volatile android.widget.EditText sMailToEdit;
     private static volatile java.lang.Object sModuleCategory;
     private static volatile com.google.gson.JsonObject sNoticeSelected;
+    /** 只打印一次"已注入"日志 */
+    static volatile boolean sCategoryLogged = false;
+
     private static android.view.ViewGroup sPageGroup;
     private static android.view.ViewGroup sPluginGroup;
     private static android.app.Activity sPluginHost;
@@ -1719,15 +1722,57 @@ public final class SettingsInjector {
         }
 
         protected void afterHookedMethod(de.robv.android.xposed.XC_MethodHook.MethodHookParam methodHookParam) throws java.lang.Throwable {
-            java.lang.Object result = methodHookParam.getResult();
-            java.util.ArrayList arrayList = new java.util.ArrayList();
-            if (result instanceof java.util.List) {
-                arrayList.addAll((java.util.List) result);
+            try {
+                java.lang.Object result = methodHookParam.getResult();
+                java.util.ArrayList arrayList = new java.util.ArrayList();
+                if (result instanceof java.util.List) {
+                    arrayList.addAll((java.util.List) result);
+                }
+                /*
+                 * 幂等：宿主可能多次调用 buildCategories（配置变更/重建），
+                 * 若无条件 add 会重复出现多个「增强模块设置」条目。
+                 */
+                for (java.lang.Object o : arrayList) {
+                    try {
+                        java.lang.String n = java.lang.String.valueOf(
+                                de.robv.android.xposed.XposedHelpers.getObjectField(o, "name"));
+                        if ("增强模块设置".equals(n)) {
+                            methodHookParam.setResult(arrayList);
+                            return;
+                        }
+                    } catch (java.lang.Throwable ignored) {
+                    }
+                }
+                /*
+                 * makeCategory 失败（宿主类未就绪等）时不能吞掉整个 hook，
+                 * 否则表现为「偶尔不出现」。失败则重试一次，仍失败就保留原列表。
+                 */
+                java.lang.Object cat = null;
+                for (int attempt = 0; attempt < 2 && cat == null; attempt++) {
+                    try {
+                        cat = com.tencent.qqlitepro.hook.SettingsInjector.makeCategory(
+                                this.val$cl, this.val$catCls, this.val$fnCls, this.val$unit,
+                                "增强模块设置", "防撤回 / 定时消息 / 端口 / 关于", 0);
+                    } catch (java.lang.Throwable t) {
+                        com.tencent.qqlitepro.util.Log.w("注入增强模块设置条目失败(第"
+                                + (attempt + 1) + "次) " + t);
+                    }
+                }
+                if (cat != null) {
+                    arrayList.add(cat);
+                    com.tencent.qqlitepro.hook.SettingsInjector.sModuleCategory = cat;
+                    methodHookParam.setResult(arrayList);
+                    if (!SettingsInjector.sCategoryLogged) {
+                        SettingsInjector.sCategoryLogged = true;
+                        com.tencent.qqlitepro.util.Log.i("已注入 QQMax 设置项：增强模块设置");
+                    }
+                }
+            } catch (java.lang.Throwable t) {
+                com.tencent.qqlitepro.util.Log.w("注入增强模块设置异常 " + t);
             }
-            arrayList.add(com.tencent.qqlitepro.hook.SettingsInjector.makeCategory(this.val$cl, this.val$catCls, this.val$fnCls, this.val$unit, "增强模块设置", "防撤回 / 定时消息 / 端口 / 关于", 0));
-            com.tencent.qqlitepro.hook.SettingsInjector.sModuleCategory = arrayList.get(arrayList.size() - 1);
-            methodHookParam.setResult(arrayList);
         }
+
+
     }
 
     /* JADX INFO: renamed from: com.tencent.qqlitepro.hook.SettingsInjector$4, reason: invalid class name */
