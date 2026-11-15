@@ -137,6 +137,11 @@ public final class QqKernel {
     }
 
     /* JADX INFO: Access modifiers changed from: private */
+    /** 对外暴露宿主 ClassLoader（供其它模块加载宿主类） */
+    public static java.lang.ClassLoader classLoader() {
+        return sCl;
+    }
+
     public static java.lang.Class<?> cls(java.lang.String str) throws java.lang.ClassNotFoundException {
         if (sCl != null) {
             return java.lang.Class.forName(str, false, sCl);
@@ -7427,8 +7432,15 @@ public final class QqKernel {
     /** 好友 uid 缓存（避免每条临时会话都去调内核） */
     private static final java.util.Set<java.lang.String> sFriendUidCache =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    /** 好友 uin 集合（加好友后 peerUid 可能从 u_xxx 变数字，需要双维度比对） */
+    private static final java.util.Set<java.lang.String> sFriendUinCache =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
     private static volatile long sFriendCacheAt = 0L;
-    private static final long FRIEND_CACHE_TTL_MS = 30_000L;
+    /*
+     * 加好友后要尽快让重复卡片消失：
+     * 缓存缩短到 5 秒，并且好友变更（onBuddyListChange）时会主动失效。
+     */
+    private static final long FRIEND_CACHE_TTL_MS = 5_000L;
     /** 判断结果缓存（uid -> 是否好友），TTL 同好友列表 */
     private static final java.util.Map<java.lang.String, Boolean> sFriendCheckCache =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -7461,10 +7473,23 @@ public final class QqKernel {
              * 在模块内部调用它会拿到被篡改的结果，导致所有临时会话都被误判成好友。
              */
             boolean friend = sFriendUidCache.contains(uid);
+            /* peerUid 若已变为纯数字（加好友后），用 uin 集合再判一次 */
+            if (!friend && uid.matches("\\d{5,12}")) {
+                friend = sFriendUinCache.contains(uid);
+            }
             sFriendCheckCache.put(uid, Boolean.valueOf(friend));
             return friend;
         } catch (Throwable ignored) {
             return false;
+        }
+    }
+
+    /** 主动失效好友缓存（加好友/删好友时调用，让重复卡片立即消失） */
+    public static void invalidateFriendCache() {
+        try {
+            sFriendCacheAt = 0L;
+            sFriendCheckCache.clear();
+        } catch (Throwable ignored) {
         }
     }
 
@@ -7474,10 +7499,42 @@ public final class QqKernel {
             java.util.Set<java.lang.String> tmp =
                     java.util.Collections.newSetFromMap(
                             new java.util.concurrent.ConcurrentHashMap<java.lang.String, Boolean>());
+            java.util.Set<java.lang.String> tmpUin =
+                    java.util.Collections.newSetFromMap(
+                            new java.util.concurrent.ConcurrentHashMap<java.lang.String, Boolean>());
             java.util.ArrayList<java.lang.Object> buddies = getBuddies();
             if (buddies != null) {
                 for (java.lang.Object b : buddies) {
                     if (b == null) continue;
+                    /*
+                     * extractBuddies 里好友被存成 Map，
+                     * 键是 "peerUid"，**不是**对象字段 —— 必须按 Map 读，
+                     * 否则永远取不到 uid，过滤就完全失效（加好友后仍重复）。
+                     */
+                    if (b instanceof java.util.Map) {
+                        java.util.Map m = (java.util.Map) b;
+                        Object uid = m.get("peerUid");
+                        if (uid == null) {
+                            uid = m.get("uid");
+                        }
+                        if (uid != null) {
+                            String s2 = String.valueOf(uid).trim();
+                            if (!s2.isEmpty()) {
+                                tmp.add(s2);
+                            }
+                        }
+                        /* 同时收集 uin（peerUid 可能已变成数字） */
+                        Object puin = m.get("peerUin");
+                        if (puin != null) {
+                            String u = String.valueOf(puin).trim();
+                            if (!u.isEmpty() && !"0".equals(u)) {
+                                tmpUin.add(u);
+                                tmp.add(u);
+                            }
+                        }
+                        continue;
+                    }
+                    /* 兼容对象形式 */
                     Object uid = fieldValue(b, "uid");
                     if (uid == null) {
                         uid = fieldValue(b, "peerUid");
@@ -7492,6 +7549,10 @@ public final class QqKernel {
             }
             sFriendUidCache.retainAll(tmp);
             sFriendUidCache.addAll(tmp);
+            sFriendUinCache.retainAll(tmpUin);
+            sFriendUinCache.addAll(tmpUin);
+            com.tencent.qqlitepro.util.Log.i("好友缓存: uid=" + sFriendUidCache.size()
+                    + " uin=" + sFriendUinCache.size());
         } catch (Throwable ignored) {
         }
     }
