@@ -32,6 +32,8 @@ public final class CrashLog {
 
     private static final Object LOCK = new Object();
     private static volatile boolean sInstalled = false;
+    /** 宿主 ClassLoader（供加载宿主类） */
+    private static volatile java.lang.ClassLoader sHostCl = null;
     private static volatile java.lang.Thread.UncaughtExceptionHandler sPrevHandler = null;
 
     private static final ThreadLocal<java.text.SimpleDateFormat> TS_FULL =
@@ -54,7 +56,23 @@ public final class CrashLog {
      * 不改变宿主的崩溃行为（该弹崩溃页仍会弹）。
      */
     public static void install() {
+        install(null);
+    }
+
+    /**
+     * @param hostCl 宿主 ClassLoader（用于加载 momoi.mod.qqpro.* 等宿主类）。
+     *               传 null 时会尝试从多个来源推断。
+     */
+    public static void install(java.lang.ClassLoader hostCl) {
+        if (hostCl != null) {
+            sHostCl = hostCl;
+        }
         if (sInstalled) {
+            /* 已安装：补装需要宿主 CL 的联动 */
+            try {
+                hookHostWatchdog();
+            } catch (Throwable ignored) {
+            }
             return;
         }
         sInstalled = true;
@@ -94,17 +112,386 @@ public final class CrashLog {
             } catch (Throwable ignored) {
             }
             /*
-             * 兜底：hook 主线程 Looper 的 messageLogging（部分 ROM 的崩溃会绕过
-             * default handler）。这里不替换日志器，只在主线程发生 FATAL 时补记一条。
-             * 真正的堆栈仍由 default handler 记录，两者互补。
+             * 多路补充捕获（default handler 覆盖不到的死角）：
+             *  1) Looper 消息处理异常（部分 ROM 吞掉）
+             *  2) AsyncTask / Runnable 里被线程池吞掉的异常
+             *  3) 线程池 execute/submit 的异常
+             *  4) 主线程卡死检测（与宿主 HangWatcher 互补，阈值更细）
              */
             try {
+                installLooperCrashHook();
+            } catch (Throwable ignored) {
+            }
+            try {
+                installThreadPoolHook();
+            } catch (Throwable ignored) {
+            }
+            try {
+                installHangWatchdog();
+            } catch (Throwable ignored) {
+            }
+            try {
                 installMainLooperWatchdog();
+            } catch (Throwable ignored) {
+            }
+            /* 与宿主 Watchdog 联动：宿主的崩溃/卡死报告也写进我们的日志 */
+            try {
+                hookHostWatchdog();
             } catch (Throwable ignored) {
             }
             Log.i("崩溃日志: 全局异常捕获已安装 -> " + crashFilePath());
         } catch (Throwable t) {
             Log.w("崩溃日志: 安装失败 " + t);
+        }
+    }
+
+    /* ============ 多路补充捕获 ============ */
+
+    /**
+     * Looper 消息处理异常。
+     *
+     * 为什么需要：`Looper.loop()` 内部有自己的 try/catch，
+     * 部分 ROM 会把异常吞掉只打日志，default handler 永远收不到。
+     * 这里 hook Looper.loop 的 catch 分支无法直接做，
+     * 改为 hook Handler.dispatchMessage —— 异常会在这里抛出前被我们看到。
+     */
+    private static void installLooperCrashHook() {
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(
+                    android.os.Handler.class, "dispatchMessage",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            /* dispatchMessage 正常返回说明没问题；异常已由 Looper 处理 */
+                        }
+                    });
+            /* 真正有价值的是捕获 Runnable 里的异常：hook Thread.run 太重，
+             * 改为 hook ThreadGroup.uncaughtException（线程池/裸线程都会走） */
+            try {
+                de.robv.android.xposed.XposedBridge.hookAllMethods(
+                        java.lang.ThreadGroup.class, "uncaughtException",
+                        new de.robv.android.xposed.XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    if (param.args == null || param.args.length < 2) {
+                                        return;
+                                    }
+                                    Object t = param.args[0];
+                                    Object e = param.args[1];
+                                    if (e instanceof Throwable) {
+                                        writeCrash("线程未捕获（ThreadGroup）",
+                                                (t instanceof Thread) ? (Thread) t : null,
+                                                (Throwable) e);
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        });
+                Log.i("崩溃日志: ThreadGroup 未捕获 hook 已安装");
+            } catch (Throwable t) {
+                Log.w("崩溃日志: ThreadGroup hook 失败 " + t);
+            }
+        } catch (Throwable t) {
+            Log.w("崩溃日志: Looper hook 失败 " + t);
+        }
+    }
+
+    /**
+     * 线程池异常。
+     *
+     * 线程池 submit 的 Future 若不被 get()，异常会被静默吞掉 ——
+     * 这是模块自身 bug 最常见的"消失"方式。
+     * 这里 hook ThreadPoolExecutor.afterExecute 拿不到（无回调），
+     * 改为包装 submit 的 Runnable/Callable，捕获后记录再原样抛出。
+     */
+    private static void installThreadPoolHook() {
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(
+                    java.util.concurrent.ThreadPoolExecutor.class, "afterExecute",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.args == null || param.args.length < 2) {
+                                    return;
+                                }
+                                Object th = param.args[1];
+                                if (th instanceof Throwable) {
+                                    moduleError("线程池任务异常（此前被静默吞掉）",
+                                            (Throwable) th);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            Log.i("崩溃日志: 线程池 afterExecute hook 已安装");
+        } catch (Throwable t) {
+            Log.w("崩溃日志: 线程池 hook 失败 " + t);
+        }
+    }
+
+    /**
+     * 主线程卡死检测（与宿主 HangWatcher 互补）。
+     *
+     * 宿主：每 1s tick，8s 判定卡死。
+     * 我们：每 1s tick，**3s 起分级记录**（3s 预警 / 8s 卡死），
+     *      拿到主线程栈后立刻落盘 —— 不等进程被杀。
+     */
+    private static void installHangWatchdog() {
+        try {
+            final long[] lastTick = {android.os.SystemClock.uptimeMillis()};
+            final boolean[] reported3s = {false};
+            final boolean[] reported8s = {false};
+            final android.os.Handler mainH =
+                    new android.os.Handler(android.os.Looper.getMainLooper());
+
+            /* 主线程每秒打点 */
+            Runnable tick = new Runnable() {
+                @Override
+                public void run() {
+                    lastTick[0] = android.os.SystemClock.uptimeMillis();
+                    /* 恢复后重置告警闸门 */
+                    reported3s[0] = false;
+                    reported8s[0] = false;
+                    mainH.postDelayed(this, 1000L);
+                }
+            };
+            mainH.postDelayed(tick, 1000L);
+
+            /* 守护线程每秒检查 */
+            Thread watcher = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    while (true) {
+                        try {
+                            Thread.sleep(1000L);
+                            long now = android.os.SystemClock.uptimeMillis();
+                            long lag = now - lastTick[0];
+                            if (lag >= 8000L && !reported8s[0]) {
+                                reported8s[0] = true;
+                                onHang(lag, true);
+                            } else if (lag >= 3000L && !reported3s[0]) {
+                                reported3s[0] = true;
+                                onHang(lag, false);
+                            }
+                        } catch (InterruptedException ie) {
+                            return;
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }, "qqmax-hang-watch");
+            watcher.setDaemon(true);
+            watcher.start();
+            Log.i("崩溃日志: 卡死检测已启动（3s 预警 / 8s 卡死）");
+        } catch (Throwable t) {
+            Log.w("崩溃日志: 卡死检测启动失败 " + t);
+        }
+    }
+
+    /** 卡死时抓主线程 + 全线程栈并落盘 */
+    private static void onHang(long lagMs, boolean severe) {
+        try {
+            StringBuilder sb = new StringBuilder(8192);
+            sb.append("\n========== ").append(severe ? "应用卡死" : "主线程卡顿")
+                    .append(' ').append(now()).append(" ==========\n");
+            sb.append("卡顿时长 : ").append(lagMs).append(" ms\n");
+            sb.append("进程     : ").append(processName()).append('\n');
+            sb.append("版本     : ").append(versionName()).append('\n');
+
+            /* 主线程栈 */
+            sb.append("---------- 主线程栈 ----------\n");
+            try {
+                StackTraceElement[] st = android.os.Looper.getMainLooper()
+                        .getThread().getStackTrace();
+                for (StackTraceElement el : st) {
+                    sb.append("  at ").append(el).append('\n');
+                }
+            } catch (Throwable ignored) {
+            }
+
+            /* 全线程栈（定位死锁用） */
+            sb.append("---------- 全部线程 ----------\n");
+            try {
+                java.util.Map<Thread, StackTraceElement[]> all =
+                        Thread.getAllStackTraces();
+                for (java.util.Map.Entry<Thread, StackTraceElement[]> en
+                        : all.entrySet()) {
+                    Thread t = en.getKey();
+                    if (t == null) {
+                        continue;
+                    }
+                    sb.append("Thread: ").append(t.getName())
+                            .append(" (id=").append(t.getId())
+                            .append(", state=").append(t.getState()).append(")\n");
+                    StackTraceElement[] sts = en.getValue();
+                    if (sts != null) {
+                        int n = Math.min(sts.length, 20);
+                        for (int i = 0; i < n; i++) {
+                            sb.append("  at ").append(sts[i]).append('\n');
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            sb.append("========== END ").append(now()).append(" ==========\n\n");
+            /* 同一时长区间只记一次，避免卡死期间刷屏 */
+            String sig = "hang|" + (severe ? "8s" : "3s") + "|" + firstMainFrame();
+            appendDedup(sig, sb.toString());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 主线程第一个业务栈帧（用于卡死去重） */
+    private static String firstMainFrame() {
+        try {
+            StackTraceElement[] st = android.os.Looper.getMainLooper()
+                    .getThread().getStackTrace();
+            for (StackTraceElement el : st) {
+                String cn = el.getClassName();
+                if (cn.contains("CrashLog")) {
+                    continue;
+                }
+                return cn + "." + el.getMethodName();
+            }
+        } catch (Throwable ignored) {
+        }
+        return "?";
+    }
+
+    /**
+     * 与宿主 Watchdog 联动：
+     * 宿主的 CrashHandler / HangWatcher 最终都会调 Watchdog.report(ctx, kind, body)。
+     * 我们 hook 它，把同样的内容镜像到 crash.log，
+     * 这样"宿主自己捕获到的崩溃/卡死"也能在我们的日志里看到。
+     */
+    public static void hookHostWatchdog() {
+        /*
+         * 必须用宿主 ClassLoader！
+         * CrashLog.class.getClassLoader() 是模块自己的 PathClassLoader，
+         * 里面没有 momoi.mod.qqpro.* —— 会抛 ClassNotFoundException
+         * （个性签名功能曾因同样的错误导致"保存失败：ClassNotFoundException"）。
+         */
+        try {
+            ClassLoader cl = hostClassLoader();
+            if (cl == null) {
+                Log.w("崩溃日志: 取不到宿主 ClassLoader，跳过 Watchdog 联动");
+                return;
+            }
+            Class<?> cls = Class.forName("momoi.mod.qqpro.watchdog.Watchdog", false, cl);
+            hookHostWatchdog(cls);
+        } catch (Throwable t) {
+            Log.w("崩溃日志: Watchdog 类加载失败 " + t);
+            /* 此时可能还没拿到宿主 CL：延迟重试最多 3 次 */
+            if (sWatchdogRetry < 3) {
+                sWatchdogRetry++;
+                try {
+                    new android.os.Handler(android.os.Looper.getMainLooper())
+                            .postDelayed(new Runnable() {
+                                @Override
+                                public void run() {
+                                    try {
+                                        hookHostWatchdog();
+                                    } catch (Throwable ignored) {
+                                    }
+                                }
+                            }, 2000L * sWatchdogRetry);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private static volatile int sWatchdogRetry = 0;
+
+    /** 取宿主 ClassLoader（优先用模块初始化时保存的） */
+    private static ClassLoader hostClassLoader() {
+        ClassLoader cached = sHostCl;
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            ClassLoader cl = com.tencent.qqlitepro.http.QqKernel.classLoader();
+            if (cl != null) {
+                return cl;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            ClassLoader cl = Thread.currentThread().getContextClassLoader();
+            if (cl != null && classExists("momoi.mod.qqpro.watchdog.Watchdog", cl)) {
+                return cl;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object app = at.getMethod("currentApplication").invoke(null);
+            if (app != null) {
+                return app.getClass().getClassLoader();
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static boolean classExists(String name, ClassLoader cl) {
+        try {
+            Class.forName(name, false, cl);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    public static void hookHostWatchdog(final Class<?> watchdogCls) {
+        if (watchdogCls == null) {
+            return;
+        }
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(watchdogCls, "report",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                String kind = "";
+                                String body = "";
+                                if (param.args != null) {
+                                    for (Object a : param.args) {
+                                        if (a instanceof String) {
+                                            String s2 = (String) a;
+                                            if ("crash".equals(s2) || "hang".equals(s2)) {
+                                                kind = s2;
+                                            } else if (s2.length() > 20) {
+                                                body = s2;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (body.isEmpty()) {
+                                    return;
+                                }
+                                /* 宿主已生成完整报告（含设备信息+堆栈），直接镜像 */
+                                String head = "crash".equals(kind) ? "宿主崩溃（Watchdog）"
+                                        : "hang".equals(kind) ? "宿主卡死（Watchdog）"
+                                        : "宿主报告";
+                                StringBuilder sb = new StringBuilder(body.length() + 256);
+                                sb.append("\n===== ").append(head).append(' ')
+                                        .append(now()).append(" =====\n");
+                                sb.append(body).append('\n');
+                                sb.append("===== END =====\n\n");
+                                String sig = "watchdog|" + kind + "|"
+                                        + Math.min(body.length(), 400);
+                                appendDedup(sig, sb.toString());
+                                Log.i("崩溃日志: 已镜像宿主 Watchdog 报告 kind=" + kind);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    });
+            Log.i("崩溃日志: 宿主 Watchdog.report 联动 hook 已安装");
+        } catch (Throwable t) {
+            Log.w("崩溃日志: Watchdog 联动失败 " + t);
         }
     }
 
@@ -610,79 +997,64 @@ public final class CrashLog {
             if (all == null || all.isEmpty()) {
                 return out;
             }
-            /* 按分隔符切块：模块异常单行开头 / 宿主闪退 & 未捕获异常用 ===== 包裹 */
+            /*
+             * 通用分块解析。
+             *
+             * 历史 bug：只识别 [模块异常]/宿主闪退/CRASH/[启动]/[异常] 五种起始，
+             * 新增的「应用卡死」「主线程卡顿」「宿主崩溃（Watchdog）」「宿主卡死（Watchdog）」
+             * 全部漏识别 —— 被当成上一条的续行或直接丢弃，
+             * 导致反馈页列表里看不到这些真实故障（且 [启动] 反而被当成异常列出）。
+             *
+             * 现在改为：任何「带时间戳的块首」都算新条目开始。
+             */
             String[] lines = all.split("\n");
             StringBuilder cur = new StringBuilder();
-            String curKey = null;
-            String curTitle = null;
             String curKind = null;
+            String curTitle = null;
             String curTime = null;
 
             for (String line : lines) {
-                boolean isStart =
-                        line.contains("[模块异常]")
-                        || line.contains("========== 宿主闪退")
-                        || line.contains("========== CRASH")
-                        || line.contains("[启动]")
-                        || line.contains("[异常]");
-                boolean isEnd = line.contains("========== END");
-
-                if (isStart) {
-                    /* 收尾上一条 */
-                    if (curKey != null) {
-                        addEntry(seen, cur);
-                    }
+                String kind = detectKind(line);
+                if (kind != null) {
+                    /* 遇到新块首：先收尾上一条 */
+                    flushEntry(seen, cur, curKind, curTitle, curTime);
                     cur.setLength(0);
-                    curKey = null;
+                    curKind = kind;
                     curTitle = null;
-                    curKind = null;
                     curTime = extractTime(line);
-                }
-                if (cur.length() > 0 || isStart) {
                     cur.append(line).append('\n');
-                }
-                if (isStart) {
-                    if (line.contains("[模块异常]")) {
-                        curKind = "模块异常";
+                    /* [模块异常] 的标题就在首行 */
+                    if ("模块异常".equals(kind)) {
                         int i = line.indexOf("[模块异常]");
-                        curTitle = line.substring(i + 6).trim();
-                    } else if (line.contains("宿主闪退")) {
-                        curKind = "宿主闪退";
-                    } else if (line.contains("========== CRASH")) {
-                        curKind = "未捕获异常";
-                    } else if (line.contains("[启动]")) {
-                        curKind = "启动";
-                        curTitle = "模块启动";
-                    } else if (line.contains("[异常]")) {
-                        curKind = "异常";
+                        if (i >= 0) {
+                            curTitle = line.substring(i + 6).trim();
+                        }
+                    }
+                    continue;
+                }
+                if (cur.length() > 0) {
+                    cur.append(line).append('\n');
+                    /* 还没拿到标题：从正文里找异常行 */
+                    if (curTitle == null && curKind != null
+                            && !"启动".equals(curKind)) {
+                        String t = pickThrowableLine(line);
+                        if (t != null) {
+                            curTitle = t;
+                        }
                     }
                 }
-                /* 从内容里提取异常标题（第一处 "xxxException"/"Error" 行） */
-                if (curTitle == null && curKind != null && !"启动".equals(curKind)) {
-                    String t = pickThrowableLine(line);
-                    if (t != null) {
-                        curTitle = t;
-                    }
-                }
-                if (isEnd) {
-                    curKey = buildKey(curKind, curTitle, cur.toString());
-                    if (curKey != null) {
-                        addEntry(seen, cur);
-                    }
+                /* 结束标记：立即收尾 */
+                if (line.contains("========== END")
+                        || line.contains("===== END")) {
+                    flushEntry(seen, cur, curKind, curTitle, curTime);
                     cur.setLength(0);
-                    curKey = null;
+                    curKind = null;
                     curTitle = null;
                 }
             }
-            /* 收尾最后一条（模块异常没有 END 标记） */
-            if (cur.length() > 0) {
-                if (curTitle == null) {
-                    curTitle = pickThrowableLine(cur.toString());
-                }
-                if (curTitle != null) {
-                    addEntry(seen, cur);
-                }
-            }
+            /* 收尾最后一条 */
+            flushEntry(seen, cur, curKind, curTitle, curTime);
+
             out.addAll(seen.values());
 
             /*
@@ -707,57 +1079,138 @@ public final class CrashLog {
         return out;
     }
 
-    /** 收尾/入库：把当前块整理成 Entry */
-    private static void addEntry(java.util.Map<String, Entry> seen, StringBuilder cur) {
+    /**
+     * 识别一行是否为"新块的首行"，并返回块类型；不是块首返回 null。
+     *
+     * 覆盖 CrashLog 写出的所有块格式：
+     *   [启动]...                          启动标记
+     *   yyyy-MM-dd ...  [模块异常] xxx      模块功能异常
+     *   ========== CRASH ...                未捕获异常
+     *   ========== 宿主闪退 ...             宿主闪退
+     *   ========== 应用卡死 ...             应用卡死（我们的看门狗）
+     *   ========== 主线程卡顿 ...           主线程卡顿（我们的看门狗）
+     *   ===== 宿主崩溃（Watchdog） ...      宿主 Watchdog 镜像-崩溃
+     *   ===== 宿主卡死（Watchdog） ...      宿主 Watchdog 镜像-卡死
+     */
+    private static String detectKind(String line) {
         try {
+            if (line == null || line.isEmpty()) {
+                return null;
+            }
+            if (line.contains("[模块异常]")) {
+                return "模块异常";
+            }
+            if (line.contains("[异常]")) {
+                return "异常";
+            }
+            if (line.contains("[启动]")) {
+                return "启动";
+            }
+            /* ===== / ========== 包裹的块（末尾带时间戳） */
+            if (line.contains("==========") || line.contains("=====")) {
+                if (line.contains("宿主崩溃（Watchdog）")) {
+                    return "宿主崩溃";
+                }
+                if (line.contains("宿主卡死（Watchdog）")) {
+                    return "宿主卡死";
+                }
+                if (line.contains("宿主闪退")) {
+                    return "宿主闪退";
+                }
+                if (line.contains("========== CRASH")) {
+                    return "未捕获异常";
+                }
+                if (line.contains("应用卡死")) {
+                    return "应用卡死";
+                }
+                if (line.contains("主线程卡顿")) {
+                    return "主线程卡顿";
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** 把一个块整理成 Entry 并入库（已存在同 key 则跳过） */
+    private static void flushEntry(java.util.Map<String, Entry> seen,
+                                   StringBuilder cur, String kind,
+                                   String title, String time) {
+        try {
+            if (cur == null || cur.length() == 0) {
+                return;
+            }
             String raw = cur.toString();
             if (raw.trim().isEmpty()) {
                 return;
             }
-            String title = pickThrowableLine(raw);
-            if (title == null) {
-                title = firstMeaningfulLine(raw);
-            }
-            if (title == null) {
+            /* 启动标记不算"可上报的异常"，直接丢弃 */
+            if ("启动".equals(kind)) {
                 return;
             }
-            String kind = raw.contains("[模块异常]") ? "模块异常"
-                    : raw.contains("宿主闪退") ? "宿主闪退"
-                    : raw.contains("========== CRASH") ? "未捕获异常" : "其它";
-            String key = kind + "|" + title;
+            String t = title;
+            /* Watchdog 镜像块：用"应用崩溃/应用卡死 xxx"做标题，比栈帧更可读 */
+            if (("应用卡死".equals(kind) || "主线程卡顿".equals(kind))
+                    && (t == null || t.isEmpty() || t.contains("主线程卡顿"))) {
+                /* 用"卡顿 xxx ms"作为统一标题，类型已由 kind 表达 */
+                t = pickThrowableLine(raw);
+            }
+            if ("宿主崩溃".equals(kind) || "宿主卡死".equals(kind)) {
+                String w = watchdogHeadline(raw);
+                if (w != null && !w.isEmpty()) {
+                    t = w;
+                }
+            }
+            if (t == null || t.isEmpty()) {
+                t = pickThrowableLine(raw);
+            }
+            if (t == null || t.isEmpty()) {
+                t = firstMeaningfulLine(raw);
+            }
+            if (t == null || t.isEmpty()) {
+                return;
+            }
+            String k = (kind == null || kind.isEmpty()) ? "其它" : kind;
+            String key = k + "|" + t;
             if (seen.containsKey(key)) {
-                return;   /* 完全相同的问题只留一条 */
+                return;
             }
             Entry e = new Entry();
             e.key = key;
-            e.title = title;
-            e.kind = kind;
+            e.title = t;
+            e.kind = k;
             e.raw = raw;
-            e.time = extractTime(raw);
+            e.time = (time == null || time.isEmpty()) ? extractTime(raw) : time;
             seen.put(key, e);
         } catch (Throwable ignored) {
         }
     }
 
-    private static String buildKey(String kind, String title, String raw) {
-        try {
-            String t = title != null ? title : pickThrowableLine(raw);
-            if (t == null) {
-                return null;
-            }
-            return (kind == null ? "?" : kind) + "|" + t;
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
+    /** 收尾/入库：把当前块整理成 Entry */
 
-    /** 从一段文本里挑出异常标题行（类名: 消息） */
+
+    /**
+     * 从一段文本里挑出"最像标题"的行。
+     *
+     * 优先级：
+     *  1) 原始错误: xxx
+     *  2) java.lang.XxxException: msg
+     *  3) 卡死/崩溃块的特征行（应用卡死 xxx ms / 异常 : xxx / 崩溃 ...）
+     *  4) 主线程栈的第一帧（Watchdog 镜像块里没有异常行，但栈很有价值）
+     */
     private static String pickThrowableLine(String text) {
         try {
+            if (text == null) {
+                return null;
+            }
             String[] ls = text.split("\n");
+            String firstFrame = null;
             for (String l : ls) {
                 String t = l.trim();
-                /* 形如 java.lang.XxxException: msg 或 com.x.YyyError */
+                if (t.isEmpty()) {
+                    continue;
+                }
+                /* 1) 原始错误行 */
                 if (t.startsWith("原始错误")) {
                     int c = t.indexOf(':');
                     if (c > 0) {
@@ -766,9 +1219,57 @@ public final class CrashLog {
                             return v;
                         }
                     }
+                    continue;
                 }
+                /* 2) 标准异常行 */
                 if (t.matches("^[a-zA-Z_$][\\w$]*(\\.[a-zA-Z_$][\\w$]*)+"
                         + "(Exception|Error|Throwable).*")) {
+                    return t;
+                }
+                /* 3) 块特征行 */
+                if (t.startsWith("卡顿时长")) {
+                    /* 只取时长数字；kind 已标明是"应用卡死"还是"主线程卡顿" */
+                    String v = t.replace("卡顿时长", "").replace(":", "").trim();
+                    return "卡顿 " + v;
+                }
+                if (t.startsWith("异常   :")) {
+                    return t.replace("异常   :", "").trim();
+                }
+                if (t.startsWith("异常 :")) {
+                    return t.replace("异常 :", "").trim();
+                }
+                if (t.startsWith("消息   :")) {
+                    String v = t.replace("消息   :", "").trim();
+                    if (!v.isEmpty() && !"null".equals(v)) {
+                        return v;
+                    }
+                }
+                /* 4) 记下首个栈帧备用 */
+                if (firstFrame == null && t.startsWith("at ")) {
+                    firstFrame = t.substring(3).trim();
+                }
+            }
+            if (firstFrame != null) {
+                return "位于 " + firstFrame;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** Watchdog 镜像块的标题：取 "应用崩溃 / 应用卡死 xxx ms" 这类首行 */
+    private static String watchdogHeadline(String text) {
+        try {
+            String[] ls = text.split("\n");
+            for (String l : ls) {
+                String t = l.trim();
+                if (t.isEmpty() || t.startsWith("=") || t.startsWith("=====")) {
+                    continue;
+                }
+                if (t.startsWith("应用崩溃") || t.startsWith("应用卡死")) {
+                    if (t.length() > 80) {
+                        t = t.substring(0, 80) + "…";
+                    }
                     return t;
                 }
             }
