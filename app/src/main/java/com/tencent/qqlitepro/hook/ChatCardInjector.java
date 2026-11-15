@@ -157,8 +157,9 @@ public class ChatCardInjector {
     /* 主列表 RecyclerView（injectAdapter 时保存）——导航/Activity 获取用 */
     private static volatile ViewGroup sMainRecyclerView;
 
+    /** 邮箱卡所在槽位；关闭邮箱功能时返回 -1（表示不存在） */
     public static int cardSlot(Object obj) {
-        return 0;
+        return ChatCardInjector.isMailCardEnabled() ? 0 : -1;
     }
 
     public static int tempChatCardSlot(Object obj) {
@@ -181,7 +182,8 @@ public class ChatCardInjector {
 
     /** 当前 adapter 的额外卡片数（必须与 getItemViewType/getItem 的实际产出严格一致） */
     private static int extraCardCountFor(Object adapter) {
-        int n = 1;   /* 邮箱卡 */
+        /* 邮箱卡槽位只在开关开启时占用，否则会多出一个空位 */
+        int n = ChatCardInjector.isMailCardEnabled() ? 1 : 0;
         if (ChatCardInjector.tempChatFeatureOn()) {
             try {
                 n += insertPlan(adapter).size();
@@ -191,7 +193,7 @@ public class ChatCardInjector {
     }
 
     private static int extraCardCount() {
-        int n = 1;
+        int n = ChatCardInjector.isMailCardEnabled() ? 1 : 0;
         if (ChatCardInjector.tempChatFeatureOn()) {
             n += Math.min(50, com.tencent.qqlitepro.http.QqKernel.tempChatCount());
         }
@@ -274,17 +276,29 @@ public class ChatCardInjector {
      * 布局：[0]=邮箱卡，[1..N]=临时会话卡（按时间），[N+1..]=宿主会话（按时间穿插）。
      * 返回 int[]{类型, 索引}：类型 0=邮箱卡，1=临时卡，2=宿主卡
      */
+    /**
+     * 显示位置 -> {类型, 下标}
+     *   类型 0 = 邮箱卡
+     *   类型 1 = 临时会话卡（下标为 plan 序号）
+     *   类型 2 = 宿主会话（下标为宿主 list 真实位置）
+     *
+     * 注意：邮箱卡槽位由 cardSlot() 决定，关闭邮箱时返回 -1，
+     * 此时第 0 位就是普通会话/临时卡，不能无条件当邮箱卡。
+     */
     private static int[] resolvePos(Object adapter, int pos) {
         try {
             java.util.List<int[]> plan = insertPlan(adapter);
             int hostCount = hostItemTimes(adapter).length;
             int n = plan.size();
-            /* 展开显示序列 */
+            int mp = cardSlot(adapter);
             int cursor = 0;
-            if (pos == cursor) {
+            /* 邮箱卡存在且占第 0 位 */
+            if (mp >= 0 && pos == cursor) {
                 return new int[]{0, 0};
             }
-            cursor++;
+            if (mp >= 0) {
+                cursor++;
+            }
             int planIdx = 0;
             int hostIdx = 0;
             while (planIdx < n || hostIdx < hostCount) {
@@ -329,15 +343,22 @@ public class ChatCardInjector {
     private static int tempChatIndexAtPos(Object adapter, int pos) {
         if (!ChatCardInjector.tempChatFeatureOn()) return -1;
         try {
-            Object mailPos = Integer.valueOf(cardSlot(adapter));
-            int mp = mailPos instanceof Integer ? (Integer) mailPos : 0;
+            /*
+             * 邮箱卡槽位：
+             *  - 开启邮箱：占 0，临时卡从 1 开始
+             *  - 关闭邮箱：返回 -1（不存在），临时卡从 0 开始
+             *
+             * 之前写死 `int cursor = 1` 且 mp 兜底成 0，
+             * 关闭邮箱后整个位移算错，同一张临时卡被绑定两次 → 重复卡片。
+             */
+            int mp = cardSlot(adapter);            /* -1 = 无邮箱卡 */
             java.util.List<int[]> plan = insertPlan(adapter);
-            int cursor = 1;   /* 邮箱卡占 0 */
+            int cursor = (mp >= 0) ? 1 : 0;        /* 无邮箱卡时从 0 开始 */
             int planIdx = 0;
             int hostIdx = 0;
             int hostCount = hostItemTimes(adapter).length;
             while (true) {
-                boolean mailSlot = (mp == cursor);
+                boolean mailSlot = (mp >= 0 && mp == cursor);
                 if (mailSlot) {
                     if (pos == cursor) return -1;
                     cursor++;
@@ -3437,8 +3458,21 @@ public class ChatCardInjector {
         return null;
     }
 
+    /**
+     * 是否为"已注入的会话列表 adapter"。
+     *
+     * 注意：这里**不再**混入邮箱开关判断。
+     * 之前是 `sInjected.containsKey(obj) && mailEnabled()`，
+     * 导致关闭 QQ 邮箱功能时，临时会话卡片也一起消失（两者共用了这个入口）。
+     * 邮箱开关应在邮箱卡片自己的渲染分支里单独判断。
+     */
     public static boolean isTarget(Object obj) {
-        return obj != null && sInjected.containsKey(obj) && ChatCardInjector.mailEnabled();
+        return obj != null && sInjected.containsKey(obj);
+    }
+
+    /** 邮箱卡片是否启用（供邮箱卡片分支单独判断） */
+    public static boolean isMailCardEnabled() {
+        return mailEnabled();
     }
 
     private static boolean mailEnabled() {
@@ -3780,7 +3814,9 @@ public class ChatCardInjector {
             if (ChatCardInjector.isTarget(methodHookParam.thisObject) && (numLastIntArg = ChatCardInjector.lastIntArg(methodHookParam)) != null) {
                 boolean isTemp;
                 int pos = numLastIntArg;
-                boolean isMail = pos == ChatCardInjector.cardSlot(methodHookParam.thisObject);
+                /* 邮箱卡片额外受开关约束；临时会话卡片与开关无关 */
+                boolean isMail = pos == ChatCardInjector.cardSlot(methodHookParam.thisObject)
+                        && ChatCardInjector.isMailCardEnabled();
                 int tempIdx = ChatCardInjector.tempChatIndexAtPos(methodHookParam.thisObject, pos);
                 boolean isTempCard = tempIdx >= 0;
                 if (!isMail && !isTempCard) {
@@ -3824,7 +3860,7 @@ public class ChatCardInjector {
             if (ChatCardInjector.isTarget(methodHookParam.thisObject) && typeArg != null) {
                 boolean isTempCard;
                 int vtype = typeArg;
-                boolean isMailCard = vtype == -10;
+                boolean isMailCard = vtype == -10 && ChatCardInjector.isMailCardEnabled();
                 boolean bl = isTempCard = vtype == -11;
                 if (!isMailCard && !isTempCard) {
                     return;
