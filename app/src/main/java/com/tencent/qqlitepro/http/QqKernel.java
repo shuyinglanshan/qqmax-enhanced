@@ -5851,6 +5851,7 @@ public final class QqKernel {
             }
             boolean had = !sTempChatKnown.isEmpty();
             sTempChatKnown.clear();
+            sDataRev++;
             try {
                 sTempChatUnread.clear();
             } catch (Throwable ignored) {
@@ -5890,6 +5891,7 @@ public final class QqKernel {
                         }
                     }
                 }
+                sDataRev++;
                 com.tencent.qqlitepro.util.Log.i("临时会话: 载入持久登记 " + sTempChatKnown.size() + " 条");
             }
         } catch (java.lang.Throwable thRethrow6) {
@@ -5966,6 +5968,7 @@ public final class QqKernel {
             return;
         }
         concurrentHashMap.put(str, new java.lang.Object[]{java.lang.Long.valueOf(jLongOf), strTrim, java.lang.Long.valueOf(jLongOf2), java.lang.Integer.valueOf(iIntOf), java.lang.Integer.valueOf(iOrderOf), strPreviewOf});
+        sDataRev++;   /* 数据变了：让快照/plan 缓存失效 */
         saveTempChatKnown();
     }
 
@@ -7557,7 +7560,40 @@ public final class QqKernel {
         }
     }
 
+    /*
+     * 快照缓存（滑动性能关键）：
+     * getItem / onBind 在滑动时每帧都会调 tempChatSnapshot()，
+     * 每次都要重建 List + 排序 + 逐条查好友，20 条就是 20 次判断，
+     * 滑动必然掉帧。这里按「数据版本号」缓存，数据不变直接复用。
+     */
+    private static volatile java.util.List<java.lang.Object[]> sSnapCache = null;
+    private static volatile long sSnapRev = -1L;
+
+    /** 临时会话数据变更时调用，让快照缓存失效 */
+    public static synchronized void bumpSnapshot() {
+        sSnapRev++;
+        sSnapCache = null;
+        try {
+            com.tencent.qqlitepro.hook.ChatCardInjector.invalidatePlanCache();
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static java.util.List<java.lang.Object[]> tempChatSnapshot() {
+        java.util.List<java.lang.Object[]> cached = sSnapCache;
+        if (cached != null && sSnapRev == sDataRev) {
+            return cached;
+        }
+        java.util.List<java.lang.Object[]> fresh = buildTempChatSnapshot();
+        sSnapCache = fresh;
+        sSnapRev = sDataRev;
+        return fresh;
+    }
+
+    /** 数据版本号：任何写 sTempChatKnown 的地方都应 +1 */
+    private static volatile long sDataRev = 0L;
+
+    private static java.util.List<java.lang.Object[]> buildTempChatSnapshot() {
         java.util.ArrayList<java.lang.Object[]> out = new java.util.ArrayList<>();
         try {
             /* 关键：每次取快照前确认账号未切换，否则会渲染上一个账号的卡片 */
