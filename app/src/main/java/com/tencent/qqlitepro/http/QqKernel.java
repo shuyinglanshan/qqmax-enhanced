@@ -7424,14 +7424,93 @@ public final class QqKernel {
         /* no-op：tempChatSnapshot() 每次实时构建 */
     }
 
+    /** 好友 uid 缓存（避免每条临时会话都去调内核） */
+    private static final java.util.Set<java.lang.String> sFriendUidCache =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+    private static volatile long sFriendCacheAt = 0L;
+    private static final long FRIEND_CACHE_TTL_MS = 30_000L;
+    /** 判断结果缓存（uid -> 是否好友），TTL 同好友列表 */
+    private static final java.util.Map<java.lang.String, Boolean> sFriendCheckCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 该临时会话是否已经变成好友。
+     *
+     * 加好友后：宿主会渲染正常好友会话卡，
+     * 而 sTempChatKnown 里还留着旧的临时卡记录 → 出现两张一样的卡。
+     * 这里用宿主的 isFriend 判断，命中就跳过临时卡。
+     */
+    private static boolean isTempChatNowFriend(java.lang.String uid) {
+        try {
+            if (uid == null || uid.isEmpty()) {
+                return false;
+            }
+            long now = System.currentTimeMillis();
+            if (now - sFriendCacheAt > FRIEND_CACHE_TTL_MS) {
+                refreshFriendUidCache();
+                sFriendCacheAt = now;
+                sFriendCheckCache.clear();
+            }
+            Boolean cached = sFriendCheckCache.get(uid);
+            if (cached != null) {
+                return cached.booleanValue();
+            }
+            /*
+             * 只用好友列表集合判断，**不要调宿主的 isFriend()**：
+             * 模块自己 hook 了 isFriend 给临时会话"放行"（永远返回 true），
+             * 在模块内部调用它会拿到被篡改的结果，导致所有临时会话都被误判成好友。
+             */
+            boolean friend = sFriendUidCache.contains(uid);
+            sFriendCheckCache.put(uid, Boolean.valueOf(friend));
+            return friend;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 刷新好友 uid 集合 */
+    private static void refreshFriendUidCache() {
+        try {
+            java.util.Set<java.lang.String> tmp =
+                    java.util.Collections.newSetFromMap(
+                            new java.util.concurrent.ConcurrentHashMap<java.lang.String, Boolean>());
+            java.util.ArrayList<java.lang.Object> buddies = getBuddies();
+            if (buddies != null) {
+                for (java.lang.Object b : buddies) {
+                    if (b == null) continue;
+                    Object uid = fieldValue(b, "uid");
+                    if (uid == null) {
+                        uid = fieldValue(b, "peerUid");
+                    }
+                    if (uid != null) {
+                        String s2 = String.valueOf(uid).trim();
+                        if (!s2.isEmpty()) {
+                            tmp.add(s2);
+                        }
+                    }
+                }
+            }
+            sFriendUidCache.retainAll(tmp);
+            sFriendUidCache.addAll(tmp);
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static java.util.List<java.lang.Object[]> tempChatSnapshot() {
         java.util.ArrayList<java.lang.Object[]> out = new java.util.ArrayList<>();
         try {
             /* 关键：每次取快照前确认账号未切换，否则会渲染上一个账号的卡片 */
             ensureTempChatOwner();
             java.util.ArrayList<java.util.Map.Entry> list = new java.util.ArrayList<>(sTempChatKnown.entrySet());
-            /* 去重：同一 uid 只保留最新一条，避免卡片重复出现 */
+            /*
+             * 去重 + 好友过滤：
+             *  1) 同一 uid 只保留最新一条（防重复卡）
+             *  2) 该 uid 已经是好友 → 不再作为"临时会话"展示。
+             *     加好友后宿主会自己渲染一张正常好友会话卡，
+             *     如果这里还保留临时卡，就会出现两张一模一样的卡片。
+             */
             java.util.HashSet<java.lang.String> seenUid = new java.util.HashSet<>();
+            int skippedFriend = 0;
             for (java.util.Map.Entry e : list) {
                 java.lang.String uid = (java.lang.String) e.getKey();
                 java.lang.Object[] v = (java.lang.Object[]) e.getValue();
@@ -7442,9 +7521,17 @@ public final class QqKernel {
                 if (!seenUid.add(norm)) {
                     continue;
                 }
+                if (isTempChatNowFriend(norm)) {
+                    skippedFriend++;
+                    continue;
+                }
                 out.add(new java.lang.Object[]{norm, strOf(v[1]), previewOf(v),
                         java.lang.Integer.valueOf(tempChatUnread(norm)),
                         java.lang.Long.valueOf(longOf(v[2]))});
+            }
+            if (skippedFriend > 0) {
+                com.tencent.qqlitepro.util.Log.i(
+                        "临时会话: 已跳过 " + skippedFriend + " 条（已成为好友，由宿主正常卡片展示）");
             }
             out.sort(new java.util.Comparator<java.lang.Object[]>() {
                 @Override
