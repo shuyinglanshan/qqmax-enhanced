@@ -10017,7 +10017,14 @@ public final class SettingsInjector {
         android.widget.TextView textViewText = text(context, "QQMax 增强模块", TITLE, 18.0f, 17);
         textViewText.setPadding(0, dp(context, 18.0f), 0, dp(context, 4.0f));
         linearLayout.addView(textViewText, rootLp());
-        linearLayout.addView(infoLine(context, "版本", "v1.2.3"));
+        /* 版本号自动读 BuildConfig，避免以后忘记同步 */
+        String verText;
+        try {
+            verText = "v" + com.tencent.qqlitepro.BuildConfig.VERSION_NAME;
+        } catch (Throwable t) {
+            verText = "v?";
+        }
+        linearLayout.addView(infoLine(context, "版本", verText));
         /* 崩溃日志：显示路径 + 可点击复制，方便用户反馈时附上 */
         try {
             final String crashPath = com.tencent.qqlitepro.util.CrashLog.crashFilePath();
