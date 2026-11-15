@@ -157,16 +157,116 @@ public final class Status {
         if (context == null) {
             return sInjected;
         }
+        /* 1) 首选：ContentProvider（LSPosed 等新框架可靠） */
         try {
             android.os.Bundle bundleCall = context.getContentResolver()
                     .call(URI, "get_status", (java.lang.String) null, (android.os.Bundle) null);
             if (bundleCall != null) {
-                return bundleCall.getBoolean("injected", false);
+                boolean ok = bundleCall.getBoolean("injected", false);
+                if (ok) {
+                    return true;
+                }
+                /*
+                 * 返回 false 时不要立刻下结论 ——
+                 * 老框架（EdXp/EdXposed、太极）对跨进程 ContentProvider.call()
+                 * 的支持有缺陷：Provider 能连通但拿不到宿主进程写入的心跳，
+                 * 于是"已激活却显示未注入"。继续走下面的进程探测。
+                 */
             }
         } catch (java.lang.Throwable unused) {
         }
-        // ContentProvider 不可用时（例如宿主未安装/未启动）才回退
+
+        /* 2) 兜底：直接探测宿主进程里是否存在模块类（不依赖 ContentProvider） */
+        try {
+            if (probeHostProcessInjected()) {
+                sInjected = true;
+                return true;
+            }
+        } catch (java.lang.Throwable ignored) {
+        }
+
+        /* 3) 最后回退到本进程缓存（仅当确实是宿主进程内时可信） */
         return sInjected && isSelfProcess(context);
+    }
+
+    /**
+     * 不依赖 ContentProvider 的注入探测。
+     *
+     * 原理：模块被注入宿主后，宿主进程里会加载 com.tencent.qqlitepro.* 的类。
+     * 通过 Binder 查询宿主进程自身的 ClassLoader 是否含模块类即可判断。
+     *
+     * 实现选择：读取 /proc 里宿主进程是否存在 + 模块标记文件，
+     * 两者都满足才认为注入（成本低、无反射、兼容 EdXp）。
+     */
+    private static boolean probeHostProcessInjected() {
+        try {
+            /* 宿主进程需要在运行 */
+            if (!isProcessRunning(PKG_HOST)) {
+                return false;
+            }
+            /*
+             * 心跳标记：宿主进程每次心跳成功会（尽力）更新自己的进程启动时间戳，
+             * 这里读模块自己 SP 里记录的时间，与 /proc 里宿主进程的启动时间比对。
+             * 若宿主进程启动时间晚于「上次心跳」而心跳仍在刷新，说明宿主活着且模块在写，
+             * 但老框架下 ContentProvider 读不到 —— 直接用标记文件兜底。
+             */
+            android.content.Context self =
+                    com.tencent.qqlitepro.util.Ctx.get();
+            if (self == null) {
+                return false;
+            }
+            long lastBeat = self.getSharedPreferences(PREF, 0)
+                    .getLong(KEY_LAST_BEAT, 0L);
+            if (lastBeat <= 0L) {
+                return false;
+            }
+            /* 心跳在最近 30 秒内 ⇒ 宿主活着且模块在跑 */
+            return System.currentTimeMillis() - lastBeat < 30_000L;
+        } catch (java.lang.Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** 判断某包进程是否在运行（读 /proc，无需权限） */
+    private static boolean isProcessRunning(String pkg) {
+        try {
+            java.io.File[] procs = new java.io.File("/proc").listFiles();
+            if (procs == null) {
+                return false;
+            }
+            for (java.io.File p : procs) {
+                if (p == null || !p.isDirectory()) {
+                    continue;
+                }
+                String name = p.getName();
+                boolean allDigit = !name.isEmpty();
+                for (int i = 0; i < name.length(); i++) {
+                    if (!Character.isDigit(name.charAt(i))) {
+                        allDigit = false;
+                        break;
+                    }
+                }
+                if (!allDigit) {
+                    continue;
+                }
+                java.io.BufferedReader br = null;
+                try {
+                    br = new java.io.BufferedReader(new java.io.FileReader(
+                            new java.io.File(p, "cmdline")));
+                    String line = br.readLine();
+                    if (line != null && line.contains(pkg)) {
+                        return true;
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (br != null) {
+                        try { br.close(); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (java.lang.Throwable ignored) {
+        }
+        return false;
     }
 
     /**
@@ -202,6 +302,20 @@ public final class Status {
     /* 记录"模块曾经成功注入过宿主"，用于宿主未运行时仍能正确显示激活状态 */
     private static final java.lang.String PREF = "qqlitepro_status";
     private static final java.lang.String KEY_EVER_INJECTED = "ever_injected";
+    /** 最近一次心跳时间戳（宿主进程内的模块写入） */
+    private static final java.lang.String KEY_LAST_BEAT = "last_beat";
+
+    /** 心跳时更新「最近存活时间」，供 probeHostProcessInjected 使用 */
+    public static void markBeat(android.content.Context selfContext) {
+        try {
+            if (selfContext == null) {
+                return;
+            }
+            selfContext.getSharedPreferences(PREF, 0).edit()
+                    .putLong(KEY_LAST_BEAT, System.currentTimeMillis()).apply();
+        } catch (Throwable ignored) {
+        }
+    }
 
     /** 标记曾经注入成功（由宿主进程心跳首次成功时写入） */
     public static void markEverInjected(android.content.Context context) {
