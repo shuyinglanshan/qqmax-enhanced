@@ -209,20 +209,84 @@ public class ChatCardInjector {
      * 逐位时间穿插：临时会话按 msgTime 与宿主会话混排。
      * 返回 List<int[]>：{临时序号, 宿主会话下标(0..hostCount)}
      */
+    /* ============ insertPlan 缓存（滑动性能关键） ============ */
+    /*
+     * getItemCount 在滑动时每帧都会被调用，而 insertPlan 内部有
+     * hostItemTimes / hostPeerUids 两次全量遍历 + 每条 2~3 次反射。
+     * 列表 20 条时 = 每帧 ~100 次反射，滑动必然卡。
+     *
+     * 现在按「adapter 身份 + 宿主列表尺寸 + 临时会话签名」做缓存，
+     * 只有真正变化时才重算。
+     */
+    private static volatile Object sPlanCacheAdapter = null;
+    private static volatile int sPlanCacheHostSize = -1;
+    private static volatile long sPlanCacheTempSig = 0L;
+    private static volatile java.util.List<int[]> sPlanCache = null;
+
+    /** 临时会话列表的廉价签名（不反射，只读已有的快照字段） */
+    private static long tempSig() {
+        try {
+            int n = com.tencent.qqlitepro.http.QqKernel.tempChatCount();
+            return n * 1000003L + sTempRev;
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
+    /** 临时会话数据变更时 +1，用于让 plan 缓存失效 */
+    public static volatile long sTempRev = 0L;
+
+    public static void bumpTempRev() {
+        sTempRev++;
+    }
+
     private static java.util.List<int[]> insertPlan(Object adapter) {
+        try {
+            int hostSize = currentListSize(adapter);
+            long sig = tempSig();
+            java.util.List<int[]> cached = sPlanCache;
+            if (cached != null
+                    && sPlanCacheAdapter == adapter
+                    && sPlanCacheHostSize == hostSize
+                    && sPlanCacheTempSig == sig) {
+                return cached;   /* 命中缓存：O(1) */
+            }
+            java.util.List<int[]> fresh = buildInsertPlan(adapter);
+            sPlanCacheAdapter = adapter;
+            sPlanCacheHostSize = hostSize;
+            sPlanCacheTempSig = sig;
+            sPlanCache = fresh;
+            return fresh;
+        } catch (Throwable ignored) {
+        }
+        return buildInsertPlan(adapter);
+    }
+
+    /** 让 plan 缓存失效（列表/临时会话变化时调用） */
+    public static void invalidatePlanCache() {
+        sPlanCacheAdapter = null;
+        sPlanCacheHostSize = -1;
+        sPlanCacheTempSig = -1L;
+        sPlanCache = null;
+        sTempRev++;
+    }
+
+    private static java.util.List<int[]> buildInsertPlan(Object adapter) {
         java.util.List<int[]> plan = new java.util.ArrayList<int[]>();
         try {
             java.util.List<Object[]> snap = com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
             if (snap == null || snap.isEmpty()) {
                 return plan;
             }
-            long[] hostTimes = hostItemTimes(adapter);
+            /* 单次遍历同时拿到 times + uids（原来分两次遍历） */
+            HostScan scan = hostScan(adapter);
+            long[] hostTimes = scan.times;
             int hostCount = hostTimes.length;
             /*
              * 关键去重：宿主自己已经有这张会话卡时，不再插临时卡。
              * 覆盖"加好友后"（变成正常好友会话）与"从临时会话转入主列表"两类重复。
              */
-            java.util.Set<String> hostUids = hostPeerUids(adapter);
+            java.util.Set<String> hostUids = scan.uids;
             int limit = Math.min(50, snap.size());
             int skipped = 0;
             for (int i = 0; i < limit; i++) {
@@ -254,21 +318,22 @@ public class ChatCardInjector {
     }
 
     /** 宿主当前列表每条会话的 lastMsgTime（秒->毫秒归一化） */
-    /**
-     * 收集宿主当前会话列表里所有 peerUid。
-     *
-     * 这是判断"宿主是否已经自己渲染了这张卡"的最可靠依据 ——
-     * 比 isFriend() 可靠：后者被模块 hook 放行（恒 true），
-     * 也比 getBuddies() 可靠：本 ROM 上 getBuddyListV2 返回空（好友 0 个）。
-     */
-    private static java.util.Set<String> hostPeerUids(Object adapter) {
-        java.util.HashSet<String> out = new java.util.HashSet<>();
+    /** 宿主列表的一次性扫描结果（times + uids 合并，避免遍历两遍） */
+    static final class HostScan {
+        long[] times = new long[0];
+        java.util.Set<String> uids = new java.util.HashSet<>();
+    }
+
+    /** 单次遍历同时取 msgTime 与 peerUid/peerUin（原来要遍历两次） */
+    private static HostScan hostScan(Object adapter) {
+        HostScan out = new HostScan();
         try {
             Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
             if (!(cur instanceof List)) {
                 return out;
             }
             List list = (List) cur;
+            java.util.ArrayList<Long> times = new java.util.ArrayList<Long>(list.size());
             for (int i = 0; i < list.size(); i++) {
                 Object it = list.get(i);
                 if (it == null) continue;
@@ -276,23 +341,29 @@ public class ChatCardInjector {
                 if (!cn.endsWith("RecentContactChatItem")) continue;
                 try {
                     Object info = XposedHelpers.getObjectField(it, "a");
+                    /* msgTime */
+                    long t = com.tencent.qqlitepro.http.QqKernel.longOf(
+                            XposedHelpers.getObjectField(info, "msgTime"));
+                    if (t > 0 && t < 100000000000L) t *= 1000L;
+                    times.add(Long.valueOf(t));
+                    /* peerUid */
                     Object uid = XposedHelpers.getObjectField(info, "peerUid");
                     if (uid != null) {
                         String u = String.valueOf(uid).trim();
-                        if (!u.isEmpty()) {
-                            out.add(u);
-                        }
+                        if (!u.isEmpty()) out.uids.add(u);
                     }
-                    /* 同时收 uin，兼容 peerUid 为数字的情形 */
+                    /* peerUin（peerUid 可能已变数字） */
                     Object uin = XposedHelpers.getObjectField(info, "peerUin");
                     if (uin != null) {
                         String u = String.valueOf(uin).trim();
-                        if (!u.isEmpty() && !"0".equals(u)) {
-                            out.add(u);
-                        }
+                        if (!u.isEmpty() && !"0".equals(u)) out.uids.add(u);
                     }
                 } catch (Throwable ignored) {
                 }
+            }
+            out.times = new long[times.size()];
+            for (int i = 0; i < out.times.length; i++) {
+                out.times[i] = times.get(i).longValue();
             }
         } catch (Throwable ignored) {
         }
@@ -300,39 +371,6 @@ public class ChatCardInjector {
     }
 
     private static volatile long sLastSkipLog = 0L;
-
-    private static long[] hostItemTimes(Object adapter) {
-        try {
-            Object cur = XposedHelpers.callMethod(adapter, "getCurrentList", new Object[0]);
-            if (!(cur instanceof List)) {
-                return new long[0];
-            }
-            List list = (List) cur;
-            java.util.ArrayList<Long> times = new java.util.ArrayList<Long>();
-            for (int i = 0; i < list.size(); i++) {
-                Object it = list.get(i);
-                if (it == null) continue;
-                String cn = it.getClass().getName();
-                /* 只统计真实会话卡（跳过 BannerHeaderItem 等头部项） */
-                if (!cn.endsWith("RecentContactChatItem")) continue;
-                long t = 0;
-                try {
-                    Object info = XposedHelpers.getObjectField(it, "a");
-                    t = com.tencent.qqlitepro.http.QqKernel.longOf(
-                            XposedHelpers.getObjectField(info, "msgTime"));
-                    if (t > 0 && t < 100000000000L) t *= 1000L;
-                } catch (Throwable ignored) {}
-                times.add(Long.valueOf(t));
-            }
-            long[] out = new long[times.size()];
-            for (int i = 0; i < out.length; i++) {
-                out[i] = times.get(i).longValue();
-            }
-            return out;
-        } catch (Throwable ignored) {
-            return new long[0];
-        }
-    }
 
     /**
      * 统一位置解析：显示位置 pos 属于哪一段。
@@ -351,7 +389,7 @@ public class ChatCardInjector {
     private static int[] resolvePos(Object adapter, int pos) {
         try {
             java.util.List<int[]> plan = insertPlan(adapter);
-            int hostCount = hostItemTimes(adapter).length;
+            int hostCount = hostScan(adapter).times.length;
             int n = plan.size();
             int mp = cardSlot(adapter);
             int cursor = 0;
@@ -419,7 +457,7 @@ public class ChatCardInjector {
             int cursor = (mp >= 0) ? 1 : 0;        /* 无邮箱卡时从 0 开始 */
             int planIdx = 0;
             int hostIdx = 0;
-            int hostCount = hostItemTimes(adapter).length;
+            int hostCount = hostScan(adapter).times.length;
             while (true) {
                 boolean mailSlot = (mp >= 0 && mp == cursor);
                 if (mailSlot) {
