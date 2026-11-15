@@ -251,37 +251,35 @@ public final class FeedbackPage {
             contactCard.addView(etContact, lp());
             body.addView(contactCard, top(ctx, 10));
 
-            /* ---- 崩溃日志：仅「功能异常」显示，单选，默认最近的 ---- */
+            /* ---- 崩溃日志：仅「功能异常」显示；列出可上报的异常条目 ---- */
             final LinearLayout logCard = card(ctx);
             logCard.addView(label(ctx, "崩溃日志（仅功能异常可附）"), lp());
-            final java.util.List<java.io.File> crashFiles = CrashLog.listFiles();
-            final int[] selLog = {0};   /* 选中的日志下标；始终单选 */
-            final TextView[] logRows = new TextView[0];
+
+            /* 从 crash.log 解析异常条目（完全相同问题已去重） */
+            final java.util.List<CrashLog.Entry> entries = CrashLog.readEntries();
+            final int[] selEntry = {0};
             final java.util.List<TextView> rowList = new java.util.ArrayList<>();
 
-            if (crashFiles == null || crashFiles.isEmpty()) {
+            if (entries.isEmpty()) {
                 TextView none = new TextView(ctx);
-                none.setText("（未检测到崩溃日志）");
+                none.setText("（未检测到可上报的异常）");
                 none.setTextSize(12.5f);
                 none.setTextColor(COLOR_HINT);
                 none.setPadding(dp(ctx, 8), dp(ctx, 6), 0, dp(ctx, 6));
                 logCard.addView(none, lp());
             } else {
-                for (int i = 0; i < crashFiles.size(); i++) {
+                for (int i = 0; i < entries.size(); i++) {
                     final int idx = i;
-                    java.io.File f = crashFiles.get(i);
+                    CrashLog.Entry en = entries.get(i);
                     TextView row = new TextView(ctx);
-                    row.setTextSize(12.5f);
+                    row.setTextSize(12f);
                     row.setPadding(dp(ctx, 10), dp(ctx, 8), dp(ctx, 10), dp(ctx, 8));
-                    row.setTag("qqmax_log_row_" + i);
                     row.setOnClickListener(new android.view.View.OnClickListener() {
                         @Override
                         public void onClick(android.view.View v) {
-                            selLog[0] = idx;
+                            selEntry[0] = idx;
                             for (int k = 0; k < rowList.size(); k++) {
-                                styleLogRow(ctx, rowList.get(k),
-                                        String.valueOf(crashFiles.get(k).getName()),
-                                        crashFiles.get(k).length(), k == idx);
+                                styleLogRow(ctx, rowList.get(k), entries.get(k), k == idx);
                             }
                         }
                     });
@@ -292,12 +290,10 @@ public final class FeedbackPage {
                     }
                     logCard.addView(row, rlp);
                 }
-                /* 默认勾选最近的（listFiles 已按时间倒序） */
-                selLog[0] = 0;
+                /* 默认选中第一条 */
+                selEntry[0] = 0;
                 for (int k = 0; k < rowList.size(); k++) {
-                    styleLogRow(ctx, rowList.get(k),
-                            String.valueOf(crashFiles.get(k).getName()),
-                            crashFiles.get(k).length(), k == 0);
+                    styleLogRow(ctx, rowList.get(k), entries.get(k), k == 0);
                 }
             }
             body.addView(logCard, top(ctx, 10));
@@ -480,10 +476,10 @@ public final class FeedbackPage {
                     final String content = etContent.getText().toString().trim();
                     final String contact = etContact.getText().toString().trim();
                     final String type = selValue[0];
-                    /* 仅「功能异常」且已选日志时才带文件 */
+                    /* 仅「功能异常」且已选中某条异常时才带文件 */
                     final boolean wantLog = "bug".equals(type)
-                            && crashFiles != null && !crashFiles.isEmpty()
-                            && selLog[0] >= 0 && selLog[0] < crashFiles.size();
+                            && !entries.isEmpty()
+                            && selEntry[0] >= 0 && selEntry[0] < entries.size();
 
                     if (type == null || type.isEmpty()) {
                         resultTv.setTextColor(-1739917);
@@ -521,16 +517,19 @@ public final class FeedbackPage {
                         public void run() {
                             final byte[][] logBytesRef = {null};
                             final String[] logNameRef = {null};
+                            final java.io.File[] tmpFileRef = {null};
                             if (wantLog) {
-                                final java.io.File pick =
-                                        crashFiles.get(selLog[0]);
-                                java.util.ArrayList<java.io.File> one =
-                                        new java.util.ArrayList<>();
-                                one.add(pick);
-                                logBytesRef[0] = readLogBytes(one);
+                                /*
+                                 * 只把"选中那条异常"写进临时日志文件（带 13 位毫秒时间戳），
+                                 * 不再上传整个 crash.log —— 体积小、隐私少、定位准。
+                                 */
+                                CrashLog.Entry pickEntry = entries.get(selEntry[0]);
+                                java.io.File tmp = CrashLog.writeTempEntryFile(pickEntry);
+                                tmpFileRef[0] = tmp;
+                                logBytesRef[0] = readLogBytes(tmp);
                                 if (logBytesRef[0] != null) {
-                                    /* 上传用文件原名（如 crash_20261114_132410.log） */
-                                    logNameRef[0] = pick.getName();
+                                    /* 上传用临时文件名（qqmax_<13位>.txt） */
+                                    logNameRef[0] = tmp.getName();
                                     /*
                                      * 防重复提交：按内容指纹（sha256）识别同一份日志，
                                      * 与文件名无关 —— 改名后也认得，杜绝刷上传。
@@ -630,15 +629,20 @@ public final class FeedbackPage {
                                                 resultTv.setText("反馈已提交，编号 "
                                                         + (r.id == null ? "-" : r.id));
                                                 etContent.setText("");
-                                                /* 重置为默认选中最近一个 */
-                                                selLog[0] = 0;
+                                                /* 上传成功后清除临时文件 */
+                                                CrashLog.deleteTempFile(tmpFileRef[0]);
+                                                tmpFileRef[0] = null;
+                                                /* 重置为默认选中第一条 */
+                                                selEntry[0] = 0;
                                                 for (int k = 0; k < rowList.size(); k++) {
                                                     styleLogRow(ctx, rowList.get(k),
-                                                            String.valueOf(crashFiles.get(k).getName()),
-                                                            crashFiles.get(k).length(), k == 0);
+                                                            entries.get(k), k == 0);
                                                 }
                                                 toast(ctx, "反馈已提交，感谢反馈");
                                             } else {
+                                                /* 失败也清掉临时文件，避免残留堆积 */
+                                                CrashLog.deleteTempFile(tmpFileRef[0]);
+                                                tmpFileRef[0] = null;
                                                 resultTv.setTextColor(-1739917);
                                                 resultTv.setText(r.error == null
                                                         ? "提交失败" : r.error);
@@ -661,6 +665,15 @@ public final class FeedbackPage {
     /* ===================== 工具 ===================== */
 
     /** 读取崩溃日志为 UTF-8 纯文本字节（服务端要求） */
+    private static byte[] readLogBytes(java.io.File f) {
+        if (f == null) {
+            return null;
+        }
+        java.util.ArrayList<java.io.File> one = new java.util.ArrayList<>();
+        one.add(f);
+        return readLogBytes(one);
+    }
+
     private static byte[] readLogBytes(java.util.List<java.io.File> files) {
         try {
             if (files == null || files.isEmpty()) {
@@ -713,6 +726,31 @@ public final class FeedbackPage {
 
     /** 最近一次验证图显示时刻（用于计算 captchaMs） */
 
+
+    /** 渲染单条异常条目行：选中=蓝框+蓝字 */
+    private static void styleLogRow(Context ctx, TextView row,
+                                    CrashLog.Entry e, boolean selected) {
+        try {
+            GradientDrawable bg = new GradientDrawable();
+            bg.setColor(selected ? -15000558 : -14935012);
+            bg.setCornerRadius(dp(ctx, 8));
+            if (selected) {
+                bg.setStroke(dp(ctx, 1.2f), COLOR_ACCENT);
+            }
+            row.setBackground(bg);
+            row.setTextColor(selected ? COLOR_ACCENT : COLOR_TITLE);
+            String kind = e == null || e.kind == null ? "" : e.kind;
+            String title = e == null || e.title == null ? "" : e.title;
+            String time = e == null || e.time == null ? "" : e.time;
+            /* 展示：[类型] 异常标题（换行显示时间） */
+            String head = (selected ? "● " : "○ ") + "[" + kind + "] " + title;
+            row.setText(time.isEmpty() ? head : (head + "\n" + time));
+            row.setSingleLine(false);
+            row.setMaxLines(3);
+            row.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        } catch (Throwable ignored) {
+        }
+    }
 
     /** 渲染单条日志行：选中=蓝框+蓝字，未选=灰底 */
     private static void styleLogRow(Context ctx, TextView row, String name,
