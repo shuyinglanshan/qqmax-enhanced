@@ -4160,10 +4160,35 @@ public class ChatCardInjector {
                 if (snap == null || tIdx >= snap.size()) {
                     return;
                 }
-                /* 占位：返回"宿主真实列表首项"（一定合法），实际渲染由 onBindViewHolder 覆盖 */
+                /*
+                 * 关键修复（进入会话后未读数仍显示 / 卡片重复的根因）：
+                 *
+                 * 旧实现返回"宿主真实列表第 0 项"当作占位：
+                 *   param.setResult(((List) cur).get(0));
+                 * 那是一个 **真实的、可能带未读的会话 item**。
+                 * RecyclerView 会用它当作本位置的稳定标识，
+                 * 于是 temp 卡位置上残留了那条会话的未读数；
+                 * 同一 item 被多个位置引用，还会造成卡片重复/未读不清除。
+                 *
+                 * 现在改为返回**为这张临时卡专门构建的 item**
+                 * （未读数取自 tempChatUnread，可独立清零）。
+                 */
+                String uid = (String) snap.get(tIdx)[0];
+                Object tempItem = com.tencent.qqlitepro.http.QqKernel.tempChatItemFor(uid);
+                if (tempItem != null) {
+                    param.setResult(tempItem);
+                    return;
+                }
+                /* 极端兜底：拿不到模板时，返回首项的**克隆副本**，
+                 * 至少不把真实 item 直接暴露出去。 */
                 Object cur = XposedHelpers.callMethod(param.thisObject, "getCurrentList", new Object[0]);
                 if (cur instanceof List && !((List) cur).isEmpty()) {
-                    param.setResult(((List) cur).get(0));
+                    Object first = ((List) cur).get(0);
+                    Object copy = com.tencent.qqlitepro.http.QqKernel
+                            .cloneRecentContactInfo(first);
+                    if (copy != null) {
+                        param.setResult(copy);
+                    }
                 }
             } catch (Throwable ignored) {}
         }
