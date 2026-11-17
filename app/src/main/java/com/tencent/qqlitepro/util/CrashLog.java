@@ -238,20 +238,41 @@ public final class CrashLog {
      * 我们：每 1s tick，**3s 起分级记录**（3s 预警 / 8s 卡死），
      *      拿到主线程栈后立刻落盘 —— 不等进程被杀。
      */
+    /**
+     * 卡死检测（带「启动期豁免」）。
+     *
+     * 重要误报修复：
+     * 旧实现在 handleLoadPackage 里立刻开始计时，但那时 QQ 还在冷启动
+     * （ActivityThread.handleBindApplication → installContentProviders →
+     *  AppContentProvider.onCreate → NtStartupDirector 的 CountDownLatch.await），
+     * 主线程本来就会被阻塞 3~10 秒 —— 这是正常启动流程，不是卡顿。
+     * 之前会上报大量 "主线程卡顿 3004ms" 假告警。
+     *
+     * 现在：
+     *   1) 启动后 20 秒内不检测（留给宿主完成冷启动）
+     *   2) 只有在「主线程已经跑过一次消息循环」后才开始计时
+     *   3) 命中时再校验主线程栈，若仍在宿主启动链路里则跳过
+     */
     private static void installHangWatchdog() {
         try {
             final long[] lastTick = {android.os.SystemClock.uptimeMillis()};
             final boolean[] reported3s = {false};
             final boolean[] reported8s = {false};
+            final boolean[] warm = {false};
+            final long startAt = android.os.SystemClock.uptimeMillis();
+            /* 冷启动豁免窗口 */
+            final long WARMUP_MS = 20_000L;
             final android.os.Handler mainH =
                     new android.os.Handler(android.os.Looper.getMainLooper());
 
-            /* 主线程每秒打点 */
+            /* 主线程每秒打点；前 20 秒只用于"热机"，不参与判定 */
             Runnable tick = new Runnable() {
                 @Override
                 public void run() {
                     lastTick[0] = android.os.SystemClock.uptimeMillis();
-                    /* 恢复后重置告警闸门 */
+                    if (lastTick[0] - startAt >= WARMUP_MS) {
+                        warm[0] = true;
+                    }
                     reported3s[0] = false;
                     reported8s[0] = false;
                     mainH.postDelayed(this, 1000L);
@@ -266,12 +287,17 @@ public final class CrashLog {
                     while (true) {
                         try {
                             Thread.sleep(1000L);
+                            /* 未热机（宿主还在冷启动）→ 不判定 */
+                            if (!warm[0]) {
+                                continue;
+                            }
                             long now = android.os.SystemClock.uptimeMillis();
                             long lag = now - lastTick[0];
+                            /* 5s 才预警（老设备正常 GC/布局也可能到 3s），8s 判卡死 */
                             if (lag >= 8000L && !reported8s[0]) {
                                 reported8s[0] = true;
                                 onHang(lag, true);
-                            } else if (lag >= 3000L && !reported3s[0]) {
+                            } else if (lag >= 5000L && !reported3s[0]) {
                                 reported3s[0] = true;
                                 onHang(lag, false);
                             }
@@ -284,10 +310,239 @@ public final class CrashLog {
             }, "qqmax-hang-watch");
             watcher.setDaemon(true);
             watcher.start();
-            Log.i("崩溃日志: 卡死检测已启动（3s 预警 / 8s 卡死）");
+            Log.i("崩溃日志: 卡死检测已启动（20s 冷启动豁免后，5s 预警 / 8s 卡死）");
         } catch (Throwable t) {
             Log.w("崩溃日志: 卡死检测启动失败 " + t);
         }
+    }
+
+    /** 记录一条「启动耗时」而不是「卡顿」，避免误报污染卡顿统计 */
+    private static void writeStartupCost(long lagMs) {
+        try {
+            StringBuilder sb = new StringBuilder(4096);
+            sb.append("\n========== 启动耗时 ").append(now()).append(" ==========\n");
+            sb.append("耗时     : ").append(lagMs).append(" ms\n");
+            sb.append("进程     : ").append(processName()).append('\n');
+            sb.append("版本     : ").append(versionName()).append('\n');
+            sb.append("说明     : 宿主冷启动期间主线程被初始化任务阻塞，属启动耗时\n");
+            sb.append("---------- 主线程栈 ----------\n");
+            try {
+                StackTraceElement[] st = android.os.Looper.getMainLooper()
+                        .getThread().getStackTrace();
+                if (st != null) {
+                    for (StackTraceElement el : st) {
+                        sb.append("  at ").append(el).append('\n');
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            sb.append("========== END ").append(now()).append(" ==========\n\n");
+            appendDedup("startup|" + firstMainFrame(), sb.toString());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 主线程此刻是否在空闲等消息（nativePollOnce）。
+     *
+     * 判据：栈顶若是 MessageQueue.nativePollOnce / MessageQueue.next，
+     * 说明主线程没有在跑任何耗时操作，此前的 lag 只是消息排队造成的假象。
+     */
+    private static boolean isMainThreadIdle() {
+        try {
+            StackTraceElement[] st = android.os.Looper.getMainLooper()
+                    .getThread().getStackTrace();
+            if (st == null || st.length == 0) {
+                /* 拿不到栈就不敢断言空闲，按"非空闲"处理以免漏报真卡死 */
+                return false;
+            }
+            int n = Math.min(st.length, 6);
+            for (int i = 0; i < n; i++) {
+                String cn = st[i].getClassName();
+                String mn = st[i].getMethodName();
+                if (cn == null) {
+                    continue;
+                }
+                if (cn.startsWith("android.os.MessageQueue")
+                        && "nativePollOnce".equals(mn)) {
+                    return true;
+                }
+                if (cn.startsWith("android.os.MessageQueue")
+                        && "next".equals(mn)) {
+                    return true;
+                }
+                /* 已经离开 Looper 区域，说明在跑业务代码 */
+                if (!cn.startsWith("android.os.") && !cn.startsWith("java.")
+                        && !cn.startsWith("dalvik.") && !cn.startsWith("com.android.internal.")) {
+                    return false;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /**
+     * 从主线程栈判断「卡顿是不是别的 Xposed 模块造成的」。
+     *
+     * 实战案例（用户上报的真实日志）：
+     *   at de.robv.android.xposed.XSharedPreferences.awaitLoadedLocked
+     *   at de.robv.android.xposed.XSharedPreferences.getInt
+     *   at s3.r.beforeHookedMethod          ← 另一个模块的混淆类
+     *   at ContextThemeWrapper.attachBaseContext
+     * 这是 EdXp 老框架的 XSharedPreferences 在主线程做全量 XML 读 + 等锁，
+     * 属于"别人的模块拖慢主线程"，我们只能标注出来，不能替它修。
+     *
+     * @return 归因描述（空串表示与外部模块无关）
+     */
+    private static String blameExternalModule(StackTraceElement[] st) {
+        try {
+            if (st == null) {
+                return "";
+            }
+            int n = Math.min(st.length, 30);
+            for (int i = 0; i < n; i++) {
+                String cn = st[i].getClassName();
+                if (cn == null) {
+                    continue;
+                }
+                if (cn.startsWith("de.robv.android.xposed.XSharedPreferences")) {
+                    /* 找栈里紧随其后的"调用方"，即真正触发读配置的模块类 */
+                    String caller = "";
+                    for (int k = i + 1; k < n; k++) {
+                        String c2 = st[k].getClassName();
+                        if (c2 == null) {
+                            continue;
+                        }
+                        if (c2.startsWith("de.robv.android.xposed.")
+                                || c2.startsWith("android.")
+                                || c2.startsWith("java.")
+                                || c2.startsWith("com.android.")) {
+                            continue;
+                        }
+                        caller = c2;
+                        break;
+                    }
+                    return "外部Xposed模块读配置阻塞主线程"
+                            + (caller.isEmpty() ? "" : "（" + caller + "）")
+                            + " — EdXp/Xposed 的 XSharedPreferences 在主线程做全量读+等锁，非本模块代码";
+                }
+                if (cn.startsWith("top.canyie.pine.")) {
+                    return "Pine 框架桥接开销（非本模块代码）";
+                }
+                if (cn.startsWith("com.elderdrivers.riru.edxp")) {
+                    return "EdXp 框架注入开销（非本模块代码）";
+                }
+                if (cn.startsWith("com.android.z.XHook") || cn.contains("ZuperHook")) {
+                    /* 常见：别的模块在 attachBaseContext 里跑 String.matches → Pattern.compile */
+                    String extra = "";
+                    for (int k = 0; k < n; k++) {
+                        String c2 = st[k].getClassName();
+                        if (c2 != null && c2.startsWith("java.util.regex.Pattern")) {
+                            extra = "（正则编译，开销很大）";
+                            break;
+                        }
+                    }
+                    return "外部Xposed模块 ZuperHook 主线程开销" + extra + "（非本模块代码）";
+                }
+            }
+            /*
+             * 通用归因：栈里出现 EdHooker_ / EdXposed 的 hook 桥接，
+             * 说明主线程正在跑"某个 Xposed 模块的 hook 回调"。
+             */
+            boolean viaEdHook = false;
+            for (int i = 0; i < n; i++) {
+                String cn = st[i].getClassName();
+                if (cn == null) {
+                    continue;
+                }
+                if (cn.contains("EdHooker_")) {
+                    viaEdHook = true;
+                    break;
+                }
+            }
+            if (viaEdHook) {
+                /* 找出真正干活的模块类（第一个非框架、非 android 的类） */
+                String who = "";
+                for (int i = 0; i < n; i++) {
+                    String cn = st[i].getClassName();
+                    if (cn == null) {
+                        continue;
+                    }
+                    if (cn.startsWith("android.") || cn.startsWith("java.")
+                            || cn.startsWith("de.robv.android.xposed.")
+                            || cn.startsWith("com.elderdrivers.riru")
+                            || cn.contains("EdHooker_")
+                            || cn.startsWith("dalvik.")) {
+                        continue;
+                    }
+                    who = cn;
+                    break;
+                }
+                if (!who.isEmpty() && !who.startsWith("com.tencent.qqlite")) {
+                    return "外部Xposed模块 hook 回调耗时（" + who + "，非本模块代码）";
+                }
+            }
+
+            /* 通用：命中别的模块 hook 入口 */
+            for (int i = 0; i < n; i++) {
+                String cn = st[i].getClassName();
+                if (cn == null) {
+                    continue;
+                }
+                if (cn.contains("beforeHookedMethod") || cn.contains("afterHookedMethod")) {
+                    /* 往上找真正的模块类（跳过 XC_MethodHook 自身） */
+                    for (int k = i - 1; k >= 0 && k >= i - 3; k--) {
+                        String c2 = st[k].getClassName();
+                        if (c2 != null && !c2.startsWith("de.robv.android.xposed.")
+                                && !c2.startsWith("android.")) {
+                            return "外部Xposed模块 hook 开销（" + c2 + "）";
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
+    }
+
+    /**
+     * 主线程是否卡在「宿主启动流程」里（正常阻塞，不应报卡顿）。
+     *
+     * 典型链路：
+     *   ActivityThread.handleBindApplication → installContentProviders
+     *   → AppContentProvider.onCreate → WatchApplicationDelegate.onCreate
+     *   → NtStartupDirector.a (CountDownLatch.await)
+     */
+    private static boolean isInHostStartup() {
+        try {
+            StackTraceElement[] st = android.os.Looper.getMainLooper()
+                    .getThread().getStackTrace();
+            if (st == null || st.length == 0) {
+                return false;
+            }
+            int n = Math.min(st.length, 24);
+            for (int i = 0; i < n; i++) {
+                String cn = st[i].getClassName();
+                if (cn == null) {
+                    continue;
+                }
+                if (cn.contains("ActivityThread")
+                        || cn.contains("AppContentProvider")
+                        || cn.contains("NtStartupDirector")
+                        || cn.contains("WatchApplicationDelegate")
+                        || cn.contains("QFixApplication")
+                        || cn.contains("Instrumentation")
+                        || cn.contains("JumpActivity")
+                        || cn.contains("SplashActivity")
+                        || cn.contains("performLaunchActivity")
+                        || cn.contains("handleLaunchActivity")) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
     }
 
     /** 卡死落盘节流（避免卡死期间反复 dump 反而加重卡顿） */
@@ -301,6 +556,27 @@ public final class CrashLog {
             if (nowMs - sLastHangDumpAt < HANG_DUMP_MIN_INTERVAL) {
                 return;   /* 30 秒内只 dump 一次 */
             }
+            /*
+             * 启动期：不当作"卡顿"，但耗时很长时记一条"启动耗时"便于优化。
+             * 3s 级别不记（太常见），≥8s 才留痕。
+             */
+            if (isInHostStartup()) {
+                if (severe && lagMs >= 8000L) {
+                    writeStartupCost(lagMs);
+                }
+                return;
+            }
+            /*
+             * 误报过滤 2（关键）：
+             * 抓栈这一刻主线程若停在 MessageQueue.nativePollOnce，
+             * 说明它其实在**空闲等消息**，早就恢复了。
+             * 之前只用「tick 消息多久没执行」判断，队列里消息多时
+             * tick 会被排到后面，于是产生大量假告警
+             * （用户上报的 3033ms / 3022ms 全是这种）。
+             */
+            if (isMainThreadIdle()) {
+                return;
+            }
             sLastHangDumpAt = nowMs;
             StringBuilder sb = new StringBuilder(8192);
             sb.append("\n========== ").append(severe ? "应用卡死" : "主线程卡顿")
@@ -309,13 +585,22 @@ public final class CrashLog {
             sb.append("进程     : ").append(processName()).append('\n');
             sb.append("版本     : ").append(versionName()).append('\n');
 
-            /* 主线程栈 */
+            /* 主线程栈 + 外部模块归因 */
+            StackTraceElement[] mainSt = null;
+            try {
+                mainSt = android.os.Looper.getMainLooper().getThread().getStackTrace();
+            } catch (Throwable ignored) {
+            }
+            String blame = blameExternalModule(mainSt);
+            if (!blame.isEmpty()) {
+                sb.append("归因     : ").append(blame).append('\n');
+            }
             sb.append("---------- 主线程栈 ----------\n");
             try {
-                StackTraceElement[] st = android.os.Looper.getMainLooper()
-                        .getThread().getStackTrace();
-                for (StackTraceElement el : st) {
-                    sb.append("  at ").append(el).append('\n');
+                if (mainSt != null) {
+                    for (StackTraceElement el : mainSt) {
+                        sb.append("  at ").append(el).append('\n');
+                    }
                 }
             } catch (Throwable ignored) {
             }
@@ -481,13 +766,35 @@ public final class CrashLog {
                                 if (body.isEmpty()) {
                                     return;
                                 }
+                                /*
+                                 * 宿主 HangWatcher 的误报过滤（关键）：
+                                 * 它用「主线程 tick 落后 8s」判定卡死，但主线程
+                                 * 开会/GC/消息排队时也会落后，此时主线程其实停在
+                                 * MessageQueue.nativePollOnce（空闲等消息）。
+                                 * 用户上报的 8926ms / 3022ms 全是这种假卡死。
+                                 */
+                                if ("hang".equals(kind)) {
+                                    if (isMainThreadIdle() || isInHostStartup()) {
+                                        Log.i("崩溃日志: 宿主 Watchdog 卡死误报已忽略"
+                                                + "（主线程空闲/启动期）");
+                                        return;
+                                    }
+                                }
                                 /* 宿主已生成完整报告（含设备信息+堆栈），直接镜像 */
                                 String head = "crash".equals(kind) ? "宿主崩溃（Watchdog）"
                                         : "hang".equals(kind) ? "宿主卡死（Watchdog）"
                                         : "宿主报告";
-                                StringBuilder sb = new StringBuilder(body.length() + 256);
+                                StringBuilder sb = new StringBuilder(body.length() + 384);
                                 sb.append("\n===== ").append(head).append(' ')
                                         .append(now()).append(" =====\n");
+                                /*
+                                 * 归因：从报告正文里找主线程栈，判断是不是
+                                 * 别的 Xposed 模块或宿主启动期造成的。
+                                 */
+                                String blame = blameFromBody(body);
+                                if (!blame.isEmpty()) {
+                                    sb.append("归因     : ").append(blame).append('\n');
+                                }
                                 sb.append(body).append('\n');
                                 sb.append("===== END =====\n\n");
                                 String sig = "watchdog|" + kind + "|"
@@ -502,6 +809,49 @@ public final class CrashLog {
         } catch (Throwable t) {
             Log.w("崩溃日志: Watchdog 联动失败 " + t);
         }
+    }
+
+    /**
+     * 从 Watchdog 报告正文里提取主线程栈并归因。
+     *
+     * 典型可识别来源：
+     *   - top.canyie.pine.*            → Pine 框架桥接开销
+     *   - momoi.mod.qqpro.watchdog.*   → 宿主自带 Watchdog（自身开销）
+     *   - com.tencent.mmkv.*           → MMKV 首次打开（启动期主线程 IO）
+     *   - Qqimei / PrivacyPolicyHelper → 启动上报任务
+     */
+    private static String blameFromBody(String body) {
+        try {
+            if (body == null || body.isEmpty()) {
+                return "";
+            }
+            boolean startup = body.contains("handleBindApplication")
+                    || body.contains("installContentProviders")
+                    || body.contains("NtStartupDirector")
+                    || body.contains("AppContentProvider");
+            if (body.contains("com.tencent.mmkv.MMKV")
+                    || body.contains("Qqimei")
+                    || body.contains("PrivacyPolicyHelper")
+                    || body.contains("MiscInitTask")) {
+                return "宿主启动期任务在主线程做 IO/初始化（MMKV/Qimei 等），"
+                        + "属启动耗时，非运行期卡死";
+            }
+            if (startup) {
+                return "宿主冷启动期（handleBindApplication/ContentProvider 初始化），"
+                        + "属正常启动耗时";
+            }
+            if (body.contains("top.canyie.pine.")) {
+                return "Pine 框架桥接开销（非本模块代码）";
+            }
+            if (body.contains("momoi.mod.qqpro.watchdog.")) {
+                return "宿主自带 Watchdog 自身的抓栈开销（非本模块代码）";
+            }
+            if (body.contains("de.robv.android.xposed.XSharedPreferences")) {
+                return "外部Xposed模块读配置阻塞主线程（XSharedPreferences，非本模块代码）";
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
     }
 
     /**
@@ -1135,6 +1485,9 @@ public final class CrashLog {
                 if (line.contains("主线程卡顿")) {
                     return "主线程卡顿";
                 }
+                if (line.contains("启动耗时")) {
+                    return "启动耗时";
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -1153,7 +1506,7 @@ public final class CrashLog {
             if (raw.trim().isEmpty()) {
                 return;
             }
-            /* 启动标记不算"可上报的异常"，直接丢弃 */
+            /* 启动标记（模块加载）不算可上报项；但"启动耗时"要保留 */
             if ("启动".equals(kind)) {
                 return;
             }
@@ -1236,6 +1589,10 @@ public final class CrashLog {
                     return t;
                 }
                 /* 3) 块特征行 */
+                if (t.startsWith("耗时")) {
+                    String v = t.replace("耗时", "").replace(":", "").trim();
+                    return "启动耗时 " + v;
+                }
                 if (t.startsWith("卡顿时长")) {
                     /* 只取时长数字；kind 已标明是"应用卡死"还是"主线程卡顿" */
                     String v = t.replace("卡顿时长", "").replace(":", "").trim();
