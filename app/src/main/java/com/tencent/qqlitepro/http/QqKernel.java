@@ -7427,6 +7427,34 @@ public final class QqKernel {
         }
     }
 
+    /**
+     * 克隆一个 RecentContactInfo（新实例 + 字段复制），并把未读清零。
+     *
+     * 用途：当临时会话卡拿不到模板时，作为 getItem 的占位返回值。
+     * **绝不能直接返回宿主真实 item** —— 那会共享未读状态，
+     * 导致"进入会话后未读数仍显示"以及卡片重复。
+     */
+    public static java.lang.Object cloneRecentContactInfo(java.lang.Object src) {
+        try {
+            if (src == null) {
+                return null;
+            }
+            java.lang.Object dst = cls("com.tencent.qqnt.kernel.nativeinterface.RecentContactInfo")
+                    .newInstance();
+            copyFields(src, dst);
+            /* 未读清零，避免把真实会话的未读数带到临时卡上 */
+            for (String f : new String[]{"unreadCnt", "unreadFlag", "unreadNum"}) {
+                try {
+                    de.robv.android.xposed.XposedHelpers.setIntField(dst, f, 0);
+                } catch (Throwable ignored) {
+                }
+            }
+            return dst;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     /** 快照已实时读取 sTempChatKnown，这里保留入口以便未来加缓存 */
     public static void ensureTempChatSnapshotFresh() {
         /* no-op：tempChatSnapshot() 每次实时构建 */
@@ -7957,6 +7985,22 @@ public final class QqKernel {
             sTempChatReadAt.put(key, java.lang.Long.valueOf(java.lang.System.currentTimeMillis()));
         } else {
             sTempChatUnread.put(key, java.lang.Integer.valueOf(count));
+        }
+        /*
+         * 关键：未读数变了，快照/plan 缓存必须失效，
+         * 否则读到的还是旧未读（表现为"进入会话返回后小红点/数字还在"）。
+         */
+        sDataRev++;
+        sSnapCache = null;
+        try {
+            com.tencent.qqlitepro.hook.ChatCardInjector.invalidatePlanCache();
+        } catch (Throwable ignored) {
+        }
+        /* 该临时卡的 item 缓存也要作废（sig 里含 unread） */
+        try {
+            sTempItemCache.remove(key);
+            sTempItemSig.remove(key);
+        } catch (Throwable ignored) {
         }
         saveTempChatUnread();
         refreshTempChatList();
