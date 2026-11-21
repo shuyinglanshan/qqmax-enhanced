@@ -2155,6 +2155,121 @@ public class ChatCardInjector {
      * 逆向：WatchRecentContactHolder.b = ItemRecentContactBinding
      *   b.c -> 昵称  b.e -> 摘要  b.d -> 时间  b.f -> 置顶图标
      */
+    /** 记录"这个 View 绑的是哪个 uid"，避免位置漂移导致串台 */
+    private static final int TAG_TEMP_UID = 0x7f0e0005;
+
+    /**
+     * 从 holder 里尽力取出它当前绑定的 peerUid。
+     * 依次尝试多条路径，兼容不同宿主版本的 binding 结构。
+     */
+    private static String peekHolderUid(Object holder) {
+        if (holder == null) {
+            return null;
+        }
+        Object binding = null;
+        try {
+            binding = XposedHelpers.getObjectField(holder, "b");
+        } catch (Throwable ignored) {
+        }
+        if (binding == null) {
+            try {
+                binding = XposedHelpers.getObjectField(holder, "binding");
+            } catch (Throwable ignored) {
+            }
+        }
+        for (Object target : new Object[]{binding, holder}) {
+            if (target == null) {
+                continue;
+            }
+            /* 直接就是 info */
+            String u = tryUidField(target);
+            if (u != null) {
+                return u;
+            }
+            /* 常见容器字段：a / mInfo / info / data */
+            for (String f : new String[]{"a", "mInfo", "info", "data", "chatItem"}) {
+                try {
+                    Object inner = XposedHelpers.getObjectField(target, f);
+                    if (inner == null) {
+                        continue;
+                    }
+                    u = tryUidField(inner);
+                    if (u != null) {
+                        return u;
+                    }
+                    /* 再深一层（ChatItem -> info） */
+                    for (String f2 : new String[]{"a", "mInfo", "info"}) {
+                        try {
+                            Object inner2 = XposedHelpers.getObjectField(inner, f2);
+                            u = tryUidField(inner2);
+                            if (u != null) {
+                                return u;
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String tryUidField(Object o) {
+        if (o == null) {
+            return null;
+        }
+        try {
+            Object pu = XposedHelpers.getObjectField(o, "peerUid");
+            if (pu != null) {
+                String v = String.valueOf(pu).trim();
+                if (!v.isEmpty() && !"null".equals(v)) {
+                    return v;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** 按 uid 绑定（最可靠，不受列表顺序变化影响） */
+    public static void bindTempChatByUid(Object holder, String uid) {
+        if (uid == null || uid.isEmpty()) {
+            return;
+        }
+        /* 用 uid 反查当前序号；查不到就放弃（不要瞎绑别人的数据） */
+        int idx = -1;
+        try {
+            java.util.List<Object[]> list =
+                    com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
+            if (list != null) {
+                for (int i = 0; i < list.size(); i++) {
+                    Object[] one = list.get(i);
+                    if (one != null && uid.equals(String.valueOf(one[0]))) {
+                        idx = i;
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (idx < 0) {
+            return;
+        }
+        try {
+            View iv = null;
+            try {
+                iv = (View) XposedHelpers.getObjectField(holder, "itemView");
+            } catch (Throwable ignored) {
+            }
+            if (iv != null) {
+                iv.setTag(TAG_TEMP_UID, uid);
+            }
+        } catch (Throwable ignored) {
+        }
+        bindTempChatByHostBinding(holder, idx);
+    }
+
     public static void bindTempChatByHostBinding(Object holder, int idx) {
         try {
             java.util.List<Object[]> list = com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
@@ -2163,6 +2278,14 @@ public class ChatCardInjector {
             }
             Object[] item = list.get(idx);
             String uid = (String) item[0];
+            /* 把 uid 记到 itemView 上：RV 复用时能识别"这个 View 现在该绑谁" */
+            try {
+                View iv0 = (View) XposedHelpers.getObjectField(holder, "itemView");
+                if (iv0 != null) {
+                    iv0.setTag(TAG_TEMP_UID, uid);
+                }
+            } catch (Throwable ignored) {
+            }
             String nick = item[1] == null ? "" : String.valueOf(item[1]);
             nick = nick.replace("（临时会话）", "").replace("(临时会话)", "").trim();
             if (nick.isEmpty()) {
@@ -3953,7 +4076,72 @@ public class ChatCardInjector {
                 try {
                     View itemView = (View)XposedHelpers.getObjectField((Object)methodHookParam.args[0], (String)"itemView");
                     if (isTempCard) {
-                        ChatCardInjector.bindTempChatByHostBinding(methodHookParam.args[0], tempIdx);
+                        /*
+                         * 绑定顺序修复（会话卡片错乱/重复的根因）：
+                         * 旧实现只按「位置 tempIdx」取数据，而快照按 msgTime 排序，
+                         * 新消息进来顺序一变，同一个 pos 就指向了另一个人 ——
+                         * 表现为"不同会话显示同一名称/头像/预览"。
+                         *
+                         * 现在优先用 getItem 阶段写进 itemView 的 uid tag，
+                         * 按 uid 反查，彻底摆脱位置漂移。
+                         */
+                        String taggedUid = null;
+                        try {
+                            Object t = itemView == null ? null
+                                    : itemView.getTag(ChatCardInjector.TAG_TEMP_UID);
+                            if (t instanceof String && !((String) t).isEmpty()) {
+                                taggedUid = (String) t;
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        /*
+                         * 但 tag 可能是 RV 复用时残留的旧值，必须与"当前位置应有的 uid"
+                         * 比对：两者一致才用 tag，否则以位置为准并覆盖 tag。
+                         */
+                        /*
+                         * 时序解耦（错乱/重复的根本修复）：
+                         * 优先从"这个 holder 实际绑定的 item 对象"读 peerUid ——
+                         * 它就是 getItem 阶段固化下来的 uid，
+                         * 与快照后续按 msgTime 重排完全无关。
+                         * 只有拿不到时才退回按位置取（退化路径）。
+                         */
+                        String posUid = ChatCardInjector.peekHolderUid(
+                                methodHookParam.args[0]);
+                        /*
+                         * 校验：peek 到的 uid 必须是"临时会话表里存在的"。
+                         * 否则说明读到的是宿主真实会话数据（不该绑临时卡），
+                         * 退回按位置取，避免把真实会话的昵称/头像显示到临时卡上。
+                         */
+                        if (posUid != null && !posUid.isEmpty()
+                                && !com.tencent.qqlitepro.http.QqKernel
+                                        .isKnownTempChatPeer(posUid)) {
+                            posUid = null;
+                        }
+                        if (posUid == null || posUid.isEmpty()) {
+                            try {
+                                java.util.List<Object[]> snap2 =
+                                        com.tencent.qqlitepro.http.QqKernel.tempChatSnapshot();
+                                if (snap2 != null && tempIdx >= 0 && tempIdx < snap2.size()) {
+                                    posUid = String.valueOf(snap2.get(tempIdx)[0]);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        if (posUid != null && !posUid.isEmpty()) {
+                            if (taggedUid == null || !taggedUid.equals(posUid)) {
+                                /* 位置权威：纠正 tag 后再绑 */
+                                try {
+                                    if (itemView != null) {
+                                        itemView.setTag(ChatCardInjector.TAG_TEMP_UID, posUid);
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                            ChatCardInjector.bindTempChatByUid(methodHookParam.args[0], posUid);
+                        } else {
+                            ChatCardInjector.bindTempChatByHostBinding(
+                                    methodHookParam.args[0], tempIdx);
+                        }
                     } else {
                         /* 顺手缓存一个宿主真实 item 作为克隆原型（供临时卡构建用） */
                         try {
@@ -4176,6 +4364,12 @@ public class ChatCardInjector {
                 String uid = (String) snap.get(tIdx)[0];
                 Object tempItem = com.tencent.qqlitepro.http.QqKernel.tempChatItemFor(uid);
                 if (tempItem != null) {
+                    /*
+                     * 时序修复：getItem 与 onBindViewHolder 之间快照可能已变，
+                     * 这里把 uid 直接固化到返回对象上（tempChatItemFor 已把
+                     * peerUid 设为该 uid），onBind 阶段以 item.peerUid 为准，
+                     * 不再重复按位置推算 —— 两步使用同一份数据，杜绝串台。
+                     */
                     param.setResult(tempItem);
                     return;
                 }
